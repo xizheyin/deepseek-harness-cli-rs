@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{ffi::OsString, process::ExitCode};
 
 const HELP: &str = "dsh - Rust CLI foundation for DeepSeek Harness

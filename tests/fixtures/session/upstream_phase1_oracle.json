@@ -1,0 +1,1361 @@
+{
+  "fixture": {
+    "baselineRepository": "https://github.com/deepseek-ai/deepseek-harness",
+    "baselineCommit": "47f943859bef60e4160492346772ded9b24f765a",
+    "fixedTime": 1700000000000,
+    "evidencePaths": [
+      "packages/llm/llm/src/brand.ts",
+      "packages/llm/llm/src/message.ts",
+      "packages/llm/llm/src/types.ts",
+      "packages/llm/llm/src/call-config.ts",
+      "packages/attachment/attachment/src/types.ts",
+      "packages/core/session/src/index.ts",
+      "packages/core/session/src/request-header.ts",
+      "packages/core/session/src/surface.ts",
+      "packages/core/session/src/invariant.ts",
+      "packages/core/session/tests/session.spec.ts",
+      "packages/core/session/tests/request-header.spec.ts",
+      "packages/core/session/tests/surface.spec.ts",
+      "packages/core/session/tests/invariant.spec.ts"
+    ]
+  },
+  "canonicalTrace": {
+    "header": {
+      "version": 0,
+      "id": "oracle-session",
+      "createdAt": 1700000000000
+    },
+    "events": [
+      {
+        "type": "turn/start",
+        "seq": 0,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1
+        }
+      },
+      {
+        "type": "user/message",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "id": "message-user-1",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "echo hello"
+            }
+          ],
+          "source": {
+            "kind": "user"
+          }
+        },
+        "surfaceOp": "append"
+      },
+      {
+        "type": "step/start",
+        "seq": 2,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1
+        }
+      },
+      {
+        "type": "assistant/chunk",
+        "seq": 3,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "chunk": {
+            "type": "text-delta",
+            "index": 0,
+            "text": "hello"
+          }
+        }
+      },
+      {
+        "type": "assistant/message",
+        "seq": 4,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "message": {
+            "id": "message-assistant-1",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "hello"
+              },
+              {
+                "type": "tool-call",
+                "id": "call-1",
+                "name": "echo",
+                "arguments": "{\"text\":\"hello\"}"
+              }
+            ],
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            }
+          }
+        },
+        "sourceEventSeqs": [
+          3
+        ],
+        "surfaceOp": "append"
+      },
+      {
+        "type": "tool/call",
+        "seq": 5,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "callId": "call-1",
+          "name": "echo",
+          "arguments": "{\"text\":\"hello\"}"
+        }
+      },
+      {
+        "type": "tool/result",
+        "seq": 6,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "message": {
+            "id": "message-tool-result-1",
+            "role": "user",
+            "content": [
+              {
+                "type": "tool-result",
+                "toolCallId": "call-1",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "hello"
+                  }
+                ],
+                "isError": false
+              }
+            ],
+            "source": {
+              "kind": "tool",
+              "callId": "call-1"
+            }
+          }
+        },
+        "sourceEventSeqs": [
+          5
+        ],
+        "surfaceOp": "append"
+      },
+      {
+        "type": "step/end",
+        "seq": 7,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1
+        }
+      },
+      {
+        "type": "turn/end",
+        "seq": 8,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "reason": {
+            "kind": "completed"
+          }
+        }
+      }
+    ],
+    "surfaceNodes": [
+      1,
+      4,
+      6
+    ],
+    "derivedMessages": [
+      {
+        "id": "message-user-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "echo hello"
+          }
+        ],
+        "source": {
+          "kind": "user"
+        }
+      },
+      {
+        "id": "message-assistant-1",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "hello"
+          },
+          {
+            "type": "tool-call",
+            "id": "call-1",
+            "name": "echo",
+            "arguments": "{\"text\":\"hello\"}"
+          }
+        ],
+        "source": {
+          "kind": "model",
+          "provider": "mock",
+          "model": "mock-model"
+        }
+      },
+      {
+        "id": "message-tool-result-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call-1",
+            "content": [
+              {
+                "type": "text",
+                "text": "hello"
+              }
+            ],
+            "isError": false
+          }
+        ],
+        "source": {
+          "kind": "tool",
+          "callId": "call-1"
+        }
+      }
+    ]
+  },
+  "preservation": {
+    "suppliedSessionHeader": {
+      "version": 0,
+      "id": "oracle-header-extra",
+      "createdAt": 1700000000000,
+      "cwd": "/tmp/oracle-workspace",
+      "pluginHeader": {
+        "owner": "oracle-plugin",
+        "flags": [
+          true,
+          null
+        ]
+      },
+      "explicitNull": null
+    },
+    "storedSessionHeader": {
+      "version": 0,
+      "id": "oracle-header-extra",
+      "createdAt": 1700000000000,
+      "cwd": "/tmp/oracle-workspace",
+      "pluginHeader": {
+        "owner": "oracle-plugin",
+        "flags": [
+          true,
+          null
+        ]
+      },
+      "explicitNull": null
+    },
+    "headerWasDetached": true,
+    "storedHeaderFrozen": true,
+    "appendedEvents": [
+      {
+        "type": "turn/start",
+        "seq": 0,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "pluginPayload": {
+            "nested": [
+              1,
+              null,
+              {
+                "ok": true
+              }
+            ]
+          },
+          "explicitNull": null
+        }
+      },
+      {
+        "type": "user/message",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "id": "message-plugin-1",
+          "role": "user",
+          "content": [
+            {
+              "type": "oracle/plugin-block",
+              "value": {
+                "answer": 42,
+                "explicitNull": null
+              },
+              "blockExtra": [
+                "preserved"
+              ]
+            }
+          ],
+          "source": {
+            "kind": "oracle/plugin-source",
+            "plugin": "oracle-plugin",
+            "sourceExtra": {
+              "preserved": true
+            }
+          },
+          "messageExtra": {
+            "preserved": true,
+            "explicitNull": null
+          }
+        },
+        "surfaceOp": "append"
+      },
+      {
+        "type": "turn/end",
+        "seq": 2,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "reason": {
+            "kind": "completed"
+          },
+          "payloadExtra": "preserved"
+        }
+      }
+    ],
+    "replayedSeedEvents": [
+      {
+        "type": "turn/start",
+        "seq": 0,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "pluginPayload": {
+            "nested": [
+              1,
+              null,
+              {
+                "ok": true
+              }
+            ]
+          },
+          "explicitNull": null
+        }
+      },
+      {
+        "type": "user/message",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "id": "message-plugin-1",
+          "role": "user",
+          "content": [
+            {
+              "type": "oracle/plugin-block",
+              "value": {
+                "answer": 42,
+                "explicitNull": null
+              },
+              "blockExtra": [
+                "preserved"
+              ]
+            }
+          ],
+          "source": {
+            "kind": "oracle/plugin-source",
+            "plugin": "oracle-plugin",
+            "sourceExtra": {
+              "preserved": true
+            }
+          },
+          "messageExtra": {
+            "preserved": true,
+            "explicitNull": null
+          }
+        },
+        "surfaceOp": "append"
+      },
+      {
+        "type": "turn/end",
+        "seq": 2,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "reason": {
+            "kind": "completed"
+          },
+          "payloadExtra": "preserved"
+        }
+      }
+    ],
+    "replayedDerivedMessages": [
+      {
+        "id": "message-plugin-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "oracle/plugin-block",
+            "value": {
+              "answer": 42,
+              "explicitNull": null
+            },
+            "blockExtra": [
+              "preserved"
+            ]
+          }
+        ],
+        "source": {
+          "kind": "oracle/plugin-source",
+          "plugin": "oracle-plugin",
+          "sourceExtra": {
+            "preserved": true
+          }
+        },
+        "messageExtra": {
+          "preserved": true,
+          "explicitNull": null
+        }
+      }
+    ]
+  },
+  "projections": {
+    "headerTimeline": [
+      {
+        "stage": "before-any-header",
+        "value": null
+      },
+      {
+        "stage": "canonical-empty-optionals",
+        "value": {
+          "config": {
+            "provider": "mock",
+            "model": "initial"
+          }
+        }
+      },
+      {
+        "stage": "populated",
+        "value": {
+          "config": {
+            "provider": "mock",
+            "model": "populated",
+            "maxTokens": 4096
+          },
+          "adapterDefaults": {
+            "maxTokens": true
+          },
+          "system": "You are an oracle.",
+          "tools": [
+            {
+              "name": "echo",
+              "description": "Echo text",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "stage": "omitted-fields-cleared",
+        "value": {
+          "config": {
+            "provider": "mock",
+            "model": "cleared"
+          }
+        }
+      }
+    ],
+    "contextTimeline": [
+      {
+        "stage": "before-any-context",
+        "value": null
+      },
+      {
+        "stage": "with-capacity",
+        "value": {
+          "provider": "mock",
+          "model": "initial",
+          "contextWindow": 128000,
+          "oldExtension": "must-disappear"
+        }
+      },
+      {
+        "stage": "updated-capacity",
+        "value": {
+          "provider": "mock",
+          "model": "populated",
+          "contextWindow": 256000
+        }
+      },
+      {
+        "stage": "omitted-capacity-cleared",
+        "value": {
+          "provider": "mock",
+          "model": "cleared",
+          "newExtension": "kept-by-context-fold",
+          "explicitNull": null
+        }
+      }
+    ],
+    "rawHeaderEvents": [
+      {
+        "type": "request/header",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "header": {
+            "config": {
+              "provider": "mock",
+              "model": "initial"
+            },
+            "adapterDefaults": {},
+            "system": "",
+            "tools": [],
+            "headerExtension": "raw-only"
+          },
+          "reason": "initial",
+          "payloadExtension": {
+            "preservedInEvent": true
+          }
+        }
+      },
+      {
+        "type": "request/header",
+        "seq": 3,
+        "time": 1700000000000,
+        "data": {
+          "header": {
+            "config": {
+              "provider": "mock",
+              "model": "populated",
+              "maxTokens": 4096
+            },
+            "adapterDefaults": {
+              "maxTokens": true
+            },
+            "system": "You are an oracle.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "Echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "text"
+                  ]
+                }
+              }
+            ]
+          },
+          "reason": "change"
+        }
+      },
+      {
+        "type": "request/header",
+        "seq": 6,
+        "time": 1700000000000,
+        "data": {
+          "header": {
+            "config": {
+              "provider": "mock",
+              "model": "cleared"
+            },
+            "adapterDefaults": {},
+            "system": "",
+            "tools": []
+          },
+          "reason": "change"
+        }
+      }
+    ],
+    "rawContextEvents": [
+      {
+        "type": "request/context",
+        "seq": 2,
+        "time": 1700000000000,
+        "data": {
+          "provider": "mock",
+          "model": "initial",
+          "contextWindow": 128000,
+          "oldExtension": "must-disappear"
+        }
+      },
+      {
+        "type": "request/context",
+        "seq": 4,
+        "time": 1700000000000,
+        "data": {
+          "provider": "mock",
+          "model": "populated",
+          "contextWindow": 256000
+        }
+      },
+      {
+        "type": "request/context",
+        "seq": 7,
+        "time": 1700000000000,
+        "data": {
+          "provider": "mock",
+          "model": "cleared",
+          "newExtension": "kept-by-context-fold",
+          "explicitNull": null
+        }
+      }
+    ],
+    "finalLiveHeader": {
+      "config": {
+        "provider": "mock",
+        "model": "cleared"
+      }
+    },
+    "finalOfflineHeader": {
+      "config": {
+        "provider": "mock",
+        "model": "cleared"
+      }
+    },
+    "finalContext": {
+      "provider": "mock",
+      "model": "cleared",
+      "newExtension": "kept-by-context-fold",
+      "explicitNull": null
+    },
+    "finalHeaderFrozen": true,
+    "finalContextFrozen": true
+  },
+  "numericToolResultRewrite": {
+    "inputJsonLexemes": [
+      "1",
+      "1.0"
+    ],
+    "parsedNumbersAreStrictlyEqual": true,
+    "outcome": "ACCEPTED",
+    "events": [
+      {
+        "type": "turn/start",
+        "seq": 0,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1
+        }
+      },
+      {
+        "type": "step/start",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1
+        }
+      },
+      {
+        "type": "tool/call",
+        "seq": 2,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "callId": "numeric-call",
+          "name": "echo",
+          "arguments": "{}"
+        }
+      },
+      {
+        "type": "tool/result",
+        "seq": 3,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "message": {
+            "id": "message-numeric-result",
+            "role": "user",
+            "content": [
+              {
+                "type": "tool-result",
+                "toolCallId": "numeric-call",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "full output"
+                  }
+                ],
+                "isError": false
+              }
+            ],
+            "source": {
+              "kind": "tool",
+              "callId": "numeric-call"
+            }
+          },
+          "meta": {
+            "score": 1
+          }
+        },
+        "sourceEventSeqs": [
+          2
+        ],
+        "surfaceOp": "append"
+      },
+      {
+        "type": "step/end",
+        "seq": 4,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1
+        }
+      },
+      {
+        "type": "turn/end",
+        "seq": 5,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "reason": {
+            "kind": "completed"
+          }
+        }
+      },
+      {
+        "type": "turn/start",
+        "seq": 6,
+        "time": 1700000000000,
+        "data": {
+          "turn": 2
+        }
+      },
+      {
+        "type": "tool/result",
+        "seq": 7,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "message": {
+            "id": "message-numeric-result",
+            "role": "user",
+            "content": [
+              {
+                "type": "tool-result",
+                "toolCallId": "numeric-call",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "pruned output"
+                  }
+                ],
+                "isError": false
+              }
+            ],
+            "source": {
+              "kind": "tool",
+              "callId": "numeric-call"
+            }
+          },
+          "meta": {
+            "score": 1
+          }
+        },
+        "sourceEventSeqs": [
+          3
+        ],
+        "surfaceOp": {
+          "op": "replace",
+          "start": 3,
+          "end": 3
+        }
+      },
+      {
+        "type": "turn/end",
+        "seq": 8,
+        "time": 1700000000000,
+        "data": {
+          "turn": 2,
+          "reason": {
+            "kind": "completed"
+          }
+        }
+      }
+    ],
+    "surfaceNodes": [
+      7
+    ],
+    "derivedMessages": [
+      {
+        "id": "message-numeric-result",
+        "role": "user",
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "numeric-call",
+            "content": [
+              {
+                "type": "text",
+                "text": "pruned output"
+              }
+            ],
+            "isError": false
+          }
+        ],
+        "source": {
+          "kind": "tool",
+          "callId": "numeric-call"
+        }
+      }
+    ]
+  },
+  "modelVocabulary": {
+    "messages": [
+      {
+        "id": "message-system-1",
+        "role": "system",
+        "content": [
+          {
+            "type": "text",
+            "text": "system text"
+          }
+        ],
+        "source": {
+          "kind": "plugin",
+          "plugin": "system-prompt",
+          "form": "instructions"
+        }
+      },
+      {
+        "id": "message-plugin-snapshot-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "snapshot text"
+          }
+        ],
+        "source": {
+          "kind": "plugin",
+          "plugin": "workspace-context",
+          "form": "snapshot",
+          "sections": [
+            {
+              "name": "AGENTS.md",
+              "text": "instructions"
+            }
+          ]
+        }
+      },
+      {
+        "id": "message-plugin-notice-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "notice text"
+          }
+        ],
+        "source": {
+          "kind": "plugin",
+          "plugin": "jobs",
+          "form": "notice",
+          "summary": "job finished"
+        }
+      },
+      {
+        "id": "message-all-blocks-1",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "visible text"
+          },
+          {
+            "type": "reasoning",
+            "text": "private reasoning"
+          },
+          {
+            "type": "image",
+            "attachment": {
+              "attachmentId": "attachment-oracle-1",
+              "mediaType": "image/png",
+              "bytes": 67,
+              "width": 1,
+              "height": 1,
+              "name": "pixel.png"
+            }
+          },
+          {
+            "type": "tool-call",
+            "id": "call-vocabulary-1",
+            "name": "read",
+            "arguments": "{\"path\":\"src/lib.rs\"}"
+          }
+        ],
+        "source": {
+          "kind": "model",
+          "provider": "mock",
+          "model": "mock-model",
+          "replayState": {
+            "cursor": 7,
+            "explicitNull": null
+          }
+        }
+      },
+      {
+        "id": "message-result-vocabulary-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call-vocabulary-1",
+            "content": [
+              {
+                "type": "text",
+                "text": "file contents"
+              },
+              {
+                "type": "image",
+                "attachment": {
+                  "attachmentId": "attachment-oracle-1",
+                  "mediaType": "image/png",
+                  "bytes": 67,
+                  "width": 1,
+                  "height": 1,
+                  "name": "pixel.png"
+                }
+              }
+            ],
+            "isError": true
+          }
+        ],
+        "source": {
+          "kind": "tool",
+          "callId": "call-vocabulary-1"
+        }
+      }
+    ],
+    "failure": {
+      "message": "rate limited",
+      "code": "RATE_LIMIT",
+      "status": 429,
+      "providerRetryAfterMs": 1250.5,
+      "requestId": "request-oracle-1"
+    },
+    "finishReasons": [
+      {
+        "kind": "stop"
+      },
+      {
+        "kind": "tool-calls"
+      },
+      {
+        "kind": "max-tokens"
+      },
+      {
+        "kind": "aborted",
+        "failure": {
+          "message": "rate limited",
+          "code": "RATE_LIMIT",
+          "status": 429,
+          "providerRetryAfterMs": 1250.5,
+          "requestId": "request-oracle-1"
+        }
+      },
+      {
+        "kind": "error",
+        "failure": {
+          "message": "rate limited",
+          "code": "RATE_LIMIT",
+          "status": 429,
+          "providerRetryAfterMs": 1250.5,
+          "requestId": "request-oracle-1"
+        }
+      },
+      {
+        "kind": "oracle/future-finish",
+        "detail": null
+      }
+    ],
+    "tokenUsage": {
+      "inputTokens": 11,
+      "outputTokens": 7,
+      "cacheReadTokens": 5,
+      "cacheWriteTokens": 3,
+      "reasoningTokens": 2,
+      "usageExtension": null
+    },
+    "streamChunks": [
+      {
+        "type": "block-start",
+        "index": 0,
+        "blockType": "text"
+      },
+      {
+        "type": "text-delta",
+        "index": 0,
+        "text": "visible"
+      },
+      {
+        "type": "block-end",
+        "index": 0,
+        "block": {
+          "type": "text",
+          "text": "visible"
+        }
+      },
+      {
+        "type": "block-start",
+        "index": 1,
+        "blockType": "reasoning"
+      },
+      {
+        "type": "reasoning-delta",
+        "index": 1,
+        "text": "reasoning"
+      },
+      {
+        "type": "block-end",
+        "index": 1,
+        "block": {
+          "type": "reasoning",
+          "text": "reasoning"
+        }
+      },
+      {
+        "type": "block-start",
+        "index": 2,
+        "blockType": "tool-call"
+      },
+      {
+        "type": "tool-call-delta",
+        "index": 2,
+        "id": "call-vocabulary-1",
+        "name": "read",
+        "argumentsDelta": "{\"path\":"
+      },
+      {
+        "type": "block-end",
+        "index": 2,
+        "block": {
+          "type": "tool-call",
+          "id": "call-vocabulary-1",
+          "name": "read",
+          "arguments": "{\"path\":\"src/lib.rs\"}"
+        }
+      },
+      {
+        "type": "usage",
+        "usage": {
+          "inputTokens": 11,
+          "outputTokens": 7,
+          "cacheReadTokens": 5,
+          "cacheWriteTokens": 3,
+          "reasoningTokens": 2,
+          "usageExtension": null
+        }
+      },
+      {
+        "type": "finish",
+        "reason": {
+          "kind": "stop"
+        },
+        "replayState": {
+          "cursor": 8,
+          "explicitNull": null
+        }
+      }
+    ],
+    "tokenDeltaDecisions": [
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ],
+    "callConfig": {
+      "provider": "mock",
+      "model": "mock-model",
+      "reasoningEffort": "high",
+      "temperature": 0.25,
+      "maxTokens": 4096,
+      "stop": [
+        "END",
+        "STOP"
+      ]
+    },
+    "adapterDefaults": {
+      "reasoningEffort": true,
+      "maxTokens": true
+    },
+    "toolSchema": {
+      "name": "read",
+      "description": "Read one file",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "callConfigEquality": {
+      "identical": true,
+      "changedStopOrder": false
+    }
+  },
+  "forwardCompatibility": {
+    "events": [
+      {
+        "type": "turn/start",
+        "seq": 0,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1
+        }
+      },
+      {
+        "type": "request/header",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "header": {
+            "config": {
+              "provider": "mock",
+              "model": "model"
+            }
+          },
+          "reason": "future-reason"
+        }
+      },
+      {
+        "type": "request/context",
+        "seq": 2,
+        "time": 1700000000000,
+        "data": {
+          "provider": "mock",
+          "model": "model",
+          "contextWindow": null,
+          "pluginFact": null
+        }
+      },
+      {
+        "type": "step/start",
+        "seq": 3,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1
+        }
+      },
+      {
+        "type": "tool/call",
+        "seq": 4,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "callId": "call-forward-1",
+          "name": "read",
+          "arguments": "{}"
+        }
+      },
+      {
+        "type": "tool/result",
+        "seq": 5,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1,
+          "message": {
+            "id": "message-forward-result-1",
+            "role": "user",
+            "content": [
+              {
+                "type": "tool-result",
+                "toolCallId": "call-forward-1",
+                "content": [],
+                "isError": null
+              }
+            ],
+            "source": {
+              "kind": "tool",
+              "callId": "call-forward-1"
+            }
+          },
+          "error": null,
+          "meta": null
+        },
+        "surfaceOp": "append"
+      },
+      {
+        "type": "step/end",
+        "seq": 6,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "step": 1
+        }
+      },
+      {
+        "type": "turn/end",
+        "seq": 7,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1,
+          "reason": {
+            "kind": "future-end",
+            "detail": null
+          }
+        }
+      }
+    ],
+    "derivedMessages": [
+      {
+        "id": "message-forward-result-1",
+        "role": "user",
+        "content": [
+          {
+            "type": "tool-result",
+            "toolCallId": "call-forward-1",
+            "content": [],
+            "isError": null
+          }
+        ],
+        "source": {
+          "kind": "tool",
+          "callId": "call-forward-1"
+        }
+      }
+    ],
+    "requestHeader": {
+      "config": {
+        "provider": "mock",
+        "model": "model"
+      }
+    },
+    "requestContext": {
+      "provider": "mock",
+      "model": "model",
+      "contextWindow": null,
+      "pluginFact": null
+    }
+  },
+  "knownPayloadAdmission": {
+    "upstreamOutcome": "ACCEPTED",
+    "events": [
+      {
+        "type": "turn/start",
+        "seq": 0,
+        "time": 1700000000000,
+        "data": {
+          "turn": 1
+        }
+      },
+      {
+        "type": "request/header",
+        "seq": 1,
+        "time": 1700000000000,
+        "data": {
+          "header": {
+            "config": {
+              "provider": "mock",
+              "model": "model",
+              "maxTokens": null,
+              "stop": [
+                1
+              ]
+            },
+            "tools": [
+              {
+                "name": "incomplete-tool"
+              }
+            ]
+          },
+          "reason": "initial"
+        }
+      }
+    ]
+  },
+  "numericBoundary": {
+    "inputJson": "{\"value\":9007199254740993}",
+    "parsedValue": 9007199254740992,
+    "reencodedJson": "{\"value\":9007199254740992}"
+  },
+  "objectOrderBoundary": {
+    "inputJson": "{\"z\":1,\"a\":2}",
+    "upstreamReencodedJson": "{\"z\":1,\"a\":2}"
+  },
+  "invariantRegistration": {
+    "upstreamWithoutCompanion": {
+      "attemptedEvent": {
+        "type": "turn/start",
+        "data": {
+          "turn": 2
+        }
+      },
+      "outcome": "ACCEPTED",
+      "committedLength": 1
+    },
+    "upstreamBareCoreUnknownRequired": {
+      "outcome": "ACCEPTED",
+      "events": [
+        {
+          "type": "plugin/required",
+          "seq": 0,
+          "time": 1700000000000,
+          "data": {
+            "fact": 1
+          }
+        }
+      ]
+    }
+  },
+  "illegal": {
+    "outcomes": {
+      "turn_skip": "InvariantError: invariant violated by \"@deepseek-ai/dsh-session\": turn/start expected turn 2, got 3",
+      "surface_missing_shadowed_source": "Error: surface replace: sourceEventSeqs must include every shadowed surface node; missing 4",
+      "orphan_tool_result": "InvariantError: invariant violated by \"@deepseek-ai/dsh-session\": tool/result for ghost with no prior tool/call in this step",
+      "turn_end_with_open_step": "InvariantError: invariant violated by \"@deepseek-ai/dsh-session\": turn/end 1 while step 1 is still open"
+    },
+    "atomicLengths": {
+      "valid": 9,
+      "orphan": 2
+    }
+  }
+}

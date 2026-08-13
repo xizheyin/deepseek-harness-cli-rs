@@ -4,13 +4,15 @@ DeepSeek Harness 核心能力的 Rust CLI 实现项目。
 
 ## 当前状态
 
-项目现在有一个可编译、可测试的 Rust CLI 骨架。当前真实可用的行为只有：
+当前可执行文件真实可用的行为只有：
 
 - `dsh --help`：显示现有命令帮助；
 - `dsh --version`：显示当前版本；
 - 对缺少参数或未知参数返回非零退出码和清楚的错误信息。
 
-DeepSeek API、Agent Loop、文件工具、Shell、会话和交互式终端尚未实现。
+项目内部已经实现并测试了与固定 DeepSeek Harness 版本对照的 Rust 会话核心，包括消息/工具类型、只追加事件、回放、turn/step/tool 关系和模型上下文投影。它尚未接入 `dsh` 可执行文件。
+
+DeepSeek API、Agent Loop、文件工具、Shell、会话持久化和交互式终端尚未实现；目前不能用它进行 AI 编程对话。
 
 ## 构建与验证
 
