@@ -8,7 +8,7 @@ Phase 0 validates the reproducible Rust CLI foundation. It does not claim that a
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before the Phase 0 checkpoint: `4d63dd24d2366432e94827eede2099cc519e679a`
-- Tested state: Phase 0 working tree that will become the checkpoint commit
+- Tested checkpoint commit: `4456dd9607e6d9c7164d1d75184e34a1a8f677d2`
 - Host: macOS 27.0.0, arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 - Cargo: `cargo 1.85.0 (d73d2caf9 2024-12-31)`
@@ -64,4 +64,15 @@ No unresolved implementation, test, documentation, compatibility, or attribution
 
 ## Remote acceptance
 
-Pending the Phase 0 checkpoint push and the Ubuntu 24.04 GitHub Actions result. Phase 0 remains `in-progress` until this section records that evidence.
+- Remote: `git@github.com:xizheyin/deepseek-harness-cli-rs.git`
+- Branch: `main`
+- Push: non-force, `4d63dd2..4456dd9`
+- GitHub Actions: [CI run 31727158126](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31727158126)
+- Trigger: push of `4456dd9607e6d9c7164d1d75184e34a1a8f677d2`
+- Configured runner: Ubuntu 24.04
+- Job: `Rust verification`
+- Result: `success`
+- Started: 2026-08-13 17:43:49 UTC
+- Completed: 2026-08-13 17:44:07 UTC
+
+The remote result proves that the same `scripts/verify.sh` entry point passes on the configured Linux runner. Together with the local and independent-review evidence above, Phase 0 is complete.

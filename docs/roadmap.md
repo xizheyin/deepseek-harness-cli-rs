@@ -4,8 +4,8 @@ This roadmap records implementation status. It is a plan, not a list of current 
 
 | Phase | Scope | Status | Acceptance record |
 | --- | --- | --- | --- |
-| 0 | Reproducible Rust CLI foundation | `in-progress` | Pending |
-| 1 | Core types and in-memory session | `not-started` | — |
+| 0 | Reproducible Rust CLI foundation | `complete` | [`validation/phase-0.md`](validation/phase-0.md) |
+| 1 | Core types and in-memory session | `in-progress` | Pending |
 | 2 | DeepSeek streaming provider | `not-started` | — |
 | 3 | Agent Loop | `not-started` | — |
 | 4 | Read-only tools | `not-started` | — |
