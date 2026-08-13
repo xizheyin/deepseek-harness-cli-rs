@@ -4,17 +4,34 @@ DeepSeek Harness 核心能力的 Rust CLI 实现项目。
 
 ## 当前状态
 
-项目处于初始化阶段。目前尚未实现可执行程序、DeepSeek API 接入、Agent Loop、终端交互或其他用户功能，因此暂时没有安装和使用说明。
+项目现在有一个可编译、可测试的 Rust CLI 骨架。当前真实可用的行为只有：
 
-仓库将在功能完成并经过测试后，再补充对应的功能说明和使用方法。README 不会把设计目标或未完成的功能描述成已经可用。
+- `dsh --help`：显示现有命令帮助；
+- `dsh --version`：显示当前版本；
+- 对缺少参数或未知参数返回非零退出码和清楚的错误信息。
+
+DeepSeek API、Agent Loop、文件工具、Shell、会话和交互式终端尚未实现。
+
+## 构建与验证
+
+仓库固定使用 Rust 1.85.0。安装 [Rustup](https://rustup.rs/) 后运行：
+
+```console
+cargo build --locked
+cargo run -- --help
+./scripts/verify.sh
+```
+
+`verify.sh` 会运行格式检查、编译、测试和 Clippy。默认验证不会访问网络、读取 API Key 或消耗模型额度。
 
 ## 项目关系
 
 本项目是独立的社区开源项目，不隶属于 DeepSeek、Anthropic 或 Claude Code。
 
-DeepSeek Harness 是本项目计划参考的上游实现：
+DeepSeek Harness 是本项目固定参考的上游实现：
 
-- <https://github.com/deepseek-ai/deepseek-harness>
+- 仓库：<https://github.com/deepseek-ai/deepseek-harness>
+- 基准 commit：[`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a)
 
 ## License
 
