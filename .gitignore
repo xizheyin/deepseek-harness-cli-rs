@@ -1,0 +1,12 @@
+/target/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Operating-system files
+.DS_Store
+
+# Local logs
+*.log
