@@ -10,7 +10,7 @@ It does not claim that `dsh` can run an Agent turn. The provider is a tested Rus
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before the Phase 2 checkpoint: `5ed26c6a224070ee3d0e7ac20374862971dafeb3`
-- Tested Phase 2 checkpoint: candidate working tree; immutable commit added after checkpoint creation
+- Tested Phase 2 checkpoint: `c208dc1cf2e7529e981900bacb7d04dd6035a7dc`
 - Host: macOS 27.0, arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 - Cargo: `cargo 1.85.0 (d73d2caf9 2024-12-31)`
@@ -136,4 +136,7 @@ was to replace this formerly pending section with the final evidence now recorde
 
 ## Remote acceptance
 
-Pending checkpoint commit, non-force push, and Ubuntu 24.04 GitHub Actions evidence.
+The Phase 2 checkpoint was pushed non-forced to `origin/main`. GitHub Actions
+run [31748523315](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31748523315)
+completed successfully on Ubuntu 24.04 for the exact checkpoint
+`c208dc1cf2e7529e981900bacb7d04dd6035a7dc`.
