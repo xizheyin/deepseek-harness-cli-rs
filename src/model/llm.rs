@@ -811,6 +811,24 @@ impl LlmCallConfig {
             && self.stop == other.stop
     }
 
+    /// Preserve extension fields while materializing provider-owned defaults.
+    pub(crate) fn with_materialized_defaults(
+        &self,
+        reasoning_effort: ReasoningEffortId,
+        max_tokens: NonNegativeSafeInteger,
+    ) -> Result<Self, ModelError> {
+        let mut value = self.raw.as_value().clone();
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| shape("call config", "must be a JSON object"))?;
+        fields.insert(
+            "reasoningEffort".to_owned(),
+            Value::String(reasoning_effort.as_str().to_owned()),
+        );
+        fields.insert("maxTokens".to_owned(), Value::from(max_tokens.get()));
+        Self::from_value(value)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ModelError> {
         if self.provider.is_empty() {
             return Err(ModelError::EmptyProvider);

@@ -1,0 +1,958 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a"
+  },
+  "evidence": {
+    "sourcePaths": [
+      "packages/llm/llm-deepseek/src/serialize.ts",
+      "packages/llm/llm-deepseek/src/index.ts",
+      "packages/llm/llm-deepseek/src/adapter.ts",
+      "packages/llm/llm-deepseek/src/translate.ts",
+      "packages/llm/llm-deepseek/src/sse.ts",
+      "packages/llm/llm/src/invariant.ts",
+      "packages/llm/llm/src/assembler.ts",
+      "packages/llm/llm/src/retry-policy.ts"
+    ],
+    "testPaths": [
+      "packages/llm/llm-deepseek/tests/serialize.spec.ts",
+      "packages/llm/llm-deepseek/tests/adapter.spec.ts",
+      "packages/llm/llm/tests/service.spec.ts",
+      "packages/llm/llm-deepseek/tests/translate.spec.ts",
+      "packages/llm/llm/tests/invariant.spec.ts",
+      "packages/llm/llm/tests/assembler.spec.ts"
+    ]
+  },
+  "serialize": {
+    "fullRequest": {
+      "ok": true,
+      "value": {
+        "model": "deepseek-v4-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Be concise."
+          },
+          {
+            "role": "user",
+            "content": "weather in Paris?"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I should inspect two sources.",
+            "tool_calls": [
+              {
+                "id": "call-weather",
+                "type": "function",
+                "function": {
+                  "name": "weather",
+                  "arguments": "{\"city\":\"Paris\"}"
+                }
+              },
+              {
+                "id": "call-clock",
+                "type": "function",
+                "function": {
+                  "name": "clock",
+                  "arguments": "{\"zone\":\"Europe/Paris\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "trusted note"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call-weather",
+            "content": "sunny"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call-clock",
+            "content": "(no output)"
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "max",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "description": "Read weather",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 128,
+        "stop": [
+          "END"
+        ]
+      }
+    },
+    "sessionTitleForcesThinkingOff": {
+      "ok": true,
+      "value": {
+        "model": "deepseek-v4-flash",
+        "messages": [
+          {
+            "role": "user",
+            "content": "weather in Paris?"
+          }
+        ],
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "thinking": {
+          "type": "disabled"
+        }
+      }
+    },
+    "unsupportedEffort": {
+      "ok": false,
+      "error": {
+        "name": "LlmError",
+        "message": "DeepSeek does not support reasoning effort \"medium\"",
+        "code": "UNSUPPORTED_REASONING_EFFORT"
+      }
+    },
+    "deploymentLockedThinkingOff": {
+      "ok": false,
+      "error": {
+        "name": "LlmError",
+        "message": "DeepSeek deployment does not support reasoning effort \"high\"",
+        "code": "UNSUPPORTED_REASONING_EFFORT"
+      }
+    },
+    "imageRejected": {
+      "ok": false,
+      "error": {
+        "name": "LlmError",
+        "message": "The DeepSeek chat-completions adapter does not support image content.",
+        "code": "UNSUPPORTED_CONTENT"
+      }
+    }
+  },
+  "prepare": {
+    "defaults": {
+      "maxTokens": 256000,
+      "defaultContextWindow": 1000000,
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek-V4-Flash",
+          "contextWindow": 1000000
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek-V4-Pro",
+          "contextWindow": 1000000
+        }
+      ],
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 2,
+        "retryableCodes": [
+          "EMPTY_RESPONSE",
+          "RATE_LIMIT",
+          "SERVER",
+          "TIMEOUT",
+          "TRANSPORT"
+        ],
+        "initialDelayMs": 500,
+        "maxDelayMs": 10000,
+        "jitterRatio": 0.1
+      }
+    },
+    "configured": {
+      "retryPolicy": {
+        "mode": "normal",
+        "maxRetries": 3,
+        "retryableCodes": [
+          "RATE_LIMIT",
+          "SERVER"
+        ],
+        "initialDelayMs": 25,
+        "maxDelayMs": 100,
+        "jitterRatio": 0.2
+      },
+      "inherited": {
+        "provider": "deepseek-official",
+        "id": "inherits-default",
+        "name": "inherits-default",
+        "inputModalities": [
+          "text"
+        ],
+        "context": {
+          "contextWindow": 256000
+        },
+        "defaultMaxTokens": 4096,
+        "reasoning": {
+          "efforts": [
+            {
+              "id": "off",
+              "name": "Off"
+            },
+            {
+              "id": "high",
+              "name": "High"
+            },
+            {
+              "id": "max",
+              "name": "Max"
+            }
+          ],
+          "defaultEffort": "high"
+        }
+      },
+      "exact": {
+        "provider": "deepseek-official",
+        "id": "exact-override",
+        "name": "Exact Override",
+        "inputModalities": [
+          "text"
+        ],
+        "context": {
+          "contextWindow": 64000
+        },
+        "defaultMaxTokens": 512,
+        "reasoning": {
+          "efforts": [
+            {
+              "id": "off",
+              "name": "Off"
+            },
+            {
+              "id": "high",
+              "name": "High"
+            },
+            {
+              "id": "max",
+              "name": "Max"
+            }
+          ],
+          "defaultEffort": "high"
+        }
+      },
+      "unlisted": {
+        "provider": "deepseek-official",
+        "id": "unlisted-pass-through",
+        "name": "unlisted-pass-through",
+        "inputModalities": [
+          "text"
+        ],
+        "context": {
+          "contextWindow": 256000
+        },
+        "defaultMaxTokens": 4096,
+        "reasoning": {
+          "efforts": [
+            {
+              "id": "off",
+              "name": "Off"
+            },
+            {
+              "id": "high",
+              "name": "High"
+            },
+            {
+              "id": "max",
+              "name": "Max"
+            }
+          ],
+          "defaultEffort": "high"
+        }
+      }
+    },
+    "invalid": {
+      "duplicateModel": {
+        "ok": false,
+        "error": {
+          "name": "Error",
+          "message": "llm-deepseek: duplicate catalog model \"dup\""
+        }
+      },
+      "zeroModelLimit": {
+        "ok": false,
+        "error": {
+          "name": "Error",
+          "message": "llm-deepseek: catalog model \"bad\" maxTokens must be a positive integer"
+        }
+      },
+      "invalidRetry": {
+        "ok": false,
+        "error": {
+          "name": "Error",
+          "message": "llm-deepseek: retryPolicy.retryableCodes must not be empty"
+        }
+      }
+    }
+  },
+  "sse": {
+    "fragmentedUtf8BomCrLfCommentAndMultiData": {
+      "ok": true,
+      "values": [
+        "{\"text\":\"你好\"}\nsecond",
+        "[DONE]"
+      ],
+      "comments": [
+        "keep-alive"
+      ]
+    },
+    "stopsAtDoneInSameRead": {
+      "ok": true,
+      "values": [
+        "[DONE]"
+      ],
+      "comments": []
+    },
+    "emptyEof": {
+      "ok": false,
+      "values": [],
+      "comments": [],
+      "error": {
+        "name": "LlmError",
+        "message": "SSE stream ended without [DONE]",
+        "code": "STREAM_CLOSED"
+      }
+    },
+    "unterminatedDone": {
+      "ok": false,
+      "values": [],
+      "comments": [],
+      "error": {
+        "name": "LlmError",
+        "message": "SSE stream ended without [DONE]",
+        "code": "STREAM_CLOSED"
+      }
+    }
+  },
+  "translate": {
+    "interleavedReasoningTextAndTools": {
+      "ok": true,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "reasoning"
+        },
+        {
+          "type": "reasoning-delta",
+          "index": 0,
+          "text": "plan "
+        },
+        {
+          "type": "reasoning-delta",
+          "index": 0,
+          "text": "first"
+        },
+        {
+          "type": "block-start",
+          "index": 1,
+          "blockType": "text"
+        },
+        {
+          "type": "text-delta",
+          "index": 1,
+          "text": "Checking. "
+        },
+        {
+          "type": "block-start",
+          "index": 2,
+          "blockType": "tool-call"
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 2,
+          "id": "call-a",
+          "name": "one",
+          "argumentsDelta": "{\"x\""
+        },
+        {
+          "type": "block-start",
+          "index": 3,
+          "blockType": "tool-call"
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 3,
+          "id": "call-b",
+          "name": "two",
+          "argumentsDelta": ""
+        },
+        {
+          "type": "text-delta",
+          "index": 1,
+          "text": "Done."
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 3,
+          "id": "call-b",
+          "name": "two",
+          "argumentsDelta": "{\"y\":2}"
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 2,
+          "id": "call-a",
+          "name": "one",
+          "argumentsDelta": ":1}"
+        },
+        {
+          "type": "block-end",
+          "index": 0,
+          "block": {
+            "type": "reasoning",
+            "text": "plan first"
+          }
+        },
+        {
+          "type": "block-end",
+          "index": 1,
+          "block": {
+            "type": "text",
+            "text": "Checking. Done."
+          }
+        },
+        {
+          "type": "block-end",
+          "index": 2,
+          "block": {
+            "type": "tool-call",
+            "id": "call-a",
+            "name": "one",
+            "arguments": "{\"x\":1}"
+          }
+        },
+        {
+          "type": "block-end",
+          "index": 3,
+          "block": {
+            "type": "tool-call",
+            "id": "call-b",
+            "name": "two",
+            "arguments": "{\"y\":2}"
+          }
+        },
+        {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 30,
+            "outputTokens": 21,
+            "cacheReadTokens": 80,
+            "reasoningTokens": 5
+          }
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "tool-calls"
+          }
+        }
+      ],
+      "assembled": {
+        "blocks": [
+          {
+            "type": "reasoning",
+            "text": "plan first"
+          },
+          {
+            "type": "text",
+            "text": "Checking. Done."
+          },
+          {
+            "type": "tool-call",
+            "id": "call-a",
+            "name": "one",
+            "arguments": "{\"x\":1}"
+          },
+          {
+            "type": "tool-call",
+            "id": "call-b",
+            "name": "two",
+            "arguments": "{\"y\":2}"
+          }
+        ],
+        "usage": {
+          "inputTokens": 30,
+          "outputTokens": 21,
+          "cacheReadTokens": 80,
+          "reasoningTokens": 5
+        },
+        "finish": {
+          "kind": "tool-calls"
+        }
+      }
+    },
+    "malformedJson": {
+      "ok": false,
+      "chunks": [],
+      "error": {
+        "name": "LlmError",
+        "message": "malformed SSE payload: {bad json",
+        "code": "MALFORMED_RESPONSE"
+      }
+    },
+    "streamClosedBeforeDone": {
+      "ok": false,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "text"
+        },
+        {
+          "type": "text-delta",
+          "index": 0,
+          "text": "partial"
+        }
+      ],
+      "error": {
+        "name": "LlmError",
+        "message": "SSE payload stream ended without [DONE]",
+        "code": "STREAM_CLOSED"
+      }
+    },
+    "completedWithoutContent": {
+      "ok": true,
+      "chunks": [
+        {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 7,
+            "outputTokens": 0
+          }
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "error",
+            "failure": {
+              "message": "model returned a completed response with no content",
+              "code": "EMPTY_RESPONSE"
+            }
+          }
+        }
+      ]
+    },
+    "unknownFinishReason": {
+      "ok": true,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "text"
+        },
+        {
+          "type": "text-delta",
+          "index": 0,
+          "text": "filtered"
+        },
+        {
+          "type": "block-end",
+          "index": 0,
+          "block": {
+            "type": "text",
+            "text": "filtered"
+          }
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "error",
+            "failure": {
+              "message": "model stopped: content_filter",
+              "code": "CONTENT_FILTER"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "wholeStreamInvariant": {
+    "translatedStreamAccepted": {
+      "ok": true,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "reasoning"
+        },
+        {
+          "type": "reasoning-delta",
+          "index": 0,
+          "text": "plan "
+        },
+        {
+          "type": "reasoning-delta",
+          "index": 0,
+          "text": "first"
+        },
+        {
+          "type": "block-start",
+          "index": 1,
+          "blockType": "text"
+        },
+        {
+          "type": "text-delta",
+          "index": 1,
+          "text": "Checking. "
+        },
+        {
+          "type": "block-start",
+          "index": 2,
+          "blockType": "tool-call"
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 2,
+          "id": "call-a",
+          "name": "one",
+          "argumentsDelta": "{\"x\""
+        },
+        {
+          "type": "block-start",
+          "index": 3,
+          "blockType": "tool-call"
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 3,
+          "id": "call-b",
+          "name": "two",
+          "argumentsDelta": ""
+        },
+        {
+          "type": "text-delta",
+          "index": 1,
+          "text": "Done."
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 3,
+          "id": "call-b",
+          "name": "two",
+          "argumentsDelta": "{\"y\":2}"
+        },
+        {
+          "type": "tool-call-delta",
+          "index": 2,
+          "id": "call-a",
+          "name": "one",
+          "argumentsDelta": ":1}"
+        },
+        {
+          "type": "block-end",
+          "index": 0,
+          "block": {
+            "type": "reasoning",
+            "text": "plan first"
+          }
+        },
+        {
+          "type": "block-end",
+          "index": 1,
+          "block": {
+            "type": "text",
+            "text": "Checking. Done."
+          }
+        },
+        {
+          "type": "block-end",
+          "index": 2,
+          "block": {
+            "type": "tool-call",
+            "id": "call-a",
+            "name": "one",
+            "arguments": "{\"x\":1}"
+          }
+        },
+        {
+          "type": "block-end",
+          "index": 3,
+          "block": {
+            "type": "tool-call",
+            "id": "call-b",
+            "name": "two",
+            "arguments": "{\"y\":2}"
+          }
+        },
+        {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 30,
+            "outputTokens": 21,
+            "cacheReadTokens": 80,
+            "reasoningTokens": 5
+          }
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "tool-calls"
+          }
+        }
+      ]
+    },
+    "negativeIndexRejected": {
+      "ok": false,
+      "chunks": [],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream block index must be a non-negative safe integer, got -1",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "unsafeIntegerIndexRejected": {
+      "ok": false,
+      "chunks": [],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream block index must be a non-negative safe integer, got 9007199254740992",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "deltaWithoutOpenRejected": {
+      "ok": false,
+      "chunks": [],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": text delta at index 0 requires an open text block, got undefined",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "wrongDeltaTypeRejected": {
+      "ok": false,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "reasoning"
+        }
+      ],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": text delta at index 0 requires an open text block, got reasoning",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "mismatchedCloseRejected": {
+      "ok": false,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "text"
+        }
+      ],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream block-end index 0 closes reasoning, expected text",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "duplicateUsageRejected": {
+      "ok": false,
+      "chunks": [
+        {
+          "type": "usage",
+          "usage": {
+            "inputTokens": 1,
+            "outputTokens": 1
+          }
+        }
+      ],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream emitted usage more than once",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "openBlockAtSuccessfulFinishRejected": {
+      "ok": false,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "text"
+        }
+      ],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream finished with 1 open block(s)",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "openBlockAtErrorFinishAccepted": {
+      "ok": true,
+      "chunks": [
+        {
+          "type": "block-start",
+          "index": 0,
+          "blockType": "text"
+        },
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "error",
+            "failure": {
+              "message": "provider failed",
+              "code": "TRANSPORT"
+            }
+          }
+        }
+      ]
+    },
+    "chunkAfterFinishRejected": {
+      "ok": false,
+      "chunks": [
+        {
+          "type": "finish",
+          "reason": {
+            "kind": "stop"
+          }
+        }
+      ],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream emitted usage after terminal finish",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "missingFinishRejected": {
+      "ok": false,
+      "chunks": [],
+      "error": {
+        "name": "InvariantError",
+        "message": "invariant violated by \"@deepseek-ai/dsh-llm\": LLM stream ended without a terminal finish chunk",
+        "code": "INVARIANT",
+        "packageName": "@deepseek-ai/dsh-llm"
+      }
+    },
+    "closedIndexMayBeReused": {
+      "invariant": {
+        "ok": true,
+        "chunks": [
+          {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          },
+          {
+            "type": "text-delta",
+            "index": 0,
+            "text": "first"
+          },
+          {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "first"
+            }
+          },
+          {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "reasoning"
+          },
+          {
+            "type": "reasoning-delta",
+            "index": 0,
+            "text": "second"
+          },
+          {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "reasoning",
+              "text": "second"
+            }
+          },
+          {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        ]
+      },
+      "assembler": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "first"
+          }
+        ],
+        "usage": null,
+        "finish": {
+          "kind": "stop"
+        }
+      }
+    }
+  },
+  "assembler": {
+    "deltaOnlyAndMaxTokensDropsToolCall": {
+      "blocks": [
+        {
+          "type": "text",
+          "text": "kept"
+        }
+      ],
+      "usage": null,
+      "finish": {
+        "kind": "max-tokens"
+      }
+    },
+    "firstCloseWins": {
+      "blocks": [
+        {
+          "type": "reasoning",
+          "text": "first"
+        }
+      ],
+      "usage": null,
+      "finish": {
+        "kind": "stop"
+      }
+    },
+    "unknownChunkRejected": {
+      "ok": false,
+      "error": {
+        "name": "Error",
+        "message": "unreachable variant in BlockAssembler.push: {\"type\":\"rogue-chunk\"}"
+      }
+    }
+  }
+}

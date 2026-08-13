@@ -5,4 +5,5 @@
 mod json_value;
 
 pub mod model;
+pub mod provider;
 pub mod session;
