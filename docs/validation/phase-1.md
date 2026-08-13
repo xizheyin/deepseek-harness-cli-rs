@@ -10,7 +10,7 @@ It does not claim that `dsh` can call DeepSeek, run tools, persist a session, or
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before the Phase 1 checkpoint: `369160dd90b9f4ac891fe9dfe3d76ba4c1148dc6`
-- Tested Phase 1 tree: the working tree described by this record; the immutable checkpoint commit is added after commit creation
+- Tested Phase 1 checkpoint: `cdaf4ba3ba91bf465e0187dd11a8965b8a78eb0c`
 - Host: macOS 27.0, arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 - Cargo: `cargo 1.85.0 (d73d2caf9 2024-12-31)`
@@ -121,4 +121,4 @@ The final complete-tree independent review reported no blocker after re-running 
 
 ## Remote acceptance
 
-Pending checkpoint commit, non-force push to `main`, and successful Ubuntu 24.04 GitHub Actions run.
+Checkpoint `cdaf4ba3ba91bf465e0187dd11a8965b8a78eb0c` was pushed non-force to `origin/main`. GitHub Actions [CI run #3](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31741014694) completed successfully on Ubuntu 24.04; its checkout, pinned Rust installation, and repository verification steps all passed.
