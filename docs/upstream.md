@@ -236,6 +236,144 @@ were byte-identical and matched the committed fixture. The default Rust suite
 uses only that JSON file, so ordinary verification stays offline, keyless, and
 independent of Node or the upstream clone.
 
+## Phase 4 inspection
+
+Phase 4 studies the real read-only filesystem tools and the common tool runtime.
+The primary source files at the pinned revision are:
+
+- `packages/core/tools/src/{index,schema}.ts`: lookup, argument snapshot and
+  validation, policy/body hooks, result validation, cancellation normalization,
+  and model-facing failures;
+- `packages/core/agent-loop/src/{agent,tool-calls}.ts`: assistant/call/result
+  ordering, intention-before-execution, cancellation draining, and ordered
+  durable result commits;
+- `packages/core/session/src/types.ts`: durable tool call/result vocabulary;
+- `packages/fs/fs/src/{index,types}.ts` and
+  `packages/fs/fs-local/src/{index,fsio}.ts`: target resolution, regular-file
+  reads, one-level directory listing, errors, and cancellation;
+- `packages/fs/fs-sandbox/src/{index,containment}.ts`: the important fact that
+  the upstream sandbox passes reads through and confines only changes;
+- `packages/fs/tool-fs/src/{read,read-target,read-render,session-cwd}.ts`: read
+  schema, UTF-8/binary decisions, line/page limits, and exact rendering;
+- `packages/fs/tool-fs-search/src/{glob,grep,search-core}.ts`: fixed ripgrep argv,
+  parsing, sorting, truncation, errors, timeout declaration, and cancellation;
+- `packages/fs/tool-fs/README.md` and `docs/tool-catalog.md`: shipped model-tool
+  surface, including the explicit absence of a model-facing directory-list tool;
+- `apps/cli/config/agent-presets/{standard,cordis,code}/agent.cordis.yml` and
+  `packages/bundle/base/cordis.patch.yml`: shipped CLI glob sampling policy.
+
+The directly relevant deterministic tests are:
+
+- `packages/core/tools/tests/{tools,schema,json-schema,execution-mode}.spec.ts`;
+- `packages/core/agent-loop/tests/{tool-calls,tool-order,cancel,contract-regressions}.spec.ts`;
+- `packages/fs/fs/tests/{service,invariant}.spec.ts`;
+- `packages/fs/fs-local/tests/{filesystem,fsio}.spec.ts`;
+- `packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts`;
+- `packages/fs/tool-fs/tests/{tools,read-render,integration,error}.spec.ts`;
+- `packages/fs/tool-fs-search/tests/{tools,integration,presentation,rg-path,load-path}.spec.ts`.
+
+The research run exercised 30 default keyless filesystem/tool test files: 886
+tests passed and one macOS-inapplicable Windows DACL test was skipped. A focused
+Agent tool-order/cancellation run exercised another 56 tests, all passing. The
+`fs-tools.e2e.ts` file requires `DEEPSEEK_API_KEY` and is not part of the default
+`*.spec.ts` suite; it was read but intentionally not run. No research command
+used a credential or public network request.
+
+### Observed contracts and boundaries
+
+`read` takes `file_path`, optional one-based `offset`, and optional `limit` up to
+2,000. It accepts regular UTF-8 files, treats a NUL in the first 8,192 bytes as
+binary, scans the full file for line count and late UTF-8 errors, caps selected
+text near 50 KiB, and emits numbered XML-like text with one of three pagination
+footers. The input root object is open to unknown fields, while the structured
+output is closed.
+
+`glob` takes `pattern` and optional `path`. The shipped CLI invokes packaged
+ripgrep without a shell, with `--no-config --files --sort=modified --no-ignore
+--hidden`, excludes `.git`, `.svn`, `.hg`, `.bzr`, `.jj`, and `.sl`, returns only
+files, and inlines the oldest 100 matches with sampling disabled. Equal-mtime
+ordering is not fixed.
+
+`grep` takes `pattern`, optional file/directory `path`, and one positive `include`
+glob. It invokes ripgrep JSON mode with `--no-config`, but unlike `glob` inherits
+ripgrep's ordinary hidden/ignore behavior. It groups matches by first file
+appearance, previews 2,000 bytes per line, represents invalid UTF-8 match bytes
+with a placeholder, and inlines 250 matches. Cross-file order and binary-search
+details are not a stable package-level promise.
+
+There is no model-callable upstream `list`. The internal `FileSystem.listDir`
+lists one level, returns file/directory/other facts, and sorts with JavaScript
+`localeCompare`; it is evidence for a filesystem primitive, not compatibility
+evidence for the Rust product extension.
+
+Most importantly, the upstream read side is ambient. Absolute paths ignore cwd,
+`..` can escape, local reads follow symlinks, and `fs-sandbox` deliberately passes
+reads through. Rust's fixed workspace capability and rejection of outside
+symlinks are therefore intentional security differences. They must not be
+described as upstream-compatible behavior.
+
+### Phase 4 runtime oracle
+
+Phase 4 committed an independently authored, type-checked oracle:
+
+- `scripts/generate-upstream-tool-fixtures.ts`;
+- `scripts/typecheck-upstream-tool-fixtures.mjs`;
+- `tests/fixtures/tools/upstream_phase4_oracle.json`.
+
+From the clean pinned checkout, the accepted reproduction was:
+
+```console
+node /Users/xizheyin/workspace/ds-harness-rs/scripts/typecheck-upstream-tool-fixtures.mjs \
+  /Users/xizheyin/workspace/deepseek-harness-upstream
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-tool-fixtures.ts \
+  /tmp/upstream-phase4-a.json
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-tool-fixtures.ts \
+  /tmp/upstream-phase4-b.json
+
+cmp -s /tmp/upstream-phase4-a.json /tmp/upstream-phase4-b.json
+cmp -s /tmp/upstream-phase4-a.json \
+  /Users/xizheyin/workspace/ds-harness-rs/tests/fixtures/tools/upstream_phase4_oracle.json
+```
+
+The checker loaded the generator into the pinned TypeScript source graph. Both
+generations were byte-identical and matched the committed fixture. SHA-256:
+
+- type checker: `aadc60f480c1d6cff1625ab96c143dd500dde154808e30dcb74dda1a217e58ec`;
+- generator: `cc18b5233da64026336c209d9ba63d304ab79d010c4f5bfe0819a897ef7763c9`;
+- fixture: `32b47ea94ec65168084a31b0a1ee5a2b614865241a380bc97d1ada141296ee0a`.
+
+The fixture uses a fresh temporary workspace, normalized paths, and fixed mtimes.
+It records schema surfaces, relevant shipped configuration, the internal one-level
+list primitive, small canonical `read`/`glob`/`grep` success/no-match cases, one
+missing-file failure, and exact ambient parent/symlink-outside outcomes. It does
+not pretend to cover every large-result, encoding, cancellation, or resource
+boundary; those are Rust safety-policy tests. Rust compares the model-facing
+canonical text and error code, while explicitly recording that upstream also has
+structured `value`/presentation `meta` and displays an absolute read path.
+
+The default Rust suite consumes only the committed JSON, so it needs neither Node
+nor the upstream checkout. The generator does not present Rust's model-facing
+`list` as an official tool and distinguishes the shipped CLI's
+`sampleOverCapGlobResults: false` from the alternate sampled catalogue setting.
+
+The final targeted upstream regression command was:
+
+```console
+pnpm exec vitest run \
+  packages/core/tools/tests \
+  packages/fs/fs-local/tests \
+  packages/fs/tool-fs/tests \
+  packages/fs/tool-fs-search/tests
+```
+
+Vitest 4.1.8 reported 26 files: 848 tests passed and one Windows-specific test
+was skipped on macOS. It used locked local dependencies, no credential, and no
+public network request.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

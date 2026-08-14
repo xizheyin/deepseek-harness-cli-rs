@@ -10,9 +10,9 @@ DeepSeek Harness 核心能力的 Rust CLI 实现项目。
 - `dsh --version`：显示当前版本；
 - 对缺少参数或未知参数返回非零退出码和清楚的错误信息。
 
-项目内部已经实现并测试了三层 Rust 核心：只追加会话/回放、DeepSeek 流式 Provider，以及有步骤/重试/时间/资源上限并可取消的 Agent Loop。它们都与固定 DeepSeek Harness 版本做了行为对照，但尚未接入 `dsh` 可执行文件。
+项目内部已经实现并测试了四层 Rust 核心：只追加会话/回放、DeepSeek 流式 Provider、有步骤/重试/时间/资源上限并可取消的 Agent Loop，以及限定在启动工作区内的 `list`、`glob`、`grep`、`read` 只读工具注册表。它们都通过公共 Rust 接口可达，并与固定 DeepSeek Harness 版本做了有明确范围的行为对照，但尚未接入 `dsh` 可执行文件。
 
-真实文件工具、审批、Shell、会话持久化和交互式终端尚未实现；Agent Loop 目前只能由 Rust 公共接口配合 Provider/工具实现调用。当前 CLI 仍不能发起 DeepSeek API 请求，因此还不能用它进行 AI 编程对话。
+文件写入与审批、Shell、会话持久化和交互式终端尚未实现；Agent Loop 与只读工具目前只能由 Rust 公共接口组装调用。当前 CLI 仍不能发起 DeepSeek API 请求或读取项目，因此还不能用它进行 AI 编程对话。
 
 ## 构建与验证
 
