@@ -304,11 +304,10 @@ can consume them honestly.
 Preparation and commit reuse the already-opened Phase 4 workspace capability.
 No code converts a display path back into ambient filesystem authority.
 
-The mutation implementation is available on Unix targets in Phase 5. Local
-acceptance runs on macOS, and the Phase checkpoint still requires green Ubuntu
-CI before completion. The read-only Phase 4 registry remains the portable
-fallback; Windows mutation publication is deferred rather than being approximated
-with weaker path or replacement rules.
+The mutation implementation is available on Unix targets in Phase 5. Acceptance
+passed locally on macOS and remotely on Ubuntu 24.04. The read-only Phase 4
+registry remains the portable fallback; Windows mutation publication is deferred
+rather than being approximated with weaker path or replacement rules.
 
 Mutation paths are stricter than reads:
 

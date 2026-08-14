@@ -9,8 +9,8 @@ This roadmap records implementation status. It is a plan, not a list of current 
 | 2 | DeepSeek streaming provider | `complete` | [`validation/phase-2.md`](validation/phase-2.md) |
 | 3 | Agent Loop | `complete` | [`validation/phase-3.md`](validation/phase-3.md) |
 | 4 | Read-only tools | `complete` | [`validation/phase-4.md`](validation/phase-4.md) |
-| 5 | File changes and approval | `in-progress` | — |
-| 6 | Shell, timeout, and cancellation | `not-started` | — |
+| 5 | File changes and approval | `complete` | [`validation/phase-5.md`](validation/phase-5.md) |
+| 6 | Shell, timeout, and cancellation | `in-progress` | — |
 | 7 | Interactive CLI/TUI | `not-started` | — |
 | 8 | Persistence, resume, and compaction | `not-started` | — |
 | 9 | v0.1 integration and release candidate | `not-started` | — |

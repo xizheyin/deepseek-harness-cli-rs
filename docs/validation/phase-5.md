@@ -28,7 +28,7 @@ cleanup are Phase 6. Persistent repair of an interrupted session tail is Phase
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before the Phase 5 checkpoint: `12e9d46bded6e8099e7dc534c06a0c49a803fe78`
-- Tested Phase 5 checkpoint: `pending first checkpoint`
+- Tested Phase 5 checkpoint: `57834fd1a24957beb04f70771b01460fbc06fb9a`
 - Total Rust tests in the final pre-checkpoint run: 263
 - Host: macOS 27.0 (build 26A5406e), arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
@@ -37,9 +37,10 @@ cleanup are Phase 6. Persistent repair of an interrupted session tail is Phase
 - Credentials or API keys used: no; tests use no credential or conspicuous fake values
 - User project data modified/read by tests: no; file-change tests use fresh temporary trees
 
-`pending first checkpoint` is a deliberate placeholder. It is replaced with the
-exact commit after the first checkpoint is created; the green command and test
-count below are the pre-checkpoint acceptance evidence.
+The tested checkpoint contains the Phase 5 implementation plus the Linux
+capability-directory synchronization fix found by the first Ubuntu run. The
+commands and test count below were rerun against the exact final code before it
+was committed.
 
 The repository-wide commands completed successfully:
 
@@ -214,6 +215,17 @@ private under `cfg(test)` and does not enter the release API or release build.
 
 ## Remote acceptance
 
-Remote acceptance is `pending first checkpoint`. Record the non-force push,
-exact commit, CI URL, platform, and result only after the local final gate is
-green and both placeholders above have been replaced.
+The Phase 5 feature checkpoint and its Linux follow-up were pushed non-forced to
+`origin/main`. The first Ubuntu run
+[31775483542](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31775483542)
+correctly exposed that `cap-std` opens the ambient workspace root with Linux
+`O_PATH`: publication succeeded, but that handle could not be directory-synced,
+so two exact commit-truth tests failed. The fix reopens `.` relative to the
+retained capability as a read-only directory before `fsync`; it does not reopen
+an ambient display path or weaken either test.
+
+GitHub Actions run
+[31776599425](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31776599425)
+then completed successfully on Ubuntu 24.04 for the exact accepted checkpoint
+`57834fd1a24957beb04f70771b01460fbc06fb9a`. Its Rust verification job ran the
+same repository gate and passed all 263 tests.
