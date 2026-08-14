@@ -96,6 +96,30 @@ pub enum TransitionError {
     EventOutsideTurn { event_type: &'static str },
     #[error("tool/result for {call_id} has no prior tool/call in this step")]
     MissingToolCall { call_id: CallId },
+    #[error("llm/retry names provider {actual:?}, but the open request uses {expected:?}")]
+    RetryProviderMismatch { expected: String, actual: String },
+    #[error("llm/retry expected retry {expected}, got {actual}")]
+    WrongRetryNumber {
+        expected: super::RetryNumber,
+        actual: super::RetryNumber,
+    },
+    #[error("llm/retry must preserve retryId {expected}, got {actual}")]
+    RetryChainIdMismatch {
+        expected: super::RetryId,
+        actual: super::RetryId,
+    },
+    #[error("llm/retry retryId {retry_id} is already owned by another chain")]
+    RetryIdAlreadyOwned { retry_id: super::RetryId },
+    #[error("llm/retry-started has no matching scheduled retry {retry} in chain {retry_id}")]
+    RetryStartedWithoutSchedule {
+        retry_id: super::RetryId,
+        retry: super::RetryNumber,
+    },
+    #[error("llm/retry-started repeats retry {retry} in chain {retry_id}")]
+    RetryStartedTwice {
+        retry_id: super::RetryId,
+        retry: super::RetryNumber,
+    },
     #[error("turn or step number has no representable successor")]
     IdentifierExhausted,
 }
@@ -158,6 +182,8 @@ pub enum EventValidationError {
     NonCanonicalRequestHeaderReason { reason: String },
     #[error("turn/end reason's typed kind disagrees with its retained JSON")]
     InconsistentTurnEndReason,
+    #[error("invalid llm retry event: {0}")]
+    InvalidRetryEvent(&'static str),
     #[error("session contains {actual} events; maximum is {maximum}")]
     TooManyEvents { maximum: usize, actual: usize },
 }
@@ -175,6 +201,16 @@ pub enum AppendError {
     EventLimit { maximum: usize },
     #[error("session would retain more than {maximum} compact JSON bytes")]
     RetainedJsonLimit { maximum: usize },
+    #[error(
+        "session reservation protects {reserved} event slot(s); this append would exceed the maximum of {maximum}"
+    )]
+    ReservedEventLimit { maximum: usize, reserved: usize },
+    #[error(
+        "session reservation protects {reserved} compact JSON bytes; this append would exceed the maximum of {maximum}"
+    )]
+    ReservedRetainedJsonLimit { maximum: usize, reserved: usize },
+    #[error("event claim does not belong to this active session reservation")]
+    InvalidClaim,
     #[error("could not reserve memory for the next session event")]
     Capacity,
 }

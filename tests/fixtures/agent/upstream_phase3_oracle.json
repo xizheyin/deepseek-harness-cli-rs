@@ -1,0 +1,2233 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a"
+  },
+  "deterministic": {
+    "clockStartMs": 1700000000000,
+    "clockStepMs": 7,
+    "eventTimes": "normalized from each scenario event seq",
+    "uuidCalls": 6
+  },
+  "evidence": {
+    "sourcePaths": [
+      "packages/core/agent-loop/src/agent.ts",
+      "packages/core/agent-loop/src/tool-calls.ts",
+      "packages/core/agent-loop/src/invariant.ts",
+      "packages/core/system-prompt/src/index.ts",
+      "packages/core/session/src/request-header.ts",
+      "packages/core/session/src/surface.ts",
+      "packages/llm/llm/src/assembler.ts",
+      "packages/llm/llm-retry/src/index.ts",
+      "packages/llm/llm-retry/src/invariant.ts"
+    ],
+    "testPaths": [
+      "packages/core/agent-loop/tests/request-reconstruction.spec.ts",
+      "packages/core/agent-loop/tests/loop.spec.ts",
+      "packages/core/agent-loop/tests/request-error.spec.ts",
+      "packages/core/agent-loop/tests/tool-calls.spec.ts",
+      "packages/core/agent-loop/tests/interception.spec.ts",
+      "packages/llm/llm-retry/tests/retry.spec.ts",
+      "packages/llm/llm-retry/tests/invariant.spec.ts"
+    ]
+  },
+  "scenarios": {
+    "textCompletion": {
+      "requests": [
+        {
+          "ordinal": 1,
+          "eventCount": 7,
+          "lastSeq": 6,
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context"
+          ],
+          "foldedHeader": {
+            "config": {
+              "provider": "mock",
+              "model": "oracle-model",
+              "maxTokens": 1024
+            },
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.\n\nOnly report observed facts."
+          },
+          "requestContext": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          },
+          "derivedMessages": [
+            {
+              "id": "user-text",
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "complete once"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ],
+          "request": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "maxTokens": 1024,
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.\n\nOnly report observed facts.",
+            "messages": [
+              {
+                "id": "user-text",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "complete once"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ],
+            "sessionId": "phase3-text",
+            "frozen": {
+              "request": true,
+              "messages": true
+            }
+          },
+          "checks": {
+            "messagesEqualDerivation": true,
+            "completeHeaderEqual": true,
+            "headerLoggedBeforeDispatch": true,
+            "contextLoggedBeforeDispatch": true
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700000000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-text",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "complete once"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700000000007,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700000000014,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700000000021,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700000000028,
+          "data": {
+            "id": "user-text",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "complete once"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 5,
+          "time": 1700000000035,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.\n\nOnly report observed facts."
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 6,
+          "time": 1700000000042,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 7,
+          "time": 1700000000049,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700000000056,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "done"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700000000063,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "done"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700000000070,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700000000077,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 12,
+          "time": 1700000000084,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "done"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000001"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 13,
+          "time": 1700000000091,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 14,
+          "time": 1700000000098,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "derivedMessages": [
+        {
+          "id": "user-text",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "complete once"
+            }
+          ],
+          "source": {
+            "kind": "user"
+          }
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "done"
+            }
+          ],
+          "source": {
+            "kind": "model",
+            "provider": "mock",
+            "model": "oracle-model"
+          },
+          "id": "00000000-0000-4000-8000-000000000001"
+        }
+      ],
+      "surfaceNodes": [
+        4,
+        12
+      ],
+      "checks": {
+        "eventOrder": [
+          "agent/inbox/spliced",
+          "turn/start",
+          "agent/inbox/spliced",
+          "step/start",
+          "user/message",
+          "request/header",
+          "request/context",
+          "assistant/chunk",
+          "assistant/chunk",
+          "assistant/chunk",
+          "assistant/chunk",
+          "assistant/chunk",
+          "assistant/message",
+          "step/end",
+          "turn/end"
+        ],
+        "oneRequest": true,
+        "requestChecksAllTrue": true,
+        "onlySubmittedUserMessageBeforeRequest": true
+      }
+    },
+    "singleToolRoundTrip": {
+      "requests": [
+        {
+          "ordinal": 1,
+          "eventCount": 7,
+          "lastSeq": 6,
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context"
+          ],
+          "foldedHeader": {
+            "config": {
+              "provider": "mock",
+              "model": "oracle-model",
+              "maxTokens": 1024
+            },
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "requestContext": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          },
+          "derivedMessages": [
+            {
+              "id": "user-tool",
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "call echo"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ],
+          "request": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "maxTokens": 1024,
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ],
+            "messages": [
+              {
+                "id": "user-tool",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "call echo"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ],
+            "sessionId": "phase3-tool",
+            "frozen": {
+              "request": true,
+              "messages": true
+            }
+          },
+          "checks": {
+            "messagesEqualDerivation": true,
+            "completeHeaderEqual": true,
+            "headerLoggedBeforeDispatch": true,
+            "contextLoggedBeforeDispatch": true
+          }
+        },
+        {
+          "ordinal": 2,
+          "eventCount": 18,
+          "lastSeq": 17,
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/message",
+            "tool/call",
+            "tool/result",
+            "step/end",
+            "step/start"
+          ],
+          "foldedHeader": {
+            "config": {
+              "provider": "mock",
+              "model": "oracle-model",
+              "maxTokens": 1024
+            },
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "requestContext": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          },
+          "derivedMessages": [
+            {
+              "id": "user-tool",
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "call echo"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-echo-1",
+                  "name": "echo",
+                  "arguments": "{\"text\":\"hello\"}"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000002"
+            },
+            {
+              "source": {
+                "kind": "tool",
+                "callId": "call-echo-1"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-echo-1",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "echo: hello"
+                    }
+                  ],
+                  "isError": false
+                }
+              ],
+              "role": "user",
+              "id": "00000000-0000-4000-8000-000000000003"
+            }
+          ],
+          "request": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "maxTokens": 1024,
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ],
+            "messages": [
+              {
+                "id": "user-tool",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "call echo"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              },
+              {
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "tool-call",
+                    "id": "call-echo-1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hello\"}"
+                  }
+                ],
+                "source": {
+                  "kind": "model",
+                  "provider": "mock",
+                  "model": "oracle-model"
+                },
+                "id": "00000000-0000-4000-8000-000000000002"
+              },
+              {
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-echo-1"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-echo-1",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "echo: hello"
+                      }
+                    ],
+                    "isError": false
+                  }
+                ],
+                "role": "user",
+                "id": "00000000-0000-4000-8000-000000000003"
+              }
+            ],
+            "sessionId": "phase3-tool",
+            "frozen": {
+              "request": true,
+              "messages": true
+            }
+          },
+          "checks": {
+            "messagesEqualDerivation": true,
+            "completeHeaderEqual": true,
+            "headerLoggedBeforeDispatch": true,
+            "contextLoggedBeforeDispatch": true
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700000000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-tool",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "call echo"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700000000007,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700000000014,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700000000021,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700000000028,
+          "data": {
+            "id": "user-tool",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "call echo"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 5,
+          "time": 1700000000035,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+              "tools": [
+                {
+                  "name": "echo",
+                  "description": "echo text",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 6,
+          "time": 1700000000042,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 7,
+          "time": 1700000000049,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "tool-call"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700000000056,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 0,
+              "id": "call-echo-1",
+              "name": "echo",
+              "argumentsDelta": "{\"te"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700000000063,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 0,
+              "id": "call-echo-1",
+              "argumentsDelta": "xt\":\"hello\"}"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700000000070,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "tool-call",
+                "id": "call-echo-1",
+                "name": "echo",
+                "arguments": "{\"text\":\"hello\"}"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700000000077,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 3
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700000000084,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "tool-calls"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 13,
+          "time": 1700000000091,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-echo-1",
+                  "name": "echo",
+                  "arguments": "{\"text\":\"hello\"}"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000002"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 3
+            }
+          },
+          "sourceEventSeqs": [
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "tool/call",
+          "seq": 14,
+          "time": 1700000000098,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "callId": "call-echo-1",
+            "name": "echo",
+            "arguments": "{\"text\":\"hello\"}"
+          }
+        },
+        {
+          "type": "tool/result",
+          "seq": 15,
+          "time": 1700000000105,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "source": {
+                "kind": "tool",
+                "callId": "call-echo-1"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-echo-1",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "echo: hello"
+                    }
+                  ],
+                  "isError": false
+                }
+              ],
+              "role": "user",
+              "id": "00000000-0000-4000-8000-000000000003"
+            }
+          },
+          "sourceEventSeqs": [
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 16,
+          "time": 1700000000112,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 17,
+          "time": 1700000000119,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 18,
+          "time": 1700000000126,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 19,
+          "time": 1700000000133,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "tool complete"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 20,
+          "time": 1700000000140,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "tool complete"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 21,
+          "time": 1700000000147,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 22,
+          "time": 1700000000154,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 23,
+          "time": 1700000000161,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "tool complete"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000004"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 24,
+          "time": 1700000000168,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 25,
+          "time": 1700000000175,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "derivedMessages": [
+        {
+          "id": "user-tool",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "call echo"
+            }
+          ],
+          "source": {
+            "kind": "user"
+          }
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool-call",
+              "id": "call-echo-1",
+              "name": "echo",
+              "arguments": "{\"text\":\"hello\"}"
+            }
+          ],
+          "source": {
+            "kind": "model",
+            "provider": "mock",
+            "model": "oracle-model"
+          },
+          "id": "00000000-0000-4000-8000-000000000002"
+        },
+        {
+          "source": {
+            "kind": "tool",
+            "callId": "call-echo-1"
+          },
+          "content": [
+            {
+              "type": "tool-result",
+              "toolCallId": "call-echo-1",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "echo: hello"
+                }
+              ],
+              "isError": false
+            }
+          ],
+          "role": "user",
+          "id": "00000000-0000-4000-8000-000000000003"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "tool complete"
+            }
+          ],
+          "source": {
+            "kind": "model",
+            "provider": "mock",
+            "model": "oracle-model"
+          },
+          "id": "00000000-0000-4000-8000-000000000004"
+        }
+      ],
+      "surfaceNodes": [
+        4,
+        13,
+        15,
+        23
+      ],
+      "toolBodySnapshots": [
+        {
+          "callId": "call-echo-1",
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/chunk",
+            "assistant/message",
+            "tool/call"
+          ],
+          "matchingCallSeq": 14
+        }
+      ],
+      "checks": {
+        "twoRequests": true,
+        "everyRequestReconstructs": true,
+        "callLoggedBeforeBody": true,
+        "resultCitesCall": true,
+        "secondRequestHasToolResult": true
+      }
+    },
+    "retrySameStep": {
+      "requests": [
+        {
+          "ordinal": 1,
+          "eventCount": 7,
+          "lastSeq": 6,
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context"
+          ],
+          "foldedHeader": {
+            "config": {
+              "provider": "mock",
+              "model": "oracle-model",
+              "maxTokens": 1024
+            },
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+          },
+          "requestContext": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          },
+          "derivedMessages": [
+            {
+              "id": "user-retry",
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "retry once"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ],
+          "request": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "maxTokens": 1024,
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "messages": [
+              {
+                "id": "user-retry",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "retry once"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ],
+            "sessionId": "phase3-retry",
+            "frozen": {
+              "request": true,
+              "messages": true
+            }
+          },
+          "checks": {
+            "messagesEqualDerivation": true,
+            "completeHeaderEqual": true,
+            "headerLoggedBeforeDispatch": true,
+            "contextLoggedBeforeDispatch": true
+          }
+        },
+        {
+          "ordinal": 2,
+          "eventCount": 10,
+          "lastSeq": 9,
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context",
+            "assistant/chunk",
+            "llm/retry",
+            "llm/retry-started"
+          ],
+          "foldedHeader": {
+            "config": {
+              "provider": "mock",
+              "model": "oracle-model",
+              "maxTokens": 1024
+            },
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+          },
+          "requestContext": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          },
+          "derivedMessages": [
+            {
+              "id": "user-retry",
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "retry once"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ],
+          "request": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "maxTokens": 1024,
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "messages": [
+              {
+                "id": "user-retry",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "retry once"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ],
+            "sessionId": "phase3-retry",
+            "frozen": {
+              "request": true,
+              "messages": true
+            }
+          },
+          "checks": {
+            "messagesEqualDerivation": true,
+            "completeHeaderEqual": true,
+            "headerLoggedBeforeDispatch": true,
+            "contextLoggedBeforeDispatch": true
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700000000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-retry",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "retry once"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700000000007,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700000000014,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700000000021,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700000000028,
+          "data": {
+            "id": "user-retry",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "retry once"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 5,
+          "time": 1700000000035,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 6,
+          "time": 1700000000042,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 7,
+          "time": 1700000000049,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "error",
+                "failure": {
+                  "message": "busy",
+                  "code": "RATE_LIMIT"
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "llm/retry",
+          "seq": 8,
+          "time": 1700000000056,
+          "data": {
+            "retryId": "oracle-retry-1",
+            "turn": 1,
+            "step": 1,
+            "provider": "mock",
+            "mode": "normal",
+            "policyKey": "[\"normal\",2,[\"RATE_LIMIT\",\"SERVER\"],1,1,0]",
+            "retry": 1,
+            "maxRetries": 2,
+            "delayMs": 1,
+            "failure": {
+              "message": "busy",
+              "code": "RATE_LIMIT"
+            }
+          }
+        },
+        {
+          "type": "llm/retry-started",
+          "seq": 9,
+          "time": 1700000000063,
+          "data": {
+            "retryId": "oracle-retry-1",
+            "turn": 1,
+            "step": 1,
+            "retry": 1
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700000000070,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700000000077,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "recovered"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700000000084,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "recovered"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 13,
+          "time": 1700000000091,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 14,
+          "time": 1700000000098,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 15,
+          "time": 1700000000105,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "recovered"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000005"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 16,
+          "time": 1700000000112,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 17,
+          "time": 1700000000119,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "derivedMessages": [
+        {
+          "id": "user-retry",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "retry once"
+            }
+          ],
+          "source": {
+            "kind": "user"
+          }
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "recovered"
+            }
+          ],
+          "source": {
+            "kind": "model",
+            "provider": "mock",
+            "model": "oracle-model"
+          },
+          "id": "00000000-0000-4000-8000-000000000005"
+        }
+      ],
+      "surfaceNodes": [
+        4,
+        15
+      ],
+      "checks": {
+        "twoRequestsOneStep": true,
+        "oneHeaderOneContext": true,
+        "onlySuccessfulAssistant": true,
+        "successfulProvenanceExcludesFailedAttempt": true,
+        "durableRetryPair": true,
+        "everyRequestReconstructs": true
+      }
+    },
+    "maxTokens": {
+      "requests": [
+        {
+          "ordinal": 1,
+          "eventCount": 7,
+          "lastSeq": 6,
+          "eventTypes": [
+            "agent/inbox/spliced",
+            "turn/start",
+            "agent/inbox/spliced",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context"
+          ],
+          "foldedHeader": {
+            "config": {
+              "provider": "mock",
+              "model": "oracle-model",
+              "maxTokens": 1024
+            },
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "requestContext": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          },
+          "derivedMessages": [
+            {
+              "id": "user-max",
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "hit output limit"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ],
+          "request": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "maxTokens": 1024,
+            "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+            "tools": [
+              {
+                "name": "echo",
+                "description": "echo text",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ],
+            "messages": [
+              {
+                "id": "user-max",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "hit output limit"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ],
+            "sessionId": "phase3-max-tokens",
+            "frozen": {
+              "request": true,
+              "messages": true
+            }
+          },
+          "checks": {
+            "messagesEqualDerivation": true,
+            "completeHeaderEqual": true,
+            "headerLoggedBeforeDispatch": true,
+            "contextLoggedBeforeDispatch": true
+          }
+        }
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700000000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-max",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "hit output limit"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700000000007,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700000000014,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700000000021,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700000000028,
+          "data": {
+            "id": "user-max",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "hit output limit"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 5,
+          "time": 1700000000035,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona.",
+              "tools": [
+                {
+                  "name": "echo",
+                  "description": "echo text",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 6,
+          "time": 1700000000042,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 7,
+          "time": 1700000000049,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700000000056,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "partial"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700000000063,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "partial"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700000000070,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 1,
+              "blockType": "tool-call"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700000000077,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 1,
+              "id": "call-truncated",
+              "name": "echo",
+              "argumentsDelta": "{\"text\":\"unsafe\"}"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700000000084,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 1,
+              "block": {
+                "type": "tool-call",
+                "id": "call-truncated",
+                "name": "echo",
+                "arguments": "{\"text\":\"unsafe\"}"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 13,
+          "time": 1700000000091,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 7,
+                "outputTokens": 9
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 14,
+          "time": 1700000000098,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "max-tokens"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 15,
+          "time": 1700000000105,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "partial"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000006"
+            },
+            "usage": {
+              "inputTokens": 7,
+              "outputTokens": 9
+            }
+          },
+          "sourceEventSeqs": [
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 16,
+          "time": 1700000000112,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 17,
+          "time": 1700000000119,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "max-tokens"
+            }
+          }
+        }
+      ],
+      "derivedMessages": [
+        {
+          "id": "user-max",
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "hit output limit"
+            }
+          ],
+          "source": {
+            "kind": "user"
+          }
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "partial"
+            }
+          ],
+          "source": {
+            "kind": "model",
+            "provider": "mock",
+            "model": "oracle-model"
+          },
+          "id": "00000000-0000-4000-8000-000000000006"
+        }
+      ],
+      "surfaceNodes": [
+        4,
+        15
+      ],
+      "checks": {
+        "toolNotExecuted": true,
+        "noToolCallEvent": true,
+        "truncatedToolBlockDropped": true,
+        "turnEndedMaxTokens": true,
+        "requestReconstructs": true
+      }
+    },
+    "preStepReject": {
+      "requests": [],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700000000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-reject",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "reject before request"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700000000007,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700000000014,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 3,
+          "time": 1700000000021,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "blocked"
+            }
+          }
+        }
+      ],
+      "derivedMessages": [],
+      "surfaceNodes": [],
+      "checks": {
+        "noRequest": true,
+        "noStep": true,
+        "noHeaderOrContext": true,
+        "balancedBlockedTurn": true
+      }
+    }
+  }
+}

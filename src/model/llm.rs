@@ -829,6 +829,46 @@ impl LlmCallConfig {
         Self::from_value(value)
     }
 
+    /// Remove fields previously supplied by an adapter while preserving extensions.
+    pub(crate) fn without_adapter_defaults(
+        &self,
+        defaults: &LlmCallConfigAdapterDefaults,
+    ) -> Result<Self, ModelError> {
+        let mut value = self.raw.as_value().clone();
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| shape("call config", "must be a JSON object"))?;
+        if defaults.reasoning_effort.is_some() {
+            fields.remove("reasoningEffort");
+        }
+        if defaults.max_tokens.is_some() {
+            fields.remove("maxTokens");
+        }
+        Self::from_value(value)
+    }
+
+    /// Restore an explicit prior effort only when the new proposal omitted it.
+    pub(crate) fn with_reasoning_effort_if_absent(
+        &self,
+        effort: Option<&ReasoningEffortId>,
+    ) -> Result<Self, ModelError> {
+        let Some(effort) = effort else {
+            return Ok(self.clone());
+        };
+        if self.reasoning_effort.is_some() {
+            return Ok(self.clone());
+        }
+        let mut value = self.raw.as_value().clone();
+        value
+            .as_object_mut()
+            .ok_or_else(|| shape("call config", "must be a JSON object"))?
+            .insert(
+                "reasoningEffort".to_owned(),
+                Value::String(effort.as_str().to_owned()),
+            );
+        Self::from_value(value)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ModelError> {
         if self.provider.is_empty() {
             return Err(ModelError::EmptyProvider);

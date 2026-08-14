@@ -112,7 +112,7 @@ impl Projection {
     ) -> Result<Self, EventValidationError> {
         event.kind.validate()?;
         let mut next = self.clone();
-        next.apply_transition(event)?;
+        next.apply_transition(event, committed_events)?;
         next.apply_surface(event, committed_events)?;
         Ok(next)
     }
@@ -125,6 +125,7 @@ impl Projection {
                 turn,
                 step,
                 pending_calls,
+                ..
             } => (Some(*turn), Some(*step), pending_calls.clone()),
         };
         SessionState {
@@ -167,7 +168,11 @@ impl Projection {
         self.request_context.as_ref()
     }
 
-    fn apply_transition(&mut self, event: &SessionEvent) -> Result<(), TransitionError> {
+    fn apply_transition(
+        &mut self,
+        event: &SessionEvent,
+        committed_events: &[SessionEvent],
+    ) -> Result<(), TransitionError> {
         match &event.kind {
             EventKind::TurnStart { turn } => {
                 if let Some(open) = self.open_turn() {
@@ -327,6 +332,12 @@ impl Projection {
                 }
                 self.request_context = Some(context.clone());
             }
+            EventKind::LlmRetry { retry } => {
+                self.validate_retry(retry, committed_events)?;
+            }
+            EventKind::LlmRetryStarted { started } => {
+                self.validate_retry_started(started, committed_events)?;
+            }
             EventKind::TodoWrite { .. } => {
                 if self.open_turn().is_none() {
                     return Err(TransitionError::EventOutsideTurn {
@@ -392,6 +403,108 @@ impl Projection {
                 self.surface_nodes
                     .splice(start_index..=end_index, [event.seq]);
             }
+        }
+        Ok(())
+    }
+
+    fn validate_retry(
+        &self,
+        retry: &super::LlmRetryEvent,
+        history: &[SessionEvent],
+    ) -> Result<(), TransitionError> {
+        self.require_open_step("llm/retry", retry.turn(), retry.step())?;
+        let expected_provider = self
+            .request_header
+            .as_ref()
+            .map(|header| header.config.provider())
+            .unwrap_or_default();
+        if retry.provider() != expected_provider {
+            return Err(TransitionError::RetryProviderMismatch {
+                expected: expected_provider.to_owned(),
+                actual: retry.provider().to_owned(),
+            });
+        }
+
+        let prior = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::LlmRetry { retry: prior }
+                    if prior.turn() == retry.turn()
+                        && prior.step() == retry.step()
+                        && prior.provider() == retry.provider()
+                        && prior.policy_key() == retry.policy_key() =>
+                {
+                    Some(prior)
+                }
+                _ => None,
+            })
+            .next_back();
+        let expected = match prior {
+            Some(prior) => prior
+                .retry()
+                .successor()
+                .ok_or(TransitionError::IdentifierExhausted)?,
+            None => super::RetryNumber::first(),
+        };
+        if retry.retry() != expected {
+            return Err(TransitionError::WrongRetryNumber {
+                expected,
+                actual: retry.retry(),
+            });
+        }
+        if let Some(prior) = prior {
+            if prior.retry_id() != retry.retry_id() {
+                return Err(TransitionError::RetryChainIdMismatch {
+                    expected: prior.retry_id().clone(),
+                    actual: retry.retry_id().clone(),
+                });
+            }
+        } else if history.iter().any(|event| match &event.kind {
+            EventKind::LlmRetry { retry: prior } => prior.retry_id() == retry.retry_id(),
+            EventKind::LlmRetryStarted { started } => started.retry_id() == retry.retry_id(),
+            _ => false,
+        }) {
+            return Err(TransitionError::RetryIdAlreadyOwned {
+                retry_id: retry.retry_id().clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_retry_started(
+        &self,
+        started: &super::LlmRetryStartedEvent,
+        history: &[SessionEvent],
+    ) -> Result<(), TransitionError> {
+        // The upstream retry companion correlates this event with its durable
+        // schedule. It does not require the referenced step to still be open:
+        // a delayed callback may publish `started` after `step/end`.
+        let scheduled = history.iter().any(|event| match &event.kind {
+            EventKind::LlmRetry { retry } => {
+                retry.retry_id() == started.retry_id()
+                    && retry.retry() == started.retry()
+                    && retry.turn() == started.turn()
+                    && retry.step() == started.step()
+            }
+            _ => false,
+        });
+        if !scheduled {
+            return Err(TransitionError::RetryStartedWithoutSchedule {
+                retry_id: started.retry_id().clone(),
+                retry: started.retry(),
+            });
+        }
+        let already_started = history.iter().any(|event| match &event.kind {
+            EventKind::LlmRetryStarted { started: prior } => {
+                prior.retry_id() == started.retry_id() && prior.retry() == started.retry()
+            }
+            _ => false,
+        });
+        if already_started {
+            return Err(TransitionError::RetryStartedTwice {
+                retry_id: started.retry_id().clone(),
+                retry: started.retry(),
+            });
         }
         Ok(())
     }
@@ -515,6 +628,8 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
+            Self::LlmRetry { .. } => "llm/retry",
+            Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { .. } => "unknown",
         }

@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 pub use crate::json_value::MAX_SAFE_INTEGER;
 use crate::json_value::{deserialize_present_option, deserialize_safe_i64, deserialize_safe_u64};
 use crate::model::{
-    CallId, JsonValue, LlmCallConfig, LlmCallConfigAdapterDefaults, LlmFailure, Message,
-    NonNegativeSafeInteger, StreamChunk, TokenUsage, ToolSchema, TrueMarker,
+    CallId, FiniteNumber, JsonValue, LlmCallConfig, LlmCallConfigAdapterDefaults, LlmFailure,
+    Message, NonNegativeSafeInteger, StreamChunk, TokenUsage, ToolSchema, TrueMarker,
 };
 
 use super::error::{EventValidationError, HeaderError, NumberError};
@@ -40,6 +40,11 @@ macro_rules! string_id {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
+
+            #[must_use]
+            pub fn is_empty(&self) -> bool {
+                self.0.is_empty()
+            }
         }
 
         impl fmt::Display for $name {
@@ -65,6 +70,10 @@ macro_rules! string_id {
 string_id!(
     /// Identifies one session and its future persistence artifacts.
     SessionId
+);
+string_id!(
+    /// Correlates all scheduled waits in one provider-policy retry chain.
+    RetryId
 );
 
 /// Zero-based event position within one session.
@@ -186,6 +195,11 @@ nonzero_id!(
     /// One-based step identity within a turn.
     StepId,
     "step"
+);
+nonzero_id!(
+    /// One-based retry number inside one provider-policy chain.
+    RetryNumber,
+    "retry"
 );
 
 /// Signed Unix-epoch milliseconds used by imported and live events.
@@ -665,6 +679,17 @@ impl EpochHeader {
         }
     }
 
+    /// Field-wise request equality used to suppress redundant full snapshots.
+    #[must_use]
+    pub fn equivalent_to(&self, other: &Self) -> bool {
+        let first = self.canonicalized();
+        let second = other.canonicalized();
+        first.config.equivalent_to(&second.config)
+            && first.adapter_defaults == second.adapter_defaults
+            && first.system == second.system
+            && first.tools == second.tools
+    }
+
     fn validate(&self) -> Result<(), EventValidationError> {
         self.config.validate()?;
         if let Some(defaults) = &self.adapter_defaults {
@@ -810,6 +835,14 @@ impl RequestContext {
     pub fn raw(&self) -> &JsonValue {
         &self.raw
     }
+
+    /// Typed route facts used to decide whether another full snapshot is needed.
+    #[must_use]
+    pub fn equivalent_to(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.model == other.model
+            && self.context_window == other.context_window
+    }
 }
 
 impl Serialize for RequestContext {
@@ -835,6 +868,237 @@ impl<'de> Deserialize<'de> for RequestContext {
 pub struct ToolFailure {
     pub name: String,
     pub code: String,
+}
+
+/// Retry policy mode retained in one durable schedule event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmRetryMode {
+    Normal,
+    Always,
+}
+
+/// One provider-routed retry scheduled after a failed model attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmRetryEvent {
+    retry_id: RetryId,
+    turn: TurnId,
+    step: StepId,
+    provider: String,
+    mode: LlmRetryMode,
+    policy_key: String,
+    retry: RetryNumber,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    max_retries: Option<RetryNumber>,
+    delay_ms: FiniteNumber,
+    failure: LlmFailure,
+}
+
+impl LlmRetryEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn normal(
+        retry_id: RetryId,
+        turn: TurnId,
+        step: StepId,
+        provider: impl Into<String>,
+        policy_key: impl Into<String>,
+        retry: RetryNumber,
+        max_retries: RetryNumber,
+        delay_ms: FiniteNumber,
+        failure: LlmFailure,
+    ) -> Result<Self, EventValidationError> {
+        Self::new(
+            retry_id,
+            turn,
+            step,
+            provider.into(),
+            LlmRetryMode::Normal,
+            policy_key.into(),
+            retry,
+            Some(max_retries),
+            delay_ms,
+            failure,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn always(
+        retry_id: RetryId,
+        turn: TurnId,
+        step: StepId,
+        provider: impl Into<String>,
+        policy_key: impl Into<String>,
+        retry: RetryNumber,
+        delay_ms: FiniteNumber,
+        failure: LlmFailure,
+    ) -> Result<Self, EventValidationError> {
+        Self::new(
+            retry_id,
+            turn,
+            step,
+            provider.into(),
+            LlmRetryMode::Always,
+            policy_key.into(),
+            retry,
+            None,
+            delay_ms,
+            failure,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        retry_id: RetryId,
+        turn: TurnId,
+        step: StepId,
+        provider: String,
+        mode: LlmRetryMode,
+        policy_key: String,
+        retry: RetryNumber,
+        max_retries: Option<RetryNumber>,
+        delay_ms: FiniteNumber,
+        failure: LlmFailure,
+    ) -> Result<Self, EventValidationError> {
+        let value = Self {
+            retry_id,
+            turn,
+            step,
+            provider,
+            mode,
+            policy_key,
+            retry,
+            max_retries,
+            delay_ms,
+            failure,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn retry_id(&self) -> &RetryId {
+        &self.retry_id
+    }
+
+    pub fn turn(&self) -> TurnId {
+        self.turn
+    }
+
+    pub fn step(&self) -> StepId {
+        self.step
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn mode(&self) -> LlmRetryMode {
+        self.mode
+    }
+
+    pub fn policy_key(&self) -> &str {
+        &self.policy_key
+    }
+
+    pub fn retry(&self) -> RetryNumber {
+        self.retry
+    }
+
+    pub fn max_retries(&self) -> Option<RetryNumber> {
+        self.max_retries
+    }
+
+    pub fn delay_ms(&self) -> FiniteNumber {
+        self.delay_ms
+    }
+
+    pub fn failure(&self) -> &LlmFailure {
+        &self.failure
+    }
+
+    fn validate(&self) -> Result<(), EventValidationError> {
+        if self.retry_id.is_empty() {
+            return Err(EventValidationError::InvalidRetryEvent(
+                "retryId must not be empty",
+            ));
+        }
+        if self.provider.is_empty() {
+            return Err(EventValidationError::InvalidRetryEvent(
+                "provider must not be empty",
+            ));
+        }
+        if self.policy_key.is_empty() {
+            return Err(EventValidationError::InvalidRetryEvent(
+                "policyKey must not be empty",
+            ));
+        }
+        if !(0.0..=2_147_483_647.0).contains(&self.delay_ms.get()) {
+            return Err(EventValidationError::InvalidRetryEvent(
+                "delayMs must be inside the runtime timer range",
+            ));
+        }
+        match (self.mode, self.max_retries) {
+            (LlmRetryMode::Normal, Some(maximum)) if self.retry <= maximum => Ok(()),
+            (LlmRetryMode::Normal, _) => Err(EventValidationError::InvalidRetryEvent(
+                "normal retry must not exceed a positive maxRetries",
+            )),
+            (LlmRetryMode::Always, None) => Ok(()),
+            (LlmRetryMode::Always, Some(_)) => Err(EventValidationError::InvalidRetryEvent(
+                "always retry must omit maxRetries",
+            )),
+        }
+    }
+}
+
+/// Wait-complete marker written immediately before the next provider attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmRetryStartedEvent {
+    retry_id: RetryId,
+    turn: TurnId,
+    step: StepId,
+    retry: RetryNumber,
+}
+
+impl LlmRetryStartedEvent {
+    pub fn new(
+        retry_id: RetryId,
+        turn: TurnId,
+        step: StepId,
+        retry: RetryNumber,
+    ) -> Result<Self, EventValidationError> {
+        if retry_id.is_empty() {
+            return Err(EventValidationError::InvalidRetryEvent(
+                "retryId must not be empty",
+            ));
+        }
+        Ok(Self {
+            retry_id,
+            turn,
+            step,
+            retry,
+        })
+    }
+
+    pub fn retry_id(&self) -> &RetryId {
+        &self.retry_id
+    }
+
+    pub fn turn(&self) -> TurnId {
+        self.turn
+    }
+
+    pub fn step(&self) -> StepId {
+        self.step
+    }
+
+    pub fn retry(&self) -> RetryNumber {
+        self.retry
+    }
 }
 
 /// A known core event payload or a retained unknown ignorable payload.
@@ -892,6 +1156,12 @@ pub enum EventKind {
     },
     RequestContext {
         context: RequestContext,
+    },
+    LlmRetry {
+        retry: LlmRetryEvent,
+    },
+    LlmRetryStarted {
+        started: LlmRetryStartedEvent,
     },
     EndSeed,
     /// An unknown envelope retained only because `ignorable: true` made it safe to skip.
@@ -979,6 +1249,16 @@ impl EventKind {
         }
     }
 
+    #[must_use]
+    pub fn llm_retry(retry: LlmRetryEvent) -> Self {
+        Self::LlmRetry { retry }
+    }
+
+    #[must_use]
+    pub fn llm_retry_started(started: LlmRetryStartedEvent) -> Self {
+        Self::LlmRetryStarted { started }
+    }
+
     /// Stable wire tag for this event.
     #[must_use]
     pub fn event_type(&self) -> &str {
@@ -995,6 +1275,8 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
+            Self::LlmRetry { .. } => "llm/retry",
+            Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { event_type, .. } => event_type,
         }
@@ -1033,6 +1315,12 @@ impl EventKind {
                 }
             }
             Self::RequestContext { .. } => {}
+            Self::LlmRetry { retry } => retry.validate()?,
+            Self::LlmRetryStarted { started } if started.retry_id.is_empty() => {
+                return Err(EventValidationError::InvalidRetryEvent(
+                    "retryId must not be empty",
+                ));
+            }
             // These values can only be created through their bounded, validated
             // constructors, so append has no second placeholder validation pass.
             Self::AssistantChunk { .. } | Self::Unknown { .. } => {}

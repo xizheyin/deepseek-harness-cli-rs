@@ -353,14 +353,26 @@ pub type ProviderStream =
     Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderStreamError>> + Send + 'static>>;
 
 /// Stable boundary implemented by a real or fake model provider.
+///
+/// This is a trusted persistence boundary: prepared configuration, defaults,
+/// retry facts, and accepted chunks are recorded in the append-only session
+/// log. Implementations must never put credentials or private transport
+/// diagnostics in those values and must redact failures before publication.
+/// The built-in DeepSeek provider enforces this; custom providers are
+/// responsible for the same contract.
 pub trait ModelProvider: Send + Sync {
-    /// Resolve model capabilities and materialize defaults before session logging.
+    /// Resolve model capabilities and materialize defaults before session
+    /// logging. This synchronous method must return promptly; remote discovery
+    /// belongs in the lazy stream or a future async preparation API.
     fn prepare_call(
         &self,
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError>;
 
-    /// Begin one one-shot model request. Work starts only when the stream is polled.
+    /// Begin one one-shot model request. Work starts only when the stream is
+    /// polled. Polling must remain non-blocking and dropping/cancelling the
+    /// stream must reclaim provider-owned work; detached background requests
+    /// are outside this contract.
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderStream;
 }
 

@@ -273,6 +273,12 @@ fn decode_kind(
                 source,
             })?,
         },
+        "llm/retry" => EventKind::LlmRetry {
+            retry: payload!(super::LlmRetryEvent),
+        },
+        "llm/retry-started" => EventKind::LlmRetryStarted {
+            started: payload!(super::LlmRetryStartedEvent),
+        },
         "session/end-seed" => {
             let _: EmptyData = payload!(EmptyData);
             EventKind::EndSeed
@@ -401,6 +407,8 @@ pub(crate) fn kind_data_value(kind: &EventKind) -> Result<Value, serde_json::Err
             serde_json::to_value(RequestHeaderRef { header, reason })
         }
         EventKind::RequestContext { context } => serde_json::to_value(context),
+        EventKind::LlmRetry { retry } => serde_json::to_value(retry),
+        EventKind::LlmRetryStarted { started } => serde_json::to_value(started),
         EventKind::EndSeed => serde_json::to_value(EmptyData {}),
         EventKind::Unknown { data, .. } => Ok(data.as_value().clone()),
     }

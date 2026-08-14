@@ -151,6 +151,91 @@ The type checker checks this repository's oracle source against the pinned TypeS
 
 The oracle is independently authored for behavioral comparison and does not copy upstream test implementation. Its JSON output contains observed API facts and short stable error messages under the upstream MIT license; it contains no source code, user data, or credential.
 
+## Phase 3 inspection
+
+Phase 3 studies how provider attempts, model-visible history, tools, retries,
+and cancellation are joined into balanced turns. The primary source files are:
+
+- [`packages/core/agent-loop/src/agent.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/agent.ts): turn/step driver, request reconstruction, raw-chunk logging, successful message anchoring, and stop reasons.
+- [`packages/core/agent-loop/src/tool-calls.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/tool-calls.ts): intention-before-execution, parallel/exclusive groups, model-order commits, cancellation draining, and skipped-call results.
+- [`packages/core/agent-loop/src/runtime-context.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/runtime-context.ts): dynamic context snapshots, which are researched but deferred from the Phase 3 Rust boundary.
+- [`packages/core/agent-loop/src/invariant.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/invariant.ts): requests must be built from logged headers and derived history.
+- [`packages/core/agent-loop/src/constants.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/agent-loop/src/constants.ts): upstream parallel-tool default.
+- [`packages/core/system-prompt/src/index.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/system-prompt/src/index.ts): identity/persona/section and tool-schema assembly order.
+- [`packages/core/tools/src/index.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/core/tools/src/index.ts): execution/result vocabulary, cancellation normalization, additional context, and tool failures.
+- [`packages/llm/llm/src/assembler.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm/src/assembler.ts): successful chunk assembly, max-token tool suppression, usage, and replay state.
+- [`packages/llm/llm-retry/src/index.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm-retry/src/index.ts): provider-routed retry decisions, delay calculation, Retry-After, and cancellation.
+- [`packages/llm/llm-retry/src/types.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm-retry/src/types.ts), [`invariant.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm-retry/src/invariant.ts), and [`history.ts`](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/llm/llm-retry/src/history.ts): durable retry schema, correlation, numbering, and route lookup.
+
+The directly relevant deterministic tests are:
+
+- `packages/core/agent-loop/tests/{loop,request-reconstruction,request-error,tool-calls,cancel,interception,contract-regressions,resume,tool-order,invariant}.spec.ts`;
+- `packages/core/system-prompt/tests/{system-prompt,tool-order}.spec.ts`;
+- `packages/llm/llm-retry/tests/{retry,transport-recovery,invariant}.spec.ts`;
+- `packages/core/tools/tests/{tools,execution-mode,invariant}.spec.ts`;
+- timeout and approval-policy tests used only to establish later-phase fail-closed boundaries.
+
+The final research rerun exercised the complete keyless Agent Loop suite
+(18 files, 329 tests) and the combined retry, tool, and system-prompt suites
+(21 files, 533 tests). All passed without network access or a credential. The
+key-controlled request-cache end-to-end test was read but intentionally not run
+because it requires a real `DEEPSEEK_API_KEY`.
+
+The inspected upstream loop has no total turn, step, attempt, token, tool-call,
+or duration budget, and the `always` retry policy is unbounded until success or
+cancellation. Rust limits are therefore a recorded safety difference, not an
+upstream feature. Tool parallelism, live inbox steering, dynamic system prompt
+context, approval, real tools, subprocess cleanup, persistence, and compaction
+remain in their assigned later phases.
+
+### Phase 3 runtime oracle
+
+The independently authored Phase 3 oracle runs the real pinned Agent Loop with
+a public fake adapter and fake tool under fixed time and UUIDs. At adapter entry
+it captures the already-committed event prefix, folded request header, request
+context, derived messages, and the complete normalized request. This proves the
+important timing invariant—model-visible content is logged before it is sent—
+rather than reconstructing evidence only after the turn finishes.
+
+[`scripts/generate-upstream-agent-fixtures.ts`](../scripts/generate-upstream-agent-fixtures.ts)
+records text completion, a tool round trip, a retry in the same step,
+max-token tool suppression, and pre-step rejection. The fixture retains the
+official inbox events; the Rust comparison removes exactly
+`agent/inbox/spliced`, then compares the remaining core trace. Provider chunks
+are read back from the fixture instead of being duplicated in a handwritten
+Rust script.
+
+From the pinned upstream root, type-check and regenerate it with:
+
+```console
+node ../ds-harness-rs/scripts/typecheck-upstream-agent-fixtures.mjs
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  ../ds-harness-rs/scripts/generate-upstream-agent-fixtures.ts \
+  /tmp/upstream-phase3-a.json
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  ../ds-harness-rs/scripts/generate-upstream-agent-fixtures.ts \
+  /tmp/upstream-phase3-b.json
+
+cmp -s /tmp/upstream-phase3-a.json /tmp/upstream-phase3-b.json
+cmp -s /tmp/upstream-phase3-a.json \
+  ../ds-harness-rs/tests/fixtures/agent/upstream_phase3_oracle.json
+```
+
+The accepted Phase 3 research run used Node 26.0.0, TypeScript 6.0.3, and the
+upstream lockfile's `tsx` 4.22.4. Its SHA-256 values are:
+
+- type checker: `3c21bb11b3ef37d3ec8182a4585d9efe4e7adc0c2984e8fefcf634a09a4976f1`;
+- generator: `d8368691f9b14dd2f214db512ba60d4b192dbfc7a1b915c52e78bd80c6226444`;
+- fixture: `9b0249dacd104df417faff37657aa0a71cde0675f66808db793bd52c562b124c`.
+
+The checker loads the oracle into the pinned TypeScript source graph; merely
+executing it through `tsx` is not counted as type checking. Two generations
+were byte-identical and matched the committed fixture. The default Rust suite
+uses only that JSON file, so ordinary verification stays offline, keyless, and
+independent of Node or the upstream clone.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
