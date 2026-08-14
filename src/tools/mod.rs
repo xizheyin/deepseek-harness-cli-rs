@@ -7,11 +7,17 @@ mod grep;
 mod list;
 #[cfg(unix)]
 mod patch;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process;
 mod read;
 mod registry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod shell;
 mod workspace;
 
 pub use error::ToolRegistryBuildError;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;
 #[cfg(unix)]
 pub use registry::WorkspaceToolRegistry;

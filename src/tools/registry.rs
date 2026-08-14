@@ -21,6 +21,12 @@ use super::{
 
 #[cfg(unix)]
 use super::patch;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::process::ProcessRunner;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::shell::{self, ShellEnvironment};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::agent::ToolClaimProfile;
 #[cfg(unix)]
 use crate::agent::{ToolPreparation, ToolPreparationFuture};
 
@@ -107,24 +113,7 @@ impl std::fmt::Debug for WorkspaceToolRegistry {
 impl WorkspaceToolRegistry {
     pub fn open(workspace: impl AsRef<Path>) -> Result<Self, ToolRegistryBuildError> {
         let workspace = Workspace::open(workspace.as_ref())?;
-        let mut schemas = build_schemas()?;
-        schemas.push(schema(
-            "apply_patch",
-            "Prepare one bounded single-file unified diff for approval and atomic publication.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "patch": {
-                        "type": "string",
-                        "description": "One strict create/update unified diff; runtime maximum is 262144 UTF-8 bytes",
-                        "minLength": 1,
-                        "maxLength": 262144
-                    }
-                },
-                "required": ["patch"],
-                "additionalProperties": false
-            }),
-        )?);
+        let schemas = build_workspace_schemas()?;
         Ok(Self {
             workspace,
             schemas: schemas.into(),
@@ -139,6 +128,146 @@ impl WorkspaceToolRegistry {
     #[must_use]
     pub fn workspace(&self) -> &Path {
         self.workspace.display_root()
+    }
+}
+
+/// Explicit local authority containing read/search, file mutation, and one
+/// approval-gated foreground Bash action. It retains exactly one workspace
+/// capability shared by all six tools.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct LocalToolRegistry {
+    workspace: Arc<Workspace>,
+    schemas: Arc<[ToolSchema]>,
+    environment: ShellEnvironment,
+    runner: Arc<ProcessRunner>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::fmt::Debug for LocalToolRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalToolRegistry")
+            .field("workspace_configured", &true)
+            .field("schema_count", &self.schemas.len())
+            .field("environment", &self.environment)
+            .field("process_runner", &self.runner)
+            .finish()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl LocalToolRegistry {
+    pub fn open(workspace: impl AsRef<Path>) -> Result<Self, ToolRegistryBuildError> {
+        let workspace = Arc::new(Workspace::open(workspace.as_ref())?);
+        let environment = ShellEnvironment::capture()?;
+        let runner = Arc::new(
+            ProcessRunner::open()
+                .map_err(|_| ToolRegistryBuildError::UnsupportedProcessObserver)?,
+        );
+        let mut schemas = build_workspace_schemas()?;
+        schemas.push(shell::schema()?);
+        Ok(Self {
+            workspace,
+            schemas: schemas.into(),
+            environment,
+            runner,
+        })
+    }
+
+    #[must_use]
+    pub fn schemas(&self) -> &[ToolSchema] {
+        &self.schemas
+    }
+
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        self.workspace.display_root()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ToolExecutor for LocalToolRegistry {
+    fn claim_profile(&self, tool_name: &str) -> ToolClaimProfile {
+        if tool_name == "bash" {
+            ToolClaimProfile::shell_action()
+        } else {
+            ToolClaimProfile::standard()
+        }
+    }
+
+    fn execute(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        if request.name() == "bash" {
+            return Box::pin(async { shell::approval_required_result() });
+        }
+        if request.name() == "apply_patch" {
+            return Box::pin(async {
+                ToolCallError::model(
+                    "ApprovalError",
+                    "APPROVAL_REQUIRED",
+                    "apply_patch must use the Agent approval preparation stage",
+                )
+                .into_execution_result()
+            });
+        }
+        let workspace = Arc::clone(&self.workspace);
+        Box::pin(async move {
+            let outcome = dispatch(
+                workspace.as_ref(),
+                request.name(),
+                request.arguments().as_value(),
+                &cancellation,
+            )
+            .await;
+            match outcome {
+                Ok(text) => normalize_success(text),
+                Err(error) => error.into_execution_result(),
+            }
+        })
+    }
+
+    fn prepare(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolPreparationFuture<'_> {
+        let workspace = Arc::clone(&self.workspace);
+        let environment = self.environment.entries();
+        let runner = Arc::clone(&self.runner);
+        Box::pin(async move {
+            if request.name() == "apply_patch" {
+                return patch::prepare(
+                    workspace.as_ref(),
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await;
+            }
+            if request.name() == "bash" {
+                return shell::prepare_action_setup(
+                    request,
+                    workspace,
+                    Box::new(move |dispatch, invocation| {
+                        shell::finish_action(dispatch, invocation, environment, runner)
+                    }),
+                );
+            }
+            let outcome = dispatch(
+                workspace.as_ref(),
+                request.name(),
+                request.arguments().as_value(),
+                &cancellation,
+            )
+            .await;
+            let result = match outcome {
+                Ok(text) => normalize_success(text),
+                Err(error) => error.into_execution_result(),
+            }?;
+            Ok(ToolPreparation::Complete(result))
+        })
     }
 }
 
@@ -339,6 +468,29 @@ fn build_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
             }),
         )?,
     ])
+}
+
+#[cfg(unix)]
+fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
+    let mut schemas = build_schemas()?;
+    schemas.push(schema(
+        "apply_patch",
+        "Prepare one bounded single-file unified diff for approval and atomic publication.",
+        json!({
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "One strict create/update unified diff; runtime maximum is 262144 UTF-8 bytes",
+                    "minLength": 1,
+                    "maxLength": 262144
+                }
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        }),
+    )?);
+    Ok(schemas)
 }
 
 fn schema(

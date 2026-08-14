@@ -3,6 +3,8 @@
 mod approval;
 mod assembler;
 mod error;
+#[cfg(test)]
+mod phase6_tests;
 mod retry;
 mod tool;
 
@@ -35,13 +37,18 @@ use crate::{
 pub use approval::{
     ApprovalFuture, ApprovalPrompt, ApprovalPromptError, ApprovalProvider, ApprovalProviderError,
     ApprovalRequest, FileChangePolicy, MAX_APPROVAL_PREVIEW_BYTES, MAX_APPROVAL_REASON_BYTES,
-    NoApprovalProvider,
+    NoApprovalProvider, ShellPolicy,
 };
 pub use error::{AgentBuildError, AgentLoopError, AgentRuntimeError};
+pub(crate) use tool::{
+    ActionDeclineReason, ToolActionControl, ToolActionOutcome, ToolActionSetupControl,
+    ToolActionSetupOutcome, ToolActionTurnStop, ToolDispatchBinding,
+};
 pub use tool::{
-    MutationDeclineReason, NoTools, PreparedToolMutation, ToolCommitDisposition, ToolCommitFn,
-    ToolCommitOutcome, ToolDeclineFn, ToolExecutionFuture, ToolExecutionRequest,
-    ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture,
+    MutationDeclineReason, NoTools, PreparedToolAction, PreparedToolActionSetup,
+    PreparedToolMutation, ToolClaimProfile, ToolCommitDisposition, ToolCommitFn, ToolCommitOutcome,
+    ToolDeclineFn, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
+    ToolExecutorError, ToolPreparation, ToolPreparationFuture,
 };
 
 use assembler::{AssembledAssistant, AssistantAssembler, without_tool_calls};
@@ -56,11 +63,14 @@ pub const MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST: u64 = 1_000_000;
 pub const MAX_AGENT_REPORTED_OUTPUT_TOKENS: u64 = 4_000_000;
 pub const MAX_AGENT_TURN_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 pub const MAX_AGENT_TOOL_DURATION: Duration = Duration::from_secs(5 * 60);
+pub const MAX_AGENT_ACTION_PREPARATION_DURATION: Duration = Duration::from_secs(5);
 /// Extra time given to an already-started tool to observe cancellation and
 /// release its own resources. This is separate from the normal tool timeout.
 pub const MAX_AGENT_TOOL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 pub const MAX_AGENT_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// Maximum compact event size promised by a sealed foreground action.
+pub const MAX_AGENT_ACTION_RESULT_EVENT_BYTES: usize = 128 * 1024;
 /// Session-event capacity protected before an irreversible mutation starts.
 pub const MAX_AGENT_COMMITTED_TOOL_RESULT_EVENT_BYTES: usize = 512 * 1024;
 pub const MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES: usize = 4 * 1024 * 1024;
@@ -328,6 +338,7 @@ pub struct AgentLoopConfig {
     tools: Vec<ToolSchema>,
     limits: AgentLimits,
     file_change_policy: FileChangePolicy,
+    shell_policy: ShellPolicy,
     approval_provider: Arc<dyn ApprovalProvider>,
 }
 
@@ -341,6 +352,7 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("tool_count", &self.tools.len())
             .field("limits", &self.limits)
             .field("file_change_policy", &self.file_change_policy)
+            .field("shell_policy", &self.shell_policy)
             .field("approval_provider_configured", &true)
             .finish()
     }
@@ -355,6 +367,7 @@ impl AgentLoopConfig {
             tools: Vec::new(),
             limits: AgentLimits::default(),
             file_change_policy: FileChangePolicy::Ask,
+            shell_policy: ShellPolicy::Ask,
             approval_provider: Arc::new(NoApprovalProvider),
         }
     }
@@ -405,8 +418,31 @@ impl AgentLoopConfig {
     }
 
     #[must_use]
+    pub fn with_approval_provider(mut self, provider: Arc<dyn ApprovalProvider>) -> Self {
+        self.approval_provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_file_change_policy(mut self, policy: FileChangePolicy) -> Self {
+        self.file_change_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_shell_policy(mut self, policy: ShellPolicy) -> Self {
+        self.shell_policy = policy;
+        self
+    }
+
+    #[must_use]
     pub fn file_change_policy(&self) -> FileChangePolicy {
         self.file_change_policy
+    }
+
+    #[must_use]
+    pub fn shell_policy(&self) -> ShellPolicy {
+        self.shell_policy
     }
 
     #[must_use]
@@ -694,6 +730,31 @@ enum StepOutcome {
     Error(LlmFailure),
 }
 
+struct StepResolution {
+    outcome: StepOutcome,
+    latched_turn_stop: ToolActionTurnStop,
+}
+
+impl StepResolution {
+    fn new(outcome: StepOutcome) -> Self {
+        Self {
+            outcome,
+            latched_turn_stop: ToolActionTurnStop::None,
+        }
+    }
+
+    fn with_stop(outcome: StepOutcome, stop: ToolStop) -> Self {
+        Self {
+            outcome,
+            latched_turn_stop: match stop {
+                ToolStop::None => ToolActionTurnStop::None,
+                ToolStop::Cancelled => ToolActionTurnStop::CallerCancelled,
+                ToolStop::TurnTimeout => ToolActionTurnStop::TurnTimeout,
+            },
+        }
+    }
+}
+
 enum StreamOutcome {
     Finished(AssembledAssistant, Vec<EventSeq>),
     Cancelled,
@@ -842,7 +903,7 @@ async fn run_entered_turn(
         messages.clear();
         driver.counters.steps += 1;
 
-        let outcome = match AssertUnwindSafe(run_step(
+        let resolution = match AssertUnwindSafe(run_step(
             reservation,
             driver,
             turn,
@@ -853,24 +914,38 @@ async fn run_entered_turn(
         .catch_unwind()
         .await
         {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) | Err(_) => StepOutcome::Error(failure_reason(
+            Ok(Ok(resolution)) => resolution,
+            Ok(Err(_)) | Err(_) => StepResolution::new(StepOutcome::Error(failure_reason(
                 "AGENT_INTERNAL",
                 "the agent stopped after an internal failure",
-            )?),
+            )?)),
         };
         reservation.settle_exact(&mut step_end)?;
-        if cancellation.is_cancelled() {
-            return Ok(TurnEndReason::Aborted {
-                reason: TurnEndCancelCause::User,
-            });
+        match resolution.latched_turn_stop {
+            ToolActionTurnStop::CallerCancelled => {
+                return Ok(TurnEndReason::Aborted {
+                    reason: TurnEndCancelCause::User,
+                });
+            }
+            ToolActionTurnStop::TurnTimeout => {
+                return Ok(TurnEndReason::Error {
+                    error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+                });
+            }
+            ToolActionTurnStop::None => {
+                if cancellation.is_cancelled() {
+                    return Ok(TurnEndReason::Aborted {
+                        reason: TurnEndCancelCause::User,
+                    });
+                }
+                if Instant::now() >= driver.deadline {
+                    return Ok(TurnEndReason::Error {
+                        error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+                    });
+                }
+            }
         }
-        if Instant::now() >= driver.deadline {
-            return Ok(TurnEndReason::Error {
-                error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
-            });
-        }
-        match outcome {
+        match resolution.outcome {
             StepOutcome::Continue => {}
             StepOutcome::Completed => return Ok(TurnEndReason::Completed),
             StepOutcome::MaxTokens => return Ok(TurnEndReason::MaxTokens),
@@ -891,24 +966,24 @@ async fn run_step(
     step: StepId,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
-) -> Result<StepOutcome, AgentLoopError> {
+) -> Result<StepResolution, AgentLoopError> {
     let mut retry_chains: BTreeMap<(String, String), (RetryId, usize)> = BTreeMap::new();
     let mut retries_in_step = 0_usize;
     loop {
         if cancellation.is_cancelled() {
-            return Ok(StepOutcome::Cancelled);
+            return Ok(StepResolution::new(StepOutcome::Cancelled));
         }
         if Instant::now() >= driver.deadline {
-            return Ok(StepOutcome::Error(failure_reason(
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                 "AGENT_TURN_TIMEOUT",
                 "the agent turn timed out",
-            )?));
+            )?)));
         }
         if driver.counters.attempts >= driver.config.limits.max_attempts_per_turn {
-            return Ok(StepOutcome::Error(failure_reason(
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                 "AGENT_MAX_MODEL_ATTEMPTS",
                 "the agent reached its model-attempt limit",
-            )?));
+            )?)));
         }
         driver.counters.attempts += 1;
 
@@ -921,27 +996,29 @@ async fn run_step(
             match catch_unwind(AssertUnwindSafe(|| driver.provider.prepare_call(proposed))) {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(error)) => {
-                    return Ok(StepOutcome::Error(failure_from_display(
-                        "AGENT_PROVIDER_PREPARE",
-                        "provider preparation failed",
-                        &error,
-                    )?));
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        failure_from_display(
+                            "AGENT_PROVIDER_PREPARE",
+                            "provider preparation failed",
+                            &error,
+                        )?,
+                    )));
                 }
                 Err(_) => {
-                    return Ok(StepOutcome::Error(failure_reason(
+                    return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                         "AGENT_PROVIDER_PANIC",
                         "the provider panicked while preparing a request",
-                    )?));
+                    )?)));
                 }
             };
         let effective_config = prepared.config().clone();
         if !effective_config.max_tokens().is_some_and(|maximum| {
             maximum.get() > 0 && maximum.get() <= driver.config.limits.max_output_tokens_per_request
         }) {
-            return Ok(StepOutcome::Error(failure_reason(
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                 "AGENT_MAX_OUTPUT_TOKENS",
                 "the prepared model request exceeds the agent output-token limit",
-            )?));
+            )?)));
         }
         let retry_policy = prepared.retry_policy().clone();
         let adapter_defaults = prepared.adapter_defaults().clone();
@@ -975,7 +1052,9 @@ async fn run_step(
             })) {
                 Ok(_) => *driver.request_header_logged = true,
                 Err(error) if is_budget_error(&error) => {
-                    return Ok(StepOutcome::Error(budget_failure.clone()));
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        budget_failure.clone(),
+                    )));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -995,7 +1074,9 @@ async fn run_step(
             })) {
                 Ok(_) => {}
                 Err(error) if is_budget_error(&error) => {
-                    return Ok(StepOutcome::Error(budget_failure.clone()));
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        budget_failure.clone(),
+                    )));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1014,11 +1095,13 @@ async fn run_step(
         let request = match request_result {
             Ok(request) => request,
             Err(error) => {
-                return Ok(StepOutcome::Error(failure_from_display(
-                    "AGENT_REQUEST",
-                    "model request construction failed",
-                    &error,
-                )?));
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    failure_from_display(
+                        "AGENT_REQUEST",
+                        "model request construction failed",
+                        &error,
+                    )?,
+                )));
             }
         };
 
@@ -1031,10 +1114,10 @@ async fn run_step(
             Ok(stream) => stream,
             Err(_) => {
                 attempt_cancellation.cancel();
-                return Ok(StepOutcome::Error(failure_reason(
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                     "AGENT_PROVIDER_PANIC",
                     "the provider panicked while opening a stream",
-                )?));
+                )?)));
             }
         };
         let streamed = consume_stream(
@@ -1052,8 +1135,12 @@ async fn run_step(
         }
         let streamed = streamed?;
         let (assembled, source_seqs) = match streamed {
-            StreamOutcome::Cancelled => return Ok(StepOutcome::Cancelled),
-            StreamOutcome::Error(error) => return Ok(StepOutcome::Error(error)),
+            StreamOutcome::Cancelled => {
+                return Ok(StepResolution::new(StepOutcome::Cancelled));
+            }
+            StreamOutcome::Error(error) => {
+                return Ok(StepResolution::new(StepOutcome::Error(error)));
+            }
             StreamOutcome::Finished(assembled, sources) => (assembled, sources),
         };
 
@@ -1061,14 +1148,14 @@ async fn run_step(
         // before publishing an assistant message or starting any tool work.
         if cancellation.is_cancelled() {
             attempt_cancellation.cancel();
-            return Ok(StepOutcome::Cancelled);
+            return Ok(StepResolution::new(StepOutcome::Cancelled));
         }
         if Instant::now() >= driver.deadline {
             attempt_cancellation.cancel();
-            return Ok(StepOutcome::Error(failure_reason(
+            return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                 "AGENT_TURN_TIMEOUT",
                 "the agent turn timed out",
-            )?));
+            )?)));
         }
 
         let provider_failure = match assembled.finish.kind() {
@@ -1079,7 +1166,7 @@ async fn run_step(
         };
         if let Some(failure) = provider_failure {
             if cancellation.is_cancelled() {
-                return Ok(StepOutcome::Cancelled);
+                return Ok(StepResolution::new(StepOutcome::Cancelled));
             }
             let key = policy_key(&retry_policy)
                 .map_err(|error| AgentLoopError::Serialization(error.to_string()))?;
@@ -1090,19 +1177,19 @@ async fn run_step(
                 .ok_or(AgentLoopError::Invariant("retry number exhausted"))?;
             let initial_decision = decide(&retry_policy, &failure, next_retry, None);
             if matches!(initial_decision, RetryDecision::Stop) {
-                return Ok(StepOutcome::Error(failure));
+                return Ok(StepResolution::new(StepOutcome::Error(failure)));
             }
             if retries_in_step >= driver.config.limits.max_retries_per_step {
-                return Ok(StepOutcome::Error(failure_reason(
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                     "AGENT_MAX_RETRIES",
                     "the agent reached its retry limit",
-                )?));
+                )?)));
             }
             if driver.counters.attempts >= driver.config.limits.max_attempts_per_turn {
-                return Ok(StepOutcome::Error(failure_reason(
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                     "AGENT_MAX_MODEL_ATTEMPTS",
                     "the agent reached its model-attempt limit",
-                )?));
+                )?)));
             }
             let decision = match initial_decision {
                 RetryDecision::NeedsSample => decide(
@@ -1114,7 +1201,7 @@ async fn run_step(
                 decision => decision,
             };
             let RetryDecision::Retry { delay_ms } = decision else {
-                return Ok(StepOutcome::Error(failure));
+                return Ok(StepResolution::new(StepOutcome::Error(failure)));
             };
             let retry_id = match retry_chains.get(&chain_key) {
                 Some((retry_id, _)) => retry_id.clone(),
@@ -1156,7 +1243,9 @@ async fn run_step(
             match reservation.append(NewEvent::log(EventKind::llm_retry(retry_event))) {
                 Ok(_) => {}
                 Err(error) if is_budget_error(&error) => {
-                    return Ok(StepOutcome::Error(budget_failure.clone()));
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        budget_failure.clone(),
+                    )));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1167,29 +1256,33 @@ async fn run_step(
             let delay = Duration::from_secs_f64(delay_ms.get() / 1_000.0);
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(StepOutcome::Cancelled),
+                _ = cancellation.cancelled() => {
+                    return Ok(StepResolution::new(StepOutcome::Cancelled));
+                }
                 _ = tokio::time::sleep_until(driver.deadline) => {
-                    return Ok(StepOutcome::Error(failure_reason(
+                    return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                         "AGENT_TURN_TIMEOUT",
                         "the agent turn timed out",
-                    )?));
+                    )?)));
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
             if cancellation.is_cancelled() {
-                return Ok(StepOutcome::Cancelled);
+                return Ok(StepResolution::new(StepOutcome::Cancelled));
             }
             if Instant::now() >= driver.deadline {
-                return Ok(StepOutcome::Error(failure_reason(
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
                     "AGENT_TURN_TIMEOUT",
                     "the agent turn timed out",
-                )?));
+                )?)));
             }
             let started = LlmRetryStartedEvent::new(retry_id, turn, step, number)?;
             match reservation.append(NewEvent::log(EventKind::llm_retry_started(started))) {
                 Ok(_) => {}
                 Err(error) if is_budget_error(&error) => {
-                    return Ok(StepOutcome::Error(budget_failure.clone()));
+                    return Ok(StepResolution::new(StepOutcome::Error(
+                        budget_failure.clone(),
+                    )));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1315,7 +1408,7 @@ async fn commit_successful_attempt(
     source_seqs: Vec<EventSeq>,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
-) -> Result<StepOutcome, AgentLoopError> {
+) -> Result<StepResolution, AgentLoopError> {
     let max_tokens = matches!(assembled.finish.kind(), FinishReasonKind::MaxTokens);
     if max_tokens {
         assembled.content = without_tool_calls(assembled.content);
@@ -1352,7 +1445,24 @@ async fn commit_successful_attempt(
         } else {
             "the model produced invalid or duplicate tool calls"
         };
-        return Ok(StepOutcome::Error(failure_reason(code, message)?));
+        return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+            code, message,
+        )?)));
+    }
+    let mut claim_profiles = Vec::with_capacity(tool_calls.len());
+    for call in &tool_calls {
+        let profile = match catch_unwind(AssertUnwindSafe(|| {
+            driver.tools.claim_profile(call.name.as_str())
+        })) {
+            Ok(profile) => profile,
+            Err(_) => {
+                return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_TOOL_EXECUTOR",
+                    "the tool executor failed while planning result capacity",
+                )?)));
+            }
+        };
+        claim_profiles.push(profile);
     }
     let assistant = NewEvent::surface(
         EventKind::AssistantMessage {
@@ -1367,15 +1477,17 @@ async fn commit_successful_attempt(
         match reservation.append(assistant) {
             Ok(_) => {}
             Err(error) if is_budget_error(&error) => {
-                return Ok(StepOutcome::Error(budget_failure.clone()));
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    budget_failure.clone(),
+                )));
             }
             Err(error) => return Err(error.into()),
         }
-        return Ok(if max_tokens {
+        return Ok(StepResolution::new(if max_tokens {
             StepOutcome::MaxTokens
         } else {
             StepOutcome::Completed
-        });
+        }));
     }
 
     commit_tool_round(
@@ -1385,6 +1497,7 @@ async fn commit_successful_attempt(
         step,
         assistant,
         tool_calls,
+        claim_profiles,
         cancellation,
         budget_failure,
     )
@@ -1422,6 +1535,8 @@ fn validate_tool_calls(driver: &Driver<'_>, calls: &[ToolCall]) -> Result<(), &'
 
 struct PlannedTool {
     call: ToolCall,
+    claim_profile: ToolClaimProfile,
+    dispatch: ToolDispatchBinding,
     call_seq: EventSeq,
     result_message_id: String,
     call_claim: EventClaim,
@@ -1436,9 +1551,15 @@ async fn commit_tool_round(
     step: StepId,
     assistant: NewEvent,
     calls: Vec<ToolCall>,
+    claim_profiles: Vec<ToolClaimProfile>,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
-) -> Result<StepOutcome, AgentLoopError> {
+) -> Result<StepResolution, AgentLoopError> {
+    if calls.len() != claim_profiles.len() {
+        return Err(AgentLoopError::Invariant(
+            "tool calls and claim profiles have different lengths",
+        ));
+    }
     let mut result_ids = Vec::with_capacity(calls.len());
     let mut fallbacks = Vec::with_capacity(1 + calls.len() * 2);
     fallbacks.push(assistant);
@@ -1453,44 +1574,90 @@ async fn commit_tool_round(
             call.name.clone(),
             call.arguments.clone(),
         )));
-        fallbacks.push(tool_error_event(
-            turn,
-            step,
-            &result_id,
-            call,
-            maximum_source_seq,
-            "TOOL_OUTPUT_BUDGET_EXCEEDED",
-            call.name.as_str(),
-            "tool output could not fit safely in the session",
-        )?);
+        let profile = claim_profiles[result_ids.len()];
+        fallbacks.push(if profile.is_shell_action() {
+            shell_prestart_error_event(
+                turn,
+                step,
+                &result_id,
+                call,
+                maximum_source_seq,
+                "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                call.name.as_str(),
+                "shell output could not fit safely in the session",
+                None,
+            )?
+        } else {
+            tool_error_event(
+                turn,
+                step,
+                &result_id,
+                call,
+                maximum_source_seq,
+                "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                call.name.as_str(),
+                "tool output could not fit safely in the session",
+            )?
+        });
         result_ids.push(result_id);
     }
     let mut claims = match reservation.claim_batch(fallbacks) {
         Ok(claims) => claims,
         Err(error) if is_budget_error(&error) => {
-            return Ok(StepOutcome::Error(budget_failure.clone()));
+            return Ok(StepResolution::new(StepOutcome::Error(
+                budget_failure.clone(),
+            )));
         }
         Err(error) => return Err(error.into()),
     };
     let mut assistant_claim = claims.remove(0);
-    reservation.settle_exact(&mut assistant_claim)?;
     let mut planned = Vec::with_capacity(calls.len());
-    for (call, result_message_id) in calls.into_iter().zip(result_ids) {
+    for ((call, result_message_id), claim_profile) in
+        calls.into_iter().zip(result_ids).zip(claim_profiles)
+    {
         let call_claim = claims.remove(0);
         let result_claim = claims.remove(0);
         planned.push(PlannedTool {
             call,
+            claim_profile,
+            dispatch: ToolDispatchBinding::new(),
             call_seq: maximum_source_seq,
             result_message_id,
             call_claim,
             result_claim,
         });
     }
+    for index in 0..planned.len() {
+        if !planned[index].claim_profile.is_shell_action() {
+            continue;
+        }
+        let ceiling = shell_prestart_claim_ceiling(
+            turn,
+            step,
+            &planned[index].result_message_id,
+            &planned[index].call,
+            maximum_source_seq,
+        )?;
+        if let Err(error) =
+            reservation.reserve_claim_retained_json_bytes(&mut planned[index].result_claim, ceiling)
+        {
+            release_uncommitted_tool_round(reservation, &mut assistant_claim, &mut planned)?;
+            return if is_budget_error(&error) {
+                Ok(StepResolution::new(StepOutcome::Error(
+                    budget_failure.clone(),
+                )))
+            } else {
+                Err(error.into())
+            };
+        }
+    }
+    reservation.settle_exact(&mut assistant_claim)?;
     driver.counters.tool_calls += planned.len();
 
     let mut cancelled = false;
     let mut concludes_turn = false;
     let mut infrastructure_failure = None;
+    let mut latched_stop = ToolStop::None;
     for index in 0..planned.len() {
         let (completed, remaining) = planned.split_at_mut(index + 1);
         let plan = &mut completed[index];
@@ -1498,37 +1665,65 @@ async fn commit_tool_round(
         plan.call_seq = actual_call_seq;
         reservation.rebind_claim_fallback(
             &mut plan.result_claim,
-            tool_error_event(
-                turn,
-                step,
-                &plan.result_message_id,
-                &plan.call,
-                actual_call_seq,
-                "TOOL_OUTPUT_BUDGET_EXCEEDED",
-                plan.call.name.as_str(),
-                "tool output could not fit safely in the session",
-            )?,
+            if plan.claim_profile.is_shell_action() {
+                shell_prestart_error_event(
+                    turn,
+                    step,
+                    &plan.result_message_id,
+                    &plan.call,
+                    actual_call_seq,
+                    "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                    plan.call.name.as_str(),
+                    "shell output could not fit safely in the session",
+                    None,
+                )?
+            } else {
+                tool_error_event(
+                    turn,
+                    step,
+                    &plan.result_message_id,
+                    &plan.call,
+                    actual_call_seq,
+                    "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                    plan.call.name.as_str(),
+                    "tool output could not fit safely in the session",
+                )?
+            },
         )?;
         let result = if infrastructure_failure.is_some() || cancelled || cancellation.is_cancelled()
         {
             cancelled |= cancellation.is_cancelled();
-            ToolRun::ModelError {
-                code: "ABORTED_BEFORE_DISPATCH",
-                message: "tool was not started because the turn was stopping",
+            if plan.claim_profile.is_shell_action() {
+                prestart_failure(
+                    plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the turn was stopping",
+                    if cancellation.is_cancelled() {
+                        ToolStop::Cancelled
+                    } else {
+                        ToolStop::None
+                    },
+                )
+            } else {
+                ToolRun::ModelError {
+                    code: "ABORTED_BEFORE_DISPATCH",
+                    message: "tool was not started because the turn was stopping",
+                }
             }
         } else {
-            run_one_tool(driver, &plan.call, cancellation).await
+            run_one_tool(driver, plan, cancellation).await
         };
         match result {
             ToolRun::Completed {
                 result,
-                committed,
+                settlement,
                 stop,
             } => {
                 let requested_conclusion = result.concludes_turn();
                 let committed_preferred =
-                    settle_tool_result(reservation, driver, plan, result, committed)?;
+                    settle_tool_result(reservation, driver, plan, result, settlement)?;
                 concludes_turn |= requested_conclusion && committed_preferred;
+                latched_stop = latch_tool_stop(latched_stop, stop);
                 match stop {
                     ToolStop::None => {}
                     ToolStop::Cancelled => cancelled = true,
@@ -1546,13 +1741,14 @@ async fn commit_tool_round(
                 match resolved {
                     ToolRun::Completed {
                         result,
-                        committed,
+                        settlement,
                         stop,
                     } => {
                         let requested_conclusion = result.concludes_turn();
                         let committed_preferred =
-                            settle_tool_result(reservation, driver, plan, result, committed)?;
+                            settle_tool_result(reservation, driver, plan, result, settlement)?;
                         concludes_turn |= requested_conclusion && committed_preferred;
+                        latched_stop = latch_tool_stop(latched_stop, stop);
                         match stop {
                             ToolStop::None => {}
                             ToolStop::Cancelled => cancelled = true,
@@ -1564,16 +1760,19 @@ async fn commit_tool_round(
                             }
                         }
                     }
-                    ToolRun::Infrastructure => {
+                    ToolRun::Infrastructure { stop } => {
                         reservation.release(&mut plan.result_claim)?;
                         for later in remaining {
                             reservation.release(&mut later.call_claim)?;
                             reservation.release(&mut later.result_claim)?;
                         }
-                        return Ok(StepOutcome::Error(failure_reason(
-                            "AGENT_TOOL_EXECUTOR",
-                            "the prepared file mutation failed without a definite outcome",
-                        )?));
+                        return Ok(StepResolution::with_stop(
+                            StepOutcome::Error(failure_reason(
+                                "AGENT_TOOL_EXECUTOR",
+                                "the prepared file mutation failed without a definite outcome",
+                            )?),
+                            latch_tool_stop(latched_stop, stop),
+                        ));
                     }
                     _ => {
                         return Err(AgentLoopError::Invariant(
@@ -1582,9 +1781,56 @@ async fn commit_tool_round(
                     }
                 }
             }
+            ToolRun::Action(action) => {
+                let resolved =
+                    resolve_action(reservation, driver, plan, action, cancellation).await?;
+                match resolved {
+                    ToolRun::Completed {
+                        result,
+                        settlement,
+                        stop,
+                    } => {
+                        let requested_conclusion = result.concludes_turn();
+                        let committed_preferred =
+                            settle_tool_result(reservation, driver, plan, result, settlement)?;
+                        concludes_turn |= requested_conclusion && committed_preferred;
+                        latched_stop = latch_tool_stop(latched_stop, stop);
+                        match stop {
+                            ToolStop::None => {}
+                            ToolStop::Cancelled => cancelled = true,
+                            ToolStop::TurnTimeout => {
+                                infrastructure_failure = Some(failure_reason(
+                                    "AGENT_TURN_TIMEOUT",
+                                    "the agent turn timed out",
+                                )?);
+                            }
+                        }
+                    }
+                    ToolRun::ActionUnresolved { stop } => {
+                        reservation.release(&mut plan.result_claim)?;
+                        for later in remaining {
+                            reservation.release(&mut later.call_claim)?;
+                            reservation.release(&mut later.result_claim)?;
+                        }
+                        return Ok(StepResolution::with_stop(
+                            StepOutcome::Error(failure_reason(
+                                "AGENT_TOOL_EXECUTOR",
+                                "the foreground action lost a definite result",
+                            )?),
+                            latch_tool_stop(latched_stop, stop),
+                        ));
+                    }
+                    _ => {
+                        return Err(AgentLoopError::Invariant(
+                            "action resolution returned an invalid tool state",
+                        ));
+                    }
+                }
+            }
             ToolRun::ModelError { code, message } => {
                 if code == "ABORTED" {
                     cancelled = true;
+                    latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
                 }
                 let failure_name = if matches!(code, "ABORTED" | "ABORTED_BEFORE_DISPATCH") {
                     "AbortError"
@@ -1603,18 +1849,36 @@ async fn commit_tool_round(
                 )?;
                 reservation.settle(&mut plan.result_claim, preferred)?;
             }
-            ToolRun::Infrastructure => {
+            ToolRun::Infrastructure { stop } => {
                 reservation.release(&mut plan.result_claim)?;
                 for later in remaining {
                     reservation.release(&mut later.call_claim)?;
                     reservation.release(&mut later.result_claim)?;
                 }
-                return Ok(StepOutcome::Error(failure_reason(
-                    "AGENT_TOOL_EXECUTOR",
-                    "the tool executor failed before producing a result",
-                )?));
+                return Ok(StepResolution::with_stop(
+                    StepOutcome::Error(failure_reason(
+                        "AGENT_TOOL_EXECUTOR",
+                        "the tool executor failed before producing a result",
+                    )?),
+                    latch_tool_stop(latched_stop, stop),
+                ));
+            }
+            ToolRun::ActionUnresolved { stop } => {
+                reservation.release(&mut plan.result_claim)?;
+                for later in remaining {
+                    reservation.release(&mut later.call_claim)?;
+                    reservation.release(&mut later.result_claim)?;
+                }
+                return Ok(StepResolution::with_stop(
+                    StepOutcome::Error(failure_reason(
+                        "AGENT_TOOL_EXECUTOR",
+                        "the foreground action lost a definite result",
+                    )?),
+                    latch_tool_stop(latched_stop, stop),
+                ));
             }
             ToolRun::TurnTimeout => {
+                latched_stop = latch_tool_stop(latched_stop, ToolStop::TurnTimeout);
                 let preferred = tool_error_event(
                     turn,
                     step,
@@ -1632,17 +1896,44 @@ async fn commit_tool_round(
                 )?);
             }
         }
+        // A stop may become ready while a truthful result is being encoded and
+        // appended. Preserve the first such outer stop before any later tool is
+        // dispatched; do not rewrite the result that was just committed.
+        latched_stop = latch_tool_stop(
+            latched_stop,
+            sample_tool_stop(cancellation, driver.deadline),
+        );
+        match latched_stop {
+            ToolStop::None => {}
+            ToolStop::Cancelled => cancelled = true,
+            ToolStop::TurnTimeout => {
+                if infrastructure_failure.is_none() {
+                    infrastructure_failure = Some(failure_reason(
+                        "AGENT_TURN_TIMEOUT",
+                        "the agent turn timed out",
+                    )?);
+                }
+            }
+        }
     }
-    if let Some(error) = infrastructure_failure {
-        return Ok(StepOutcome::Error(error));
+    let outcome = if let Some(error) = infrastructure_failure {
+        StepOutcome::Error(error)
+    } else if cancelled {
+        StepOutcome::Cancelled
+    } else if concludes_turn {
+        StepOutcome::Completed
+    } else {
+        StepOutcome::Continue
+    };
+    Ok(StepResolution::with_stop(outcome, latched_stop))
+}
+
+fn latch_tool_stop(current: ToolStop, observed: ToolStop) -> ToolStop {
+    if current == ToolStop::None {
+        observed
+    } else {
+        current
     }
-    if cancelled {
-        return Ok(StepOutcome::Cancelled);
-    }
-    if concludes_turn {
-        return Ok(StepOutcome::Completed);
-    }
-    Ok(StepOutcome::Continue)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1655,33 +1946,48 @@ enum ToolStop {
 enum ToolRun {
     Completed {
         result: ToolExecutionResult,
-        committed: bool,
+        settlement: ResultSettlement,
         stop: ToolStop,
     },
     Mutation(PreparedToolMutation),
+    Action(PreparedToolActionSetup),
     ModelError {
         code: &'static str,
         message: &'static str,
     },
-    Infrastructure,
+    Infrastructure {
+        stop: ToolStop,
+    },
+    ActionUnresolved {
+        stop: ToolStop,
+    },
     TurnTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultSettlement {
+    FallbackAllowed,
+    PreferredRequired,
 }
 
 async fn run_one_tool(
     driver: &Driver<'_>,
-    call: &ToolCall,
+    plan: &PlannedTool,
     cancellation: &CancellationToken,
 ) -> ToolRun {
+    let call = &plan.call;
     if !driver
         .config
         .tools
         .iter()
         .any(|tool| tool.name() == call.name)
     {
-        return ToolRun::ModelError {
-            code: "UNKNOWN_TOOL",
-            message: "the requested tool was not declared for this model call",
-        };
+        return prestart_failure(
+            plan,
+            "UNKNOWN_TOOL",
+            "the requested tool was not declared for this model call",
+            ToolStop::None,
+        );
     }
     let raw = if call.arguments.is_empty() {
         "{}".to_owned()
@@ -1689,10 +1995,12 @@ async fn run_one_tool(
         call.arguments.clone()
     };
     if raw.len() > driver.config.limits.max_tool_argument_bytes {
-        return ToolRun::ModelError {
-            code: "TOOL_ARGUMENTS_TOO_LARGE",
-            message: "tool arguments exceed the configured size limit",
-        };
+        return prestart_failure(
+            plan,
+            "TOOL_ARGUMENTS_TOO_LARGE",
+            "tool arguments exceed the configured size limit",
+            ToolStop::None,
+        );
     }
     let parsed = match serde_json::from_str(raw.as_str())
         .ok()
@@ -1700,20 +2008,39 @@ async fn run_one_tool(
     {
         Some(parsed) => parsed,
         None => {
-            return ToolRun::ModelError {
-                code: "INVALID_TOOL_ARGUMENTS",
-                message: "tool arguments are not valid bounded JSON",
-            };
+            return prestart_failure(
+                plan,
+                "INVALID_TOOL_ARGUMENTS",
+                "tool arguments are not valid bounded JSON",
+                ToolStop::None,
+            );
         }
     };
-    let request = ToolExecutionRequest::new(call.id.clone(), call.name.clone(), raw, parsed);
+    let request = ToolExecutionRequest::new(
+        call.id.clone(),
+        call.name.clone(),
+        raw,
+        parsed,
+        plan.dispatch.clone(),
+    );
     let child = cancellation.child_token();
     if cancellation.is_cancelled() {
         child.cancel();
-        return ToolRun::ModelError {
-            code: "ABORTED_BEFORE_DISPATCH",
-            message: "tool was not started because the turn was stopping",
-        };
+        return prestart_failure(
+            plan,
+            "ABORTED_BEFORE_DISPATCH",
+            "tool was not started because the turn was stopping",
+            ToolStop::Cancelled,
+        );
+    }
+    if Instant::now() >= driver.deadline {
+        child.cancel();
+        return prestart_failure(
+            plan,
+            "ABORTED_BEFORE_DISPATCH",
+            "tool was not started because the agent turn timed out",
+            ToolStop::TurnTimeout,
+        );
     }
     let future = match catch_unwind(AssertUnwindSafe(|| {
         driver.tools.prepare(request, child.clone())
@@ -1721,36 +2048,109 @@ async fn run_one_tool(
         Ok(future) => future,
         Err(_) => {
             child.cancel();
-            return ToolRun::Infrastructure;
+            return ToolRun::Infrastructure {
+                stop: sample_tool_stop(cancellation, driver.deadline),
+            };
         }
     };
     let guarded = AssertUnwindSafe(future).catch_unwind();
     tokio::pin!(guarded);
+    let tool_deadline = Instant::now() + driver.config.limits.tool_duration;
     let interrupted = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
-            ToolRun::ModelError { code: "ABORTED", message: "tool was cancelled" }
+            prestart_failure(
+                plan,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the turn was stopping",
+                ToolStop::Cancelled,
+            )
         }
         _ = tokio::time::sleep_until(driver.deadline) => {
-            ToolRun::TurnTimeout
+            prestart_failure(
+                plan,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the agent turn timed out",
+                ToolStop::TurnTimeout,
+            )
         }
-        _ = tokio::time::sleep(driver.config.limits.tool_duration) => {
-            ToolRun::ModelError { code: "TOOL_TIMEOUT", message: "tool exceeded its configured timeout" }
+        _ = tokio::time::sleep_until(tool_deadline) => {
+            prestart_failure(
+                plan,
+                "TOOL_TIMEOUT",
+                "tool preparation exceeded its configured timeout",
+                ToolStop::None,
+            )
         }
-        result = &mut guarded => return if cancellation.is_cancelled() {
-            child.cancel();
-            ToolRun::ModelError { code: "ABORTED", message: "tool was cancelled" }
-        } else {
+        result = &mut guarded => return {
+            if cancellation.is_cancelled() {
+                child.cancel();
+                return prestart_failure(
+                    plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the turn was stopping",
+                    ToolStop::Cancelled,
+                );
+            }
+            if Instant::now() >= driver.deadline {
+                child.cancel();
+                return prestart_failure(
+                    plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the agent turn timed out",
+                    ToolStop::TurnTimeout,
+                );
+            }
+            if Instant::now() >= tool_deadline {
+                child.cancel();
+                return prestart_failure(
+                    plan,
+                    "TOOL_TIMEOUT",
+                    "tool preparation exceeded its configured timeout",
+                    ToolStop::None,
+                );
+            }
             match result {
-                Ok(Ok(ToolPreparation::Complete(result))) => ToolRun::Completed {
-                    result,
-                    committed: false,
-                    stop: ToolStop::None,
-                },
-                Ok(Ok(ToolPreparation::Mutation(mutation))) => ToolRun::Mutation(mutation),
+                Ok(Ok(ToolPreparation::Complete(result))) => {
+                    if plan.claim_profile.is_shell_action()
+                        && tool::validate_action_not_started_result(&result).is_err()
+                    {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Completed {
+                            result,
+                            settlement: ResultSettlement::FallbackAllowed,
+                            stop: ToolStop::None,
+                        }
+                    }
+                }
+                Ok(Ok(ToolPreparation::Mutation(mutation))) => {
+                    if plan.claim_profile.is_shell_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Mutation(mutation)
+                    }
+                }
+                Ok(Ok(ToolPreparation::Action(action))) => {
+                    if !plan.claim_profile.is_shell_action()
+                        || !action.matches_dispatch(&plan.dispatch)
+                    {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Action(action)
+                    }
+                }
                 Ok(Err(_)) | Err(_) => {
                     child.cancel();
-                    ToolRun::Infrastructure
+                    ToolRun::Infrastructure {
+                        stop: sample_tool_stop(cancellation, driver.deadline),
+                    }
                 }
             }
         }
@@ -1766,6 +2166,391 @@ async fn run_one_tool(
     // outcome (and no extension detail is retained).
     let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
     interrupted
+}
+
+fn prestart_failure(
+    plan: &PlannedTool,
+    code: &'static str,
+    message: &'static str,
+    stop: ToolStop,
+) -> ToolRun {
+    if !plan.claim_profile.is_shell_action() {
+        return match stop {
+            ToolStop::TurnTimeout => ToolRun::TurnTimeout,
+            ToolStop::Cancelled => ToolRun::ModelError {
+                code: "ABORTED",
+                message: "tool was cancelled",
+            },
+            ToolStop::None => ToolRun::ModelError { code, message },
+        };
+    }
+    let failure_name = if matches!(code, "ABORTED" | "ABORTED_BEFORE_DISPATCH") {
+        "AbortError"
+    } else {
+        plan.call.name.as_str()
+    };
+    match shell_prestart_result(code, failure_name, message, None) {
+        Ok(result) => ToolRun::Completed {
+            result,
+            settlement: ResultSettlement::FallbackAllowed,
+            stop,
+        },
+        Err(_) => ToolRun::Infrastructure { stop },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_action(
+    reservation: &mut SessionReservation<'_>,
+    driver: &Driver<'_>,
+    plan: &mut PlannedTool,
+    setup: PreparedToolActionSetup,
+    cancellation: &CancellationToken,
+) -> Result<ToolRun, AgentLoopError> {
+    let setup_child = cancellation.child_token();
+    let preparation_deadline = Instant::now() + MAX_AGENT_ACTION_PREPARATION_DURATION;
+    let setup_control =
+        ToolActionSetupControl::new(setup_child.clone(), driver.deadline, preparation_deadline);
+    let setup_future = match catch_unwind(AssertUnwindSafe(|| setup.resolve(setup_control))) {
+        Ok(future) => future,
+        Err(_) => {
+            setup_child.cancel();
+            return Ok(ToolRun::ActionUnresolved {
+                stop: sample_tool_stop(cancellation, driver.deadline),
+            });
+        }
+    };
+    let guarded_setup = AssertUnwindSafe(setup_future).catch_unwind();
+    tokio::pin!(guarded_setup);
+    let mut latched_stop = ToolStop::None;
+    let setup_outcome = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::Cancelled;
+            }
+            _ = tokio::time::sleep_until(driver.deadline), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::TurnTimeout;
+            }
+            outcome = &mut guarded_setup => break match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Ok(ToolRun::ActionUnresolved {
+                        stop: preserve_or_sample_tool_stop(
+                            latched_stop,
+                            cancellation,
+                            driver.deadline,
+                        ),
+                    });
+                }
+            },
+        }
+    };
+    let action = match setup_outcome {
+        ToolActionSetupOutcome::Ready(action) => {
+            latched_stop =
+                preserve_or_sample_tool_stop(latched_stop, cancellation, driver.deadline);
+            if !action.matches_dispatch(&plan.dispatch) {
+                return Ok(ToolRun::ActionUnresolved { stop: latched_stop });
+            }
+            if latched_stop != ToolStop::None {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::AbortedBeforeDispatch,
+                    latched_stop,
+                ));
+            }
+            action
+        }
+        ToolActionSetupOutcome::NotStarted { turn_stop, result } => {
+            let stop = preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            );
+            if tool::validate_action_not_started_result(&result).is_err() {
+                return Ok(ToolRun::ActionUnresolved { stop });
+            }
+            return Ok(ToolRun::Completed {
+                result,
+                settlement: ResultSettlement::FallbackAllowed,
+                stop,
+            });
+        }
+        ToolActionSetupOutcome::Infrastructure { turn_stop } => {
+            return Ok(ToolRun::ActionUnresolved {
+                stop: preserve_or_sample_tool_stop(
+                    merge_action_stop(latched_stop, turn_stop),
+                    cancellation,
+                    driver.deadline,
+                ),
+            });
+        }
+    };
+
+    if driver.config.shell_policy == ShellPolicy::Deny {
+        return Ok(decline_action(
+            action,
+            ActionDeclineReason::PolicyDenied,
+            ToolStop::None,
+        ));
+    }
+
+    let maximum_result_bytes = action.maximum_result_event_bytes();
+    let configured_result_fits = maximum_result_bytes <= driver.config.limits.max_tool_result_bytes
+        && driver
+            .counters
+            .tool_result_bytes
+            .checked_add(maximum_result_bytes)
+            .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes);
+    if !configured_result_fits {
+        return Ok(decline_action(
+            action,
+            ActionDeclineReason::OutputBudgetExceeded,
+            ToolStop::None,
+        ));
+    }
+    match reservation
+        .reserve_claim_retained_json_bytes(&mut plan.result_claim, maximum_result_bytes)
+    {
+        Ok(()) => {}
+        Err(error) if is_budget_error(&error) => {
+            return Ok(decline_action(
+                action,
+                ActionDeclineReason::OutputBudgetExceeded,
+                ToolStop::None,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let action = if driver.config.shell_policy == ShellPolicy::Ask {
+        let approval_id = match next_id(driver.runtime, AgentIdKind::Approval) {
+            Ok(id) => ApprovalRequestId::new(id),
+            Err(_) => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+        };
+        let request = ApprovalRequest::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            plan.call.id.clone(),
+            action.prompt(),
+        );
+        let asked = NewEvent::log(EventKind::approval_asked(ApprovalAskedEvent::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            Some(plan.call.id.clone()),
+            action.prompt().reason().map(str::to_owned),
+        )?));
+        let decision_fallback = NewEvent::log(EventKind::approval_decided(
+            ApprovalDecidedEvent::new(approval_id.clone(), ApprovalOutcome::AllowedOnce)?,
+        ));
+        let mut audit_claims = match reservation.claim_batch([asked, decision_fallback]) {
+            Ok(claims) => claims,
+            Err(error) if is_budget_error(&error) => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut asked_claim = audit_claims.remove(0);
+        let mut decided_claim = audit_claims.remove(0);
+        reservation.settle_exact(&mut asked_claim)?;
+        let (outcome, stop) = request_approval(driver, request, cancellation).await;
+        reservation.rebind_claim_fallback(
+            &mut decided_claim,
+            NewEvent::log(EventKind::approval_decided(ApprovalDecidedEvent::new(
+                approval_id,
+                outcome,
+            )?)),
+        )?;
+        reservation.settle_exact(&mut decided_claim)?;
+        match outcome {
+            ApprovalOutcome::AllowedOnce if stop == ToolStop::None => action,
+            ApprovalOutcome::AllowedOnce | ApprovalOutcome::Cancelled => {
+                return Ok(decline_action(
+                    action,
+                    if stop == ToolStop::Cancelled {
+                        ActionDeclineReason::AbortedBeforeDispatch
+                    } else {
+                        ActionDeclineReason::ApprovalCancelled
+                    },
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Rejected => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalRejected,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Unavailable => {
+                return Ok(decline_action(
+                    action,
+                    ActionDeclineReason::ApprovalUnavailable,
+                    stop,
+                ));
+            }
+        }
+    } else {
+        action
+    };
+
+    let final_stop = sample_tool_stop(cancellation, driver.deadline);
+    if final_stop != ToolStop::None {
+        return Ok(decline_action(
+            action,
+            ActionDeclineReason::AbortedBeforeDispatch,
+            final_stop,
+        ));
+    }
+    if !action.matches_dispatch(&plan.dispatch) {
+        return Ok(ToolRun::ActionUnresolved {
+            stop: ToolStop::None,
+        });
+    }
+
+    let action_child = cancellation.child_token();
+    let action_deadline = Instant::now() + driver.config.limits.tool_duration;
+    let action_control =
+        ToolActionControl::new(action_child.clone(), driver.deadline, action_deadline);
+    let action_future = match catch_unwind(AssertUnwindSafe(|| action.run(action_control))) {
+        Ok(future) => future,
+        Err(_) => {
+            action_child.cancel();
+            return Ok(ToolRun::ActionUnresolved {
+                stop: sample_tool_stop(cancellation, driver.deadline),
+            });
+        }
+    };
+    let guarded_action = AssertUnwindSafe(action_future).catch_unwind();
+    tokio::pin!(guarded_action);
+    let mut latched_stop = ToolStop::None;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled(), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::Cancelled;
+            }
+            _ = tokio::time::sleep_until(driver.deadline), if latched_stop == ToolStop::None => {
+                latched_stop = ToolStop::TurnTimeout;
+            }
+            outcome = &mut guarded_action => break match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Ok(ToolRun::ActionUnresolved {
+                        stop: preserve_or_sample_tool_stop(
+                            latched_stop,
+                            cancellation,
+                            driver.deadline,
+                        ),
+                    });
+                }
+            },
+        }
+    };
+    Ok(match outcome {
+        ToolActionOutcome::NotStarted { turn_stop, result } => {
+            let stop = preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            );
+            if tool::validate_action_not_started_result(&result).is_err() {
+                ToolRun::ActionUnresolved { stop }
+            } else {
+                ToolRun::Completed {
+                    result,
+                    settlement: ResultSettlement::FallbackAllowed,
+                    stop,
+                }
+            }
+        }
+        ToolActionOutcome::Infrastructure { turn_stop }
+        | ToolActionOutcome::StartedOwnershipLost { turn_stop } => ToolRun::ActionUnresolved {
+            stop: preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            ),
+        },
+        ToolActionOutcome::StartedAndQuiescent { turn_stop, result } => {
+            let stop = preserve_or_sample_tool_stop(
+                merge_action_stop(latched_stop, turn_stop),
+                cancellation,
+                driver.deadline,
+            );
+            let result_fits_declared_bound = action_result_event_bytes(reservation, plan, &result)
+                .is_ok_and(|size| size <= maximum_result_bytes);
+            if tool::validate_action_started_result(&result).is_err() || !result_fits_declared_bound
+            {
+                ToolRun::ActionUnresolved { stop }
+            } else {
+                ToolRun::Completed {
+                    result,
+                    settlement: ResultSettlement::PreferredRequired,
+                    stop,
+                }
+            }
+        }
+    })
+}
+
+fn decline_action(
+    action: PreparedToolAction,
+    reason: ActionDeclineReason,
+    stop: ToolStop,
+) -> ToolRun {
+    match action.decline(reason) {
+        Ok(result) => ToolRun::Completed {
+            result,
+            settlement: ResultSettlement::FallbackAllowed,
+            stop,
+        },
+        Err(_) => ToolRun::ActionUnresolved { stop },
+    }
+}
+
+fn sample_tool_stop(cancellation: &CancellationToken, deadline: Instant) -> ToolStop {
+    if cancellation.is_cancelled() {
+        ToolStop::Cancelled
+    } else if Instant::now() >= deadline {
+        ToolStop::TurnTimeout
+    } else {
+        ToolStop::None
+    }
+}
+
+fn preserve_or_sample_tool_stop(
+    current: ToolStop,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> ToolStop {
+    if current == ToolStop::None {
+        sample_tool_stop(cancellation, deadline)
+    } else {
+        current
+    }
+}
+
+fn merge_action_stop(current: ToolStop, reported: ToolActionTurnStop) -> ToolStop {
+    if current != ToolStop::None {
+        return current;
+    }
+    match reported {
+        ToolActionTurnStop::None => ToolStop::None,
+        ToolActionTurnStop::CallerCancelled => ToolStop::Cancelled,
+        ToolActionTurnStop::TurnTimeout => ToolStop::TurnTimeout,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1911,10 +2696,10 @@ fn decline_mutation(
     match mutation.decline(reason) {
         Ok(result) => ToolRun::Completed {
             result,
-            committed: false,
+            settlement: ResultSettlement::FallbackAllowed,
             stop,
         },
-        Err(_) => ToolRun::Infrastructure,
+        Err(_) => ToolRun::Infrastructure { stop },
     }
 }
 
@@ -2029,7 +2814,7 @@ async fn commit_mutation(
         Ok(Ok(Ok(outcome))) => outcome,
         Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
             child.cancel();
-            return Ok(ToolRun::Infrastructure);
+            return Ok(ToolRun::Infrastructure { stop });
         }
     };
     let (disposition, result) = outcome.into_parts();
@@ -2055,7 +2840,11 @@ async fn commit_mutation(
     };
     Ok(ToolRun::Completed {
         result,
-        committed: disposition == ToolCommitDisposition::Committed,
+        settlement: if disposition == ToolCommitDisposition::Committed {
+            ResultSettlement::PreferredRequired
+        } else {
+            ResultSettlement::FallbackAllowed
+        },
         stop,
     })
 }
@@ -2100,7 +2889,7 @@ fn settle_tool_result(
     driver: &mut Driver<'_>,
     plan: &mut PlannedTool,
     result: ToolExecutionResult,
-    committed: bool,
+    settlement: ResultSettlement,
 ) -> Result<bool, AgentLoopError> {
     let (content, is_error, error, meta, _concludes_turn) = result.into_parts();
     let component_bytes = content
@@ -2124,7 +2913,8 @@ fn settle_tool_result(
                 .checked_add(size)
                 .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes)
     });
-    if !committed && !component_fits {
+    let preferred_required = settlement == ResultSettlement::PreferredRequired;
+    if !preferred_required && !component_fits {
         reservation.settle_exact(&mut plan.result_claim)?;
         return Ok(false);
     }
@@ -2135,7 +2925,7 @@ fn settle_tool_result(
         is_error,
     ) {
         Ok(message) => message,
-        Err(error) if committed => return Err(error.into()),
+        Err(error) if preferred_required => return Err(error.into()),
         Err(_) => {
             reservation.settle_exact(&mut plan.result_claim)?;
             return Ok(false);
@@ -2153,13 +2943,13 @@ fn settle_tool_result(
     );
     let size = match Session::event_retained_json_bytes(&preferred) {
         Ok(size) => size,
-        Err(error) if committed => return Err(error.into()),
+        Err(error) if preferred_required => return Err(error.into()),
         Err(_) => {
             reservation.settle_exact(&mut plan.result_claim)?;
             return Ok(false);
         }
     };
-    if committed {
+    if preferred_required {
         reservation.settle_preferred_only(&mut plan.result_claim, preferred)?;
         driver.counters.tool_result_bytes = driver.counters.tool_result_bytes.saturating_add(size);
         return Ok(true);
@@ -2180,6 +2970,136 @@ fn settle_tool_result(
         driver.counters.tool_result_bytes += size;
     }
     Ok(preferred)
+}
+
+fn release_uncommitted_tool_round(
+    reservation: &mut SessionReservation<'_>,
+    assistant_claim: &mut EventClaim,
+    planned: &mut [PlannedTool],
+) -> Result<(), AgentLoopError> {
+    reservation.release(assistant_claim)?;
+    for plan in planned {
+        reservation.release(&mut plan.call_claim)?;
+        reservation.release(&mut plan.result_claim)?;
+    }
+    Ok(())
+}
+
+fn action_result_event_bytes(
+    reservation: &SessionReservation<'_>,
+    plan: &PlannedTool,
+    result: &ToolExecutionResult,
+) -> Result<usize, AgentLoopError> {
+    let message = Message::tool_result(
+        plan.result_message_id.clone(),
+        plan.call.id.clone(),
+        result.content().to_vec(),
+        result.is_error(),
+    )?;
+    let event = NewEvent::surface(
+        EventKind::ToolResult {
+            turn: plan_turn(plan, reservation)?,
+            step: plan_step(plan, reservation)?,
+            message,
+            error: result.error().cloned(),
+            meta: result.meta().cloned(),
+        },
+        SurfaceIntent::append().with_sources(vec![plan.call_seq]),
+    );
+    Session::event_retained_json_bytes(&event).map_err(Into::into)
+}
+
+fn shell_prestart_result(
+    code: &'static str,
+    failure_name: &str,
+    message: impl Into<String>,
+    parsed: Option<(&str, u64)>,
+) -> Result<ToolExecutionResult, AgentLoopError> {
+    let mut meta = serde_json::Map::from_iter([
+        (
+            "kind".to_owned(),
+            serde_json::Value::String("foreground".to_owned()),
+        ),
+        ("started".to_owned(), serde_json::Value::Bool(false)),
+        ("exitCode".to_owned(), serde_json::Value::Null),
+        ("signal".to_owned(), serde_json::Value::Null),
+    ]);
+    if let Some((workdir, timeout_ms)) = parsed {
+        meta.insert(
+            "workdir".to_owned(),
+            serde_json::Value::String(workdir.to_owned()),
+        );
+        meta.insert(
+            "timeoutMs".to_owned(),
+            serde_json::Value::Number(timeout_ms.into()),
+        );
+    }
+    Ok(ToolExecutionResult::new(
+        vec![ContentBlock::text(message.into())?],
+        true,
+        Some(ToolFailure {
+            name: failure_name.to_owned(),
+            code: code.to_owned(),
+        }),
+        Some(
+            JsonValue::new(serde_json::Value::Object(meta)).map_err(|_| {
+                AgentLoopError::Invariant("internal shell result metadata exceeded model bounds")
+            })?,
+        ),
+        false,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shell_prestart_error_event(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    code: &'static str,
+    failure_name: &str,
+    message: impl Into<String>,
+    parsed: Option<(&str, u64)>,
+) -> Result<NewEvent, AgentLoopError> {
+    let result = shell_prestart_result(code, failure_name, message, parsed)?;
+    let (content, is_error, error, meta, _) = result.into_parts();
+    let message = Message::tool_result(message_id, call.id.clone(), content, is_error)?;
+    Ok(NewEvent::surface(
+        EventKind::ToolResult {
+            turn,
+            step,
+            message,
+            error,
+            meta,
+        },
+        SurfaceIntent::append().with_sources(vec![call_seq]),
+    ))
+}
+
+fn shell_prestart_claim_ceiling(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+) -> Result<usize, AgentLoopError> {
+    // This probe is never appended. Backslashes exercise JSON expansion for a
+    // maximum-length legal relative workdir; the remaining text covers every
+    // fixed pre-start diagnostic without inventing those fields in a fallback.
+    let workdir = "\\".repeat(4_096);
+    let probe = shell_prestart_error_event(
+        turn,
+        step,
+        message_id,
+        call,
+        call_seq,
+        "TOOL_OUTPUT_BUDGET_EXCEEDED",
+        &"x".repeat(256),
+        "x".repeat(4_096),
+        Some((workdir.as_str(), 295_000)),
+    )?;
+    Session::event_retained_json_bytes(&probe).map_err(Into::into)
 }
 
 fn plan_turn(

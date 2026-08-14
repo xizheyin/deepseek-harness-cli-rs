@@ -198,6 +198,7 @@ dependencies = [
  "futures-util",
  "globset",
  "httpdate",
+ "libc",
  "regex",
  "reqwest",
  "rustix",

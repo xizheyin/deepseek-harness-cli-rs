@@ -1,6 +1,7 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use thiserror::Error;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -18,10 +19,88 @@ pub type ToolExecutionFuture<'a> =
 pub type ToolPreparationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolPreparation, ToolExecutorError>> + Send + 'a>>;
 
+/// Bounded planning fact sampled before the Agent reserves durable tool events.
+///
+/// External executors can request the ordinary profile. The crate-controlled
+/// action profile has no public constructor because it enables a stronger,
+/// non-detachable cleanup contract.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ToolClaimProfile {
+    kind: ToolClaimKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolClaimKind {
+    Standard,
+    ShellAction,
+}
+
+impl std::fmt::Debug for ToolClaimProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ToolClaimProfile")
+            .field(&match self.kind {
+                ToolClaimKind::Standard => "standard",
+                ToolClaimKind::ShellAction => "crate-controlled-action",
+            })
+            .finish()
+    }
+}
+
+impl ToolClaimProfile {
+    #[must_use]
+    pub fn standard() -> Self {
+        Self {
+            kind: ToolClaimKind::Standard,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn shell_action() -> Self {
+        Self {
+            kind: ToolClaimKind::ShellAction,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_shell_action(self) -> bool {
+        self.kind == ToolClaimKind::ShellAction
+    }
+}
+
+impl Default for ToolClaimProfile {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Per-dispatch unforgeable identity retained by the Agent and sealed action.
+#[derive(Clone)]
+pub(crate) struct ToolDispatchBinding(Arc<()>);
+
+impl ToolDispatchBinding {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    #[must_use]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for ToolDispatchBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ToolDispatchBinding(<redacted>)")
+    }
+}
+
 /// Result of preparing one durable tool call.
 pub enum ToolPreparation {
     Complete(ToolExecutionResult),
     Mutation(PreparedToolMutation),
+    Action(PreparedToolActionSetup),
 }
 
 impl std::fmt::Debug for ToolPreparation {
@@ -29,8 +108,355 @@ impl std::fmt::Debug for ToolPreparation {
         match self {
             Self::Complete(result) => formatter.debug_tuple("Complete").field(result).finish(),
             Self::Mutation(mutation) => formatter.debug_tuple("Mutation").field(mutation).finish(),
+            Self::Action(action) => formatter.debug_tuple("Action").field(action).finish(),
         }
     }
+}
+
+/// Why a prepared foreground action was closed before process creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActionDeclineReason {
+    PolicyDenied,
+    ApprovalRejected,
+    ApprovalCancelled,
+    ApprovalUnavailable,
+    AbortedBeforeDispatch,
+    OutputBudgetExceeded,
+}
+
+/// First outer-turn stop observed while an owned action was settling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ToolActionTurnStop {
+    #[default]
+    None,
+    CallerCancelled,
+    TurnTimeout,
+}
+
+/// Control passed to the side-effect-free, owned setup stage.
+pub(crate) struct ToolActionSetupControl {
+    cancellation: CancellationToken,
+    turn_deadline: Instant,
+    preparation_deadline: Instant,
+}
+
+impl ToolActionSetupControl {
+    #[must_use]
+    pub(crate) fn new(
+        cancellation: CancellationToken,
+        turn_deadline: Instant,
+        preparation_deadline: Instant,
+    ) -> Self {
+        Self {
+            cancellation,
+            turn_deadline,
+            preparation_deadline,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    #[must_use]
+    pub(crate) fn turn_deadline(&self) -> Instant {
+        self.turn_deadline
+    }
+
+    #[must_use]
+    pub(crate) fn preparation_deadline(&self) -> Instant {
+        self.preparation_deadline
+    }
+}
+
+/// Control passed to the single-use foreground action runner.
+pub(crate) struct ToolActionControl {
+    cancellation: CancellationToken,
+    turn_deadline: Instant,
+    action_deadline: Instant,
+}
+
+impl ToolActionControl {
+    #[must_use]
+    pub(crate) fn new(
+        cancellation: CancellationToken,
+        turn_deadline: Instant,
+        action_deadline: Instant,
+    ) -> Self {
+        Self {
+            cancellation,
+            turn_deadline,
+            action_deadline,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    #[must_use]
+    pub(crate) fn turn_deadline(&self) -> Instant {
+        self.turn_deadline
+    }
+
+    #[must_use]
+    pub(crate) fn action_deadline(&self) -> Instant {
+        self.action_deadline
+    }
+}
+
+pub(crate) type ToolActionSetupFuture =
+    Pin<Box<dyn Future<Output = ToolActionSetupOutcome> + Send + 'static>>;
+pub(crate) type ToolActionSetupFn =
+    Box<dyn FnOnce(ToolActionSetupControl) -> ToolActionSetupFuture + Send + 'static>;
+pub(crate) type ToolActionFuture =
+    Pin<Box<dyn Future<Output = ToolActionOutcome> + Send + 'static>>;
+pub(crate) type ToolActionDeclineFn = Box<
+    dyn FnOnce(ActionDeclineReason) -> Result<ToolExecutionResult, ToolExecutorError>
+        + Send
+        + 'static,
+>;
+pub(crate) type ToolActionRunFn =
+    Box<dyn FnOnce(ToolActionControl) -> ToolActionFuture + Send + 'static>;
+
+/// Sealed carrier for the action's side-effect-free setup stage.
+pub struct PreparedToolActionSetup {
+    dispatch: ToolDispatchBinding,
+    resolve: ToolActionSetupFn,
+}
+
+impl std::fmt::Debug for PreparedToolActionSetup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedToolActionSetup")
+            .field("dispatch", &"<redacted>")
+            .field("single_use_resolve", &true)
+            .finish()
+    }
+}
+
+impl PreparedToolActionSetup {
+    pub(crate) fn new(
+        dispatch: ToolDispatchBinding,
+        resolve: ToolActionSetupFn,
+    ) -> Result<Self, ToolExecutorError> {
+        Ok(Self { dispatch, resolve })
+    }
+
+    #[must_use]
+    pub(crate) fn matches_dispatch(&self, expected: &ToolDispatchBinding) -> bool {
+        self.dispatch.ptr_eq(expected)
+    }
+
+    pub(crate) fn resolve(self, control: ToolActionSetupControl) -> ToolActionSetupFuture {
+        (self.resolve)(control)
+    }
+}
+
+/// Definite outcome of resolving the pre-spawn action setup.
+pub(crate) enum ToolActionSetupOutcome {
+    Ready(PreparedToolAction),
+    NotStarted {
+        turn_stop: ToolActionTurnStop,
+        result: ToolExecutionResult,
+    },
+    Infrastructure {
+        turn_stop: ToolActionTurnStop,
+    },
+}
+
+/// Sealed, fully owned, single-use foreground action.
+pub struct PreparedToolAction {
+    dispatch: ToolDispatchBinding,
+    prompt: ApprovalPrompt,
+    maximum_result_event_bytes: usize,
+    decline: ToolActionDeclineFn,
+    run: ToolActionRunFn,
+}
+
+impl std::fmt::Debug for PreparedToolAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedToolAction")
+            .field("dispatch", &"<redacted>")
+            .field("prompt", &self.prompt)
+            .field(
+                "maximum_result_event_bytes",
+                &self.maximum_result_event_bytes,
+            )
+            .field("single_use_decline", &true)
+            .field("single_use_run", &true)
+            .finish()
+    }
+}
+
+impl PreparedToolAction {
+    pub(crate) fn new(
+        dispatch: ToolDispatchBinding,
+        prompt: ApprovalPrompt,
+        maximum_result_event_bytes: usize,
+        decline: ToolActionDeclineFn,
+        run: ToolActionRunFn,
+    ) -> Result<Self, ToolExecutorError> {
+        if maximum_result_event_bytes == 0
+            || maximum_result_event_bytes > super::MAX_AGENT_ACTION_RESULT_EVENT_BYTES
+        {
+            return Err(ToolExecutorError::new(
+                "prepared action result bound is outside the supported range",
+            ));
+        }
+        Ok(Self {
+            dispatch,
+            prompt,
+            maximum_result_event_bytes,
+            decline,
+            run,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn matches_dispatch(&self, expected: &ToolDispatchBinding) -> bool {
+        self.dispatch.ptr_eq(expected)
+    }
+
+    #[must_use]
+    pub(crate) fn prompt(&self) -> &ApprovalPrompt {
+        &self.prompt
+    }
+
+    #[must_use]
+    pub(crate) fn maximum_result_event_bytes(&self) -> usize {
+        self.maximum_result_event_bytes
+    }
+
+    pub(crate) fn decline(
+        self,
+        reason: ActionDeclineReason,
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        let result = (self.decline)(reason)?;
+        validate_action_result(&result, false, true)?;
+        Ok(result)
+    }
+
+    pub(crate) fn run(self, control: ToolActionControl) -> ToolActionFuture {
+        (self.run)(control)
+    }
+}
+
+/// Definite lifecycle outcome of a sealed foreground action.
+pub(crate) enum ToolActionOutcome {
+    NotStarted {
+        turn_stop: ToolActionTurnStop,
+        result: ToolExecutionResult,
+    },
+    Infrastructure {
+        turn_stop: ToolActionTurnStop,
+    },
+    StartedAndQuiescent {
+        turn_stop: ToolActionTurnStop,
+        result: ToolExecutionResult,
+    },
+    StartedOwnershipLost {
+        turn_stop: ToolActionTurnStop,
+    },
+}
+
+pub(crate) fn validate_action_not_started_result(
+    result: &ToolExecutionResult,
+) -> Result<(), ToolExecutorError> {
+    validate_action_result(result, false, true)
+}
+
+pub(crate) fn validate_action_started_result(
+    result: &ToolExecutionResult,
+) -> Result<(), ToolExecutorError> {
+    validate_action_result(result, true, false)
+}
+
+fn validate_action_result(
+    result: &ToolExecutionResult,
+    expected_started: bool,
+    require_error: bool,
+) -> Result<(), ToolExecutorError> {
+    let fields = result
+        .meta()
+        .and_then(|meta| meta.as_value().as_object())
+        .ok_or_else(|| ToolExecutorError::new("an action result requires object metadata"))?;
+    if require_error && !result.is_error() {
+        return Err(ToolExecutorError::new(
+            "a not-started action result must be an error",
+        ));
+    }
+    if fields.get("started").and_then(serde_json::Value::as_bool) != Some(expected_started) {
+        return Err(ToolExecutorError::new(
+            "an action result has inconsistent started metadata",
+        ));
+    }
+    if fields.contains_key("committed") {
+        return Err(ToolExecutorError::new(
+            "an action result must not use file-mutation committed metadata",
+        ));
+    }
+    if fields.get("kind").and_then(serde_json::Value::as_str) != Some("foreground") {
+        return Err(ToolExecutorError::new(
+            "an action result must identify the foreground result kind",
+        ));
+    }
+    let exit_code = fields.get("exitCode");
+    let signal = fields.get("signal");
+    if !expected_started {
+        if !exit_code.is_some_and(serde_json::Value::is_null)
+            || !signal.is_some_and(serde_json::Value::is_null)
+        {
+            return Err(ToolExecutorError::new(
+                "a not-started action result must retain null status fields",
+            ));
+        }
+        return Ok(());
+    }
+    let exited = exit_code.and_then(serde_json::Value::as_i64).is_some()
+        && signal.is_some_and(serde_json::Value::is_null);
+    let signalled = exit_code.is_some_and(serde_json::Value::is_null)
+        && signal
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+    if exited == signalled {
+        return Err(ToolExecutorError::new(
+            "a quiescent action result requires exactly one termination status",
+        ));
+    }
+    let boolean_fields = [
+        "timedOut",
+        "aborted",
+        "outputLimitExceeded",
+        "pipeSetupFailed",
+        "pipeReadFailed",
+        "signalDeliveryFailed",
+        "pipeDrainTimedOut",
+        "stdoutTruncated",
+        "stderrTruncated",
+    ];
+    if boolean_fields.iter().any(|name| {
+        fields
+            .get(*name)
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+    }) || fields
+        .get("timeoutMs")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+        || fields
+            .get("workdir")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return Err(ToolExecutorError::new(
+            "a started action result is missing complete lifecycle metadata",
+        ));
+    }
+    Ok(())
 }
 
 /// Why a prepared mutation was closed without starting its commit capability.
@@ -206,6 +632,7 @@ pub struct ToolExecutionRequest {
     name: String,
     raw_arguments: String,
     arguments: JsonValue,
+    dispatch: ToolDispatchBinding,
 }
 
 impl std::fmt::Debug for ToolExecutionRequest {
@@ -225,12 +652,14 @@ impl ToolExecutionRequest {
         name: String,
         raw_arguments: String,
         arguments: JsonValue,
+        dispatch: ToolDispatchBinding,
     ) -> Self {
         Self {
             call_id,
             name,
             raw_arguments,
             arguments,
+            dispatch,
         }
     }
 
@@ -252,6 +681,11 @@ impl ToolExecutionRequest {
     #[must_use]
     pub fn arguments(&self) -> &JsonValue {
         &self.arguments
+    }
+
+    #[must_use]
+    pub(crate) fn dispatch_binding(&self) -> &ToolDispatchBinding {
+        &self.dispatch
     }
 }
 
@@ -411,6 +845,15 @@ impl ToolExecutorError {
 
 /// Trusted in-process tool seam used by ordinary and approval-gated tools.
 pub trait ToolExecutor: Send + Sync {
+    /// Return the bounded claim profile for a declared tool name.
+    ///
+    /// This method must be prompt, pure, and stable for the executor's schema
+    /// snapshot. The Agent calls it once before admitting any events for the
+    /// tool round.
+    fn claim_profile(&self, _tool_name: &str) -> ToolClaimProfile {
+        ToolClaimProfile::standard()
+    }
+
     /// Build and promptly return a lazy future. Implementations must not perform
     /// the actual tool side effect synchronously before the future is polled. Each
     /// poll must return promptly; the future must check the child cancellation

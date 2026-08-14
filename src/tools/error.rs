@@ -23,6 +23,12 @@ pub enum ToolRegistryBuildError {
         #[source]
         source: ModelError,
     },
+    #[error("an allowlisted child environment value is not valid Unicode")]
+    InvalidEnvironment,
+    #[error("the fixed child environment exceeds its retained-size limit")]
+    EnvironmentTooLarge,
+    #[error("the host cannot provide the required foreground-process observer")]
+    UnsupportedProcessObserver,
 }
 
 #[derive(Debug)]
@@ -49,6 +55,38 @@ impl ToolCallError {
             "FsError",
             "WORKSPACE_PATH_DENIED",
             "the requested path is outside the workspace or crosses an unsafe symbolic link",
+        )
+    }
+
+    pub(crate) fn shell_workdir_outside_workspace() -> Self {
+        Self::model(
+            "ShellWorkdirError",
+            "SHELL_WORKDIR_OUTSIDE_WORKSPACE",
+            "the requested shell working directory is outside the retained workspace or crosses a symbolic link",
+        )
+    }
+
+    pub(crate) fn shell_workdir_not_found() -> Self {
+        Self::model(
+            "ShellWorkdirError",
+            "SHELL_WORKDIR_NOT_FOUND",
+            "the requested shell working directory was not found",
+        )
+    }
+
+    pub(crate) fn shell_workdir_not_directory() -> Self {
+        Self::model(
+            "ShellWorkdirError",
+            "SHELL_WORKDIR_NOT_DIRECTORY",
+            "the requested shell working directory is not a directory",
+        )
+    }
+
+    pub(crate) fn shell_workdir_changed() -> Self {
+        Self::model(
+            "ShellWorkdirError",
+            "SHELL_WORKDIR_CHANGED",
+            "the shell working directory changed while the command was being prepared",
         )
     }
 

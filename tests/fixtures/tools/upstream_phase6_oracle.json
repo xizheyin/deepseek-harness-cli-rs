@@ -1,0 +1,789 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a"
+  },
+  "evidence": {
+    "sourcePaths": [
+      "packages/bundle/base/cordis.patch.yml",
+      "packages/core/tools/src/index.ts",
+      "packages/core/tools/src/schema.ts",
+      "packages/shell/tool-bash/src/index.ts",
+      "packages/shell/tool-bash/src/render.ts",
+      "packages/shell/bash-local/src/index.ts",
+      "packages/shell/shell/src/index.ts",
+      "packages/shell/shell/src/types.ts",
+      "packages/shell/shell-env/src/index.ts",
+      "packages/subprocess/subprocess/src/index.ts",
+      "packages/subprocess/subprocess-local/src/index.ts",
+      "packages/subprocess/subprocess-local/src/process-inspector.ts",
+      "packages/subprocess/subprocess-local/src/spawn.ts"
+    ],
+    "testPaths": [
+      "packages/core/tools/tests/schema.spec.ts",
+      "packages/core/tools/tests/tools.spec.ts",
+      "packages/shell/tool-bash/tests/tools.spec.ts",
+      "packages/shell/tool-bash/tests/integration.spec.ts",
+      "packages/shell/bash-local/tests/executor.spec.ts",
+      "packages/shell/shell/tests/render.spec.ts",
+      "packages/shell/shell/tests/service.spec.ts",
+      "packages/shell/shell-env/tests/shell-env.spec.ts",
+      "packages/subprocess/subprocess/tests/service.spec.ts",
+      "packages/subprocess/subprocess-local/tests/spawn.spec.ts",
+      "packages/subprocess/subprocess-local/tests/local.spec.ts",
+      "packages/subprocess/subprocess-local/tests/process-inspector.spec.ts"
+    ]
+  },
+  "schemaSurface": {
+    "foregroundOnly": {
+      "composition": {
+        "enableRunInBackground": false,
+        "sandboxExecutorMounted": false
+      },
+      "modelSchema": {
+        "name": "bash",
+        "description": "Execute a bash command (`bash -c`) and return its stdout/stderr. Each call runs in a fresh shell: no state (cwd, variables, functions) persists between calls — pass `workdir` instead of using `cd`. Non-zero exits are reported as `[exit code: N]`. Current harness environment facts are exposed through managed `$DSH_*` variables; inspect them when needed. Commands may run under a file sandbox; a blocked file operation is reported as `[sandbox: file access denied under <mode> mode]` — a policy denial, not a bug in the command; do not retry another way. Long output is truncated to its tail; the full output is saved to a file whose path is reported when available. Background execution is not available; long-running commands must finish within the timeout.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "The bash command to execute."
+            },
+            "description": {
+              "type": "string",
+              "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"."
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "Timeout in milliseconds. The executor applies its configured default and cap, and kills the command on expiry."
+            },
+            "workdir": {
+              "type": "string",
+              "description": "Working directory for this command. Defaults to the session workspace; a relative path is resolved against it."
+            }
+          },
+          "required": [
+            "command",
+            "description"
+          ]
+        }
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "background"
+              },
+              "jobId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "jobId"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "foreground"
+              },
+              "exitCode": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "signal": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "timedOut": {
+                "type": "boolean"
+              },
+              "aborted": {
+                "type": "boolean"
+              },
+              "timeoutMs": {
+                "type": "number"
+              },
+              "stdout": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  },
+                  "spillPath": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text",
+                  "truncated"
+                ]
+              },
+              "stderr": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  },
+                  "truncated": {
+                    "type": "boolean"
+                  },
+                  "spillPath": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text",
+                  "truncated"
+                ]
+              },
+              "sandbox": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "type": "string"
+                  },
+                  "denied": {
+                    "type": "boolean"
+                  },
+                  "enforcement": {
+                    "type": "string"
+                  },
+                  "runnerFailed": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "denied"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "exitCode",
+              "signal",
+              "timedOut",
+              "aborted",
+              "timeoutMs",
+              "stdout",
+              "stderr"
+            ]
+          }
+        ]
+      },
+      "checks": {
+        "exactForegroundParameterOrder": true,
+        "requiredCommandAndDescription": true,
+        "implicitParameterRootIsOpen": true,
+        "backgroundInputAbsent": true,
+        "sandboxEscalationInputAbsent": true,
+        "backgroundOutputUnionStillPresent": true
+      }
+    },
+    "upstreamUnsandboxedPluginDefault": {
+      "composition": {
+        "enableRunInBackground": "upstream plugin default true",
+        "sandboxExecutorMounted": false
+      },
+      "inputParameterNames": [
+        "command",
+        "description",
+        "timeoutMs",
+        "workdir",
+        "run_in_background"
+      ],
+      "checks": {
+        "upstreamPluginDefaultExposesBackground": true
+      }
+    }
+  },
+  "configuration": {
+    "libraryExecutorDefaults": {
+      "timeoutMs": 120000,
+      "maxTimeoutMs": 600000,
+      "maxOutputBytes": 64000,
+      "maxSpillBytes": 67108864,
+      "graceMs": 3000
+    },
+    "shippedBaseComposition": {
+      "timeoutMs": 60000,
+      "sandboxModeDefault": "workspace-write",
+      "ordinaryCallApproval": "no prompt unless another pre-rule asks or escalation is requested"
+    },
+    "checks": {
+      "libraryTimeoutDefault120Seconds": true,
+      "libraryTimeoutCap600Seconds": true,
+      "perStreamTail64000Bytes": true,
+      "perStreamSpill64MiB": true,
+      "libraryGraceThreeSeconds": true,
+      "shippedTimeoutOverride60Seconds": true
+    }
+  },
+  "processScenarios": {
+    "success": {
+      "input": {
+        "command": "printf 'hello\\n'",
+        "description": "Print a greeting",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": 0,
+          "signal": null,
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 25000,
+          "stdout": {
+            "text": "hello\n",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "hello\n"
+          }
+        ]
+      }
+    },
+    "silent": {
+      "input": {
+        "command": ":",
+        "description": "Produce no output",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": 0,
+          "signal": null,
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 25000,
+          "stdout": {
+            "text": "",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "(no output)"
+          }
+        ]
+      }
+    },
+    "stdoutAndStderr": {
+      "input": {
+        "command": "printf 'out\\n'; printf 'err\\n' >&2",
+        "description": "Print both output streams",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": 0,
+          "signal": null,
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 25000,
+          "stdout": {
+            "text": "out\n",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "err\n",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "out\n[stderr]\nerr\n"
+          }
+        ]
+      }
+    },
+    "nonzero": {
+      "input": {
+        "command": "printf 'failing\\n'; exit 3",
+        "description": "Exit with status three",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": 3,
+          "signal": null,
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 25000,
+          "stdout": {
+            "text": "failing\n",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "failing\n[exit code: 3]"
+          }
+        ]
+      }
+    },
+    "selfSignal": {
+      "input": {
+        "command": "kill -TERM $$",
+        "description": "Terminate the shell with SIGTERM",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": null,
+          "signal": "SIGTERM",
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 25000,
+          "stdout": {
+            "text": "",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "(no output)\n[killed by signal: SIGTERM]"
+          }
+        ]
+      }
+    },
+    "timeout": {
+      "input": {
+        "command": "trap 'exit 0' TERM; while :; do :; done",
+        "description": "Wait until command timeout",
+        "timeoutMs": 100
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "termination": "<normalized-after-timeout>",
+          "timedOut": true,
+          "aborted": false,
+          "timeoutMs": 100,
+          "stdout": {
+            "text": "",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "(no output)\n[timed out after 100ms]"
+          }
+        ]
+      },
+      "normalization": "exitCode, signal, and any corresponding final marker are platform facts"
+    },
+    "workdir": {
+      "default": {
+        "input": {
+          "command": "pwd",
+          "description": "Print default work directory"
+        },
+        "result": {
+          "isError": false,
+          "value": {
+            "kind": "foreground",
+            "exitCode": 0,
+            "signal": null,
+            "timedOut": false,
+            "aborted": false,
+            "timeoutMs": 120000,
+            "stdout": {
+              "text": "<workspace>\n",
+              "truncated": false
+            },
+            "stderr": {
+              "text": "",
+              "truncated": false
+            }
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "<workspace>\n"
+            }
+          ]
+        }
+      },
+      "relative": {
+        "input": {
+          "command": "pwd",
+          "description": "Print relative work directory",
+          "workdir": "nested"
+        },
+        "result": {
+          "isError": false,
+          "value": {
+            "kind": "foreground",
+            "exitCode": 0,
+            "signal": null,
+            "timedOut": false,
+            "aborted": false,
+            "timeoutMs": 120000,
+            "stdout": {
+              "text": "<workspace>/nested\n",
+              "truncated": false
+            },
+            "stderr": {
+              "text": "",
+              "truncated": false
+            }
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "<workspace>/nested\n"
+            }
+          ]
+        }
+      },
+      "absolute": {
+        "input": {
+          "command": "pwd",
+          "description": "Print absolute work directory",
+          "workdir": "<workspace>/nested"
+        },
+        "result": {
+          "isError": false,
+          "value": {
+            "kind": "foreground",
+            "exitCode": 0,
+            "signal": null,
+            "timedOut": false,
+            "aborted": false,
+            "timeoutMs": 120000,
+            "stdout": {
+              "text": "<workspace>/nested\n",
+              "truncated": false
+            },
+            "stderr": {
+              "text": "",
+              "truncated": false
+            }
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "<workspace>/nested\n"
+            }
+          ]
+        }
+      }
+    },
+    "environment": {
+      "input": {
+        "command": "printf 'token=%s\\n' \"${PHASE6_ORACLE_TOKEN+present}\"; printf 'safe=%s\\n' \"$PHASE6_ORACLE_SAFE\"; printf 'ambient_dsh=%s\\n' \"${DSH_PHASE6_ORACLE_AMBIENT+present}\"; printf 'managed=%s,%s,%s\\n' \"$DSH_SHELL\" \"$DSH_SESSION_ID\" \"$DSH_HOME\"; printf 'terminal=%s,%s,%s,%s\\n' \"$NO_COLOR\" \"$TERM\" \"$PAGER\" \"$GIT_PAGER\"",
+        "description": "Inspect scrubbed shell environment"
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": 0,
+          "signal": null,
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 120000,
+          "stdout": {
+            "text": "token=\nsafe=safe-value\nambient_dsh=\nmanaged=1,phase6-oracle-session,<workspace>/.dsh-home\nterminal=1,dumb,cat,cat\n",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "token=\nsafe=safe-value\nambient_dsh=\nmanaged=1,phase6-oracle-session,<workspace>/.dsh-home\nterminal=1,dumb,cat,cat\n"
+          }
+        ]
+      },
+      "fakeAmbientNames": [
+        "PHASE6_ORACLE_TOKEN",
+        "PHASE6_ORACLE_SAFE",
+        "DSH_PHASE6_ORACLE_AMBIENT"
+      ]
+    },
+    "executableAndStartup": {
+      "pathResolution": {
+        "environment": {
+          "PATH": "<fixture-root>/empty-path"
+        },
+        "input": {
+          "command": ":",
+          "description": "Prove that the bare Bash executable is resolved through PATH"
+        },
+        "result": {
+          "isError": true,
+          "error": {
+            "message": "spawn bash ENOENT"
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "Error: spawn bash ENOENT"
+            }
+          ]
+        }
+      },
+      "bashEnvHook": {
+        "environment": {
+          "PATH": "/bin:/usr/bin",
+          "BASH_ENV": "<fixture-root>/bash-env-hook.sh"
+        },
+        "hookSource": "export PHASE6_ORACLE_BASH_ENV_RAN=hook-ran\n",
+        "input": {
+          "command": "printf 'bash_env=%s\\nargv0=%s\\n' \"$PHASE6_ORACLE_BASH_ENV_RAN\" \"$0\"",
+          "description": "Prove the non-interactive Bash startup hook and argv zero"
+        },
+        "result": {
+          "isError": false,
+          "value": {
+            "kind": "foreground",
+            "exitCode": 0,
+            "signal": null,
+            "timedOut": false,
+            "aborted": false,
+            "timeoutMs": 120000,
+            "stdout": {
+              "text": "bash_env=hook-ran\nargv0=bash\n",
+              "truncated": false
+            },
+            "stderr": {
+              "text": "",
+              "truncated": false
+            }
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "bash_env=hook-ran\nargv0=bash\n"
+            }
+          ]
+        }
+      }
+    },
+    "checks": {
+      "successIsOrdinary": true,
+      "silentUsesMarker": true,
+      "stdoutPrecedesMarkedStderr": true,
+      "nonzeroIsOrdinary": true,
+      "selfSignalIsOrdinary": true,
+      "timeoutIsOrdinaryAndDistinctFromAbort": true,
+      "defaultWorkdirUsesSession": true,
+      "relativeWorkdirUsesSessionBase": true,
+      "absoluteWorkdirAccepted": true,
+      "credentialShapedAmbientRemoved": true,
+      "ordinaryAmbientRetained": true,
+      "ambientDshRemoved": true,
+      "managedDshRebuilt": true,
+      "terminalOverridesApplied": true,
+      "bareBashUsesEffectivePath": true,
+      "bashEnvHookExecuted": true,
+      "argvZeroIsBareBash": true
+    },
+    "deterministicCallIds": [
+      "phase6-direct-01",
+      "phase6-direct-02",
+      "phase6-direct-03",
+      "phase6-direct-04",
+      "phase6-direct-05",
+      "phase6-direct-06",
+      "phase6-direct-07",
+      "phase6-direct-08",
+      "phase6-direct-09",
+      "phase6-direct-10",
+      "phase6-direct-11",
+      "phase6-direct-12"
+    ]
+  },
+  "lifecycleBoundaries": {
+    "callerAbortAtToolBoundary": {
+      "input": {
+        "command": "trap '' TERM; printf '%s\\n' \"$$\" > '<fixture-root>/caller-abort-leader.pid'; while :; do sleep 60; done",
+        "description": "Observe the real caller-abort boundary",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": true,
+        "error": {
+          "message": "tool call aborted",
+          "info": {
+            "name": "AbortError",
+            "code": "ABORTED"
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Error: tool call aborted"
+          }
+        ]
+      },
+      "observations": {
+        "leaderPidObservedButNotSerialized": true,
+        "leaderAliveBeforeCallerAbort": true,
+        "leaderGoneWhenToolResultSettled": true
+      }
+    },
+    "foregroundDirectCompletionVsServiceCleanup": {
+      "input": {
+        "command": "bash -c 'trap '\"'\"''\"'\"' TERM; printf '\"'\"'%s\\n'\"'\"' \"$$\" > '\"'\"'<fixture-root>/foreground-survivor.pid'\"'\"'; sleep 60' >/dev/null 2>&1 & disown; printf 'direct-complete\\n'",
+        "description": "Leave a service-owned same-group survivor after direct completion",
+        "timeoutMs": 25000
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "kind": "foreground",
+          "exitCode": 0,
+          "signal": null,
+          "timedOut": false,
+          "aborted": false,
+          "timeoutMs": 25000,
+          "stdout": {
+            "text": "direct-complete\n",
+            "truncated": false
+          },
+          "stderr": {
+            "text": "",
+            "truncated": false
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "direct-complete\n"
+          }
+        ]
+      },
+      "observations": {
+        "descendantPidObservedButNotSerialized": true,
+        "descendantAliveWhenForegroundResultSettled": true,
+        "descendantGoneWhenSubprocessServiceDisposeSettled": true
+      }
+    },
+    "checks": {
+      "callerAbort": {
+        "bodyStartedBeforeCallerAbort": true,
+        "callerAbortCleanupReapedLeaderBeforeResult": true,
+        "toolBoundaryReturnsGenericAbort": true,
+        "internalShellResultNotExposed": true,
+        "callerAbortReasonNotExposed": true
+      },
+      "directCompletion": {
+        "foregroundResultSettlesNormally": true,
+        "sameGroupDescendantOutlivesForegroundResult": true,
+        "subprocessServiceDisposeAwaitsWholeGroup": true
+      }
+    },
+    "deterministicCallIds": [
+      "phase6-lifecycle-01",
+      "phase6-lifecycle-02"
+    ]
+  },
+  "renderScenarios": {
+    "cases": {
+      "silent": "(no output)",
+      "stdoutAndStderr": "out\n[stderr]\nerr",
+      "nonzero": "(no output)\n[exit code: 7]",
+      "timeoutWithSignal": "(no output)\n[timed out after 125ms]\n[killed by signal: SIGTERM]",
+      "truncatedWithSpill": "tail\n[output truncated; full output: <spill>]",
+      "truncatedWithoutSpill": "[stderr]\ntail\n[output truncated; full output: (unavailable)]"
+    },
+    "checks": {
+      "silentMarker": true,
+      "streamOrderAndSeparator": true,
+      "exitMarkerLast": true,
+      "timeoutBeforeSignal": true,
+      "spillPathRendered": true,
+      "unavailableSpillRendered": true
+    }
+  },
+  "deterministic": {
+    "freshTemporaryWorkspace": true,
+    "temporaryPathsNormalized": true,
+    "timeoutTerminationFactsNormalized": true,
+    "fixedCallIds": true,
+    "controlledExecutablePath": "/bin:/usr/bin",
+    "ambientBashEnvClearedOutsideExplicitHookScenario": true,
+    "lifecycleProcessIdsObservedButNotSerialized": true,
+    "realTimeoutGraceMs": 75
+  },
+  "safety": {
+    "networkAccess": "none",
+    "credentialRequirement": "none",
+    "environmentProbe": "only explicit non-secret markers are rendered; fake credential values are asserted absent",
+    "filesystemWrites": "fresh platform temporary directory and explicit output path only"
+  }
+}

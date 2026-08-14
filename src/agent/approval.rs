@@ -20,6 +20,15 @@ pub enum FileChangePolicy {
     Ask,
 }
 
+/// Static Phase 6 decision applied to every prepared foreground shell action.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShellPolicy {
+    Allow,
+    Deny,
+    #[default]
+    Ask,
+}
+
 /// Bounded, immutable question retained by one prepared mutation.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ApprovalPrompt {

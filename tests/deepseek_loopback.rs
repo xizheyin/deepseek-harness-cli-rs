@@ -87,6 +87,12 @@ fn spawn_recording_sse_server(listener: TcpListener) -> thread::JoinHandle<Optio
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // The listener is nonblocking so the server thread can
+                    // honor its accept deadline. Some Unix implementations
+                    // may expose the accepted socket with the same status;
+                    // restore a bounded blocking read before consuming the
+                    // complete HTTP request.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();

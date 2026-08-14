@@ -8,6 +8,9 @@ use std::{
 };
 
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+
+#[cfg(unix)]
 use cap_std::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use cap_std::{
     ambient_authority,
@@ -90,6 +93,67 @@ pub(crate) struct PreparedWorkspaceMutation {
     mutation_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     test_commit_hook: Option<MutationCommitTestHook>,
+}
+
+/// Directory authority retained between shell approval preparation and spawn.
+///
+/// The path text is display metadata only. The held directory and its identity
+/// are the authority; immediately before spawn we reopen the relative path and
+/// compare identities so a replacement cannot redirect the command.
+#[cfg(unix)]
+pub(crate) struct PreparedShellWorkdir {
+    root: Arc<Dir>,
+    directory: Dir,
+    relative: PathBuf,
+    display: String,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for PreparedShellWorkdir {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedShellWorkdir")
+            .field("display_bytes", &self.display.len())
+            .field("component_count", &shell_component_count(&self.relative))
+            .field("directory_capability", &true)
+            .finish()
+    }
+}
+
+#[cfg(unix)]
+impl PreparedShellWorkdir {
+    pub(crate) fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Reopen and compare the approved directory immediately before spawn.
+    pub(crate) fn revalidate(self, cancellation: &CancellationToken) -> ToolCallResult<OwnedFd> {
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::aborted());
+        }
+        let held_metadata = self
+            .directory
+            .dir_metadata()
+            .map_err(|_| ToolCallError::shell_workdir_changed())?;
+        if held_metadata.dev() != self.dev || held_metadata.ino() != self.ino {
+            return Err(ToolCallError::shell_workdir_changed());
+        }
+        let reopened =
+            open_shell_directory_no_follow(&self.root, &self.relative, Some(cancellation))
+                .map_err(|error| map_shell_workdir_open_error(&error, cancellation, true))?;
+        let reopened_metadata = reopened
+            .dir_metadata()
+            .map_err(|_| ToolCallError::shell_workdir_changed())?;
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::aborted());
+        }
+        if reopened_metadata.dev() != self.dev || reopened_metadata.ino() != self.ino {
+            return Err(ToolCallError::shell_workdir_changed());
+        }
+        Ok(OwnedFd::from(reopened.into_std_file()))
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -731,6 +795,55 @@ impl Workspace {
         Ok(ResolvedPath { relative, display })
     }
 
+    /// Resolve a shell working directory without touching the filesystem.
+    /// The sealed Action setup performs the blocking capability open later.
+    #[cfg(unix)]
+    pub(crate) fn resolve_shell_workdir(&self, input: &str) -> ToolCallResult<ResolvedPath> {
+        let resolved = self.resolve(input).map_err(|error| {
+            if error.has_code("WORKSPACE_PATH_DENIED") {
+                ToolCallError::shell_workdir_outside_workspace()
+            } else {
+                error
+            }
+        })?;
+        if shell_component_count(&resolved.relative) > MAX_DIRECTORY_DEPTH {
+            return Err(ToolCallError::invalid_args(format!(
+                "bash.workdir must contain at most {MAX_DIRECTORY_DEPTH} path components"
+            )));
+        }
+        Ok(resolved)
+    }
+
+    /// Perform the blocking, capability-relative workdir open owned by the
+    /// sealed shell setup job. No caller should invoke this on a Tokio worker.
+    #[cfg(unix)]
+    pub(crate) fn prepare_shell_workdir(
+        &self,
+        path: ResolvedPath,
+        cancellation: &CancellationToken,
+    ) -> ToolCallResult<PreparedShellWorkdir> {
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::aborted());
+        }
+        let directory =
+            open_shell_directory_no_follow(&self.root, &path.relative, Some(cancellation))
+                .map_err(|error| map_shell_workdir_open_error(&error, cancellation, false))?;
+        let metadata = directory
+            .dir_metadata()
+            .map_err(|error| map_shell_workdir_open_error(&error, cancellation, false))?;
+        if cancellation.is_cancelled() {
+            return Err(ToolCallError::aborted());
+        }
+        Ok(PreparedShellWorkdir {
+            root: Arc::clone(&self.root),
+            directory,
+            relative: path.relative,
+            display: path.display,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+
     pub(crate) async fn classify(
         &self,
         path: &ResolvedPath,
@@ -1083,6 +1196,49 @@ fn open_child_directory_no_follow(parent: &Dir, name: &Path) -> io::Result<Dir> 
         }
     })?;
     Ok(Dir::from_std_file(std::fs::File::from(descriptor)))
+}
+
+#[cfg(unix)]
+fn open_shell_directory_no_follow(
+    root: &Dir,
+    relative: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> io::Result<Dir> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "shell workdir preparation was cancelled",
+        ));
+    }
+    if relative == Path::new(".") || relative.as_os_str().is_empty() {
+        open_child_directory_no_follow(root, Path::new("."))
+    } else {
+        // This helper opens every normal component with O_NOFOLLOW; despite its
+        // historical mutation-oriented name it traverses the complete path.
+        open_parent_no_follow(root, relative, cancellation)
+    }
+}
+
+#[cfg(unix)]
+fn map_shell_workdir_open_error(
+    error: &io::Error,
+    cancellation: &CancellationToken,
+    revalidating: bool,
+) -> ToolCallError {
+    if cancellation.is_cancelled() || error.kind() == io::ErrorKind::Interrupted {
+        return ToolCallError::aborted();
+    }
+    if revalidating {
+        return ToolCallError::shell_workdir_changed();
+    }
+    match error.kind() {
+        io::ErrorKind::NotFound => ToolCallError::shell_workdir_not_found(),
+        io::ErrorKind::NotADirectory => ToolCallError::shell_workdir_not_directory(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
+            ToolCallError::shell_workdir_outside_workspace()
+        }
+        _ => ToolCallError::shell_workdir_changed(),
+    }
 }
 
 #[cfg(unix)]
@@ -1487,6 +1643,13 @@ fn display_path(path: &Path) -> Result<String, BlockingError> {
         output.push_str(part);
     }
     Ok(output)
+}
+
+#[cfg(unix)]
+fn shell_component_count(path: &Path) -> usize {
+    path.components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count()
 }
 
 fn is_vcs_directory(name: &str) -> bool {
@@ -2145,5 +2308,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_workdir_retains_and_revalidates_one_directory_capability() {
+        let root = TempRoot::new();
+        fs::create_dir(root.0.join("nested")).unwrap();
+        let workspace = Workspace::open(&root.0).unwrap();
+        let token = CancellationToken::new();
+        let resolved = workspace.resolve_shell_workdir("nested").unwrap();
+        let prepared = workspace.prepare_shell_workdir(resolved, &token).unwrap();
+        assert_eq!(prepared.display(), "nested");
+        assert!(prepared.revalidate(&token).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_workdir_rejects_symlinks_and_detects_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempRoot::new();
+        fs::create_dir(root.0.join("original")).unwrap();
+        symlink("original", root.0.join("linked")).unwrap();
+        let workspace = Workspace::open(&root.0).unwrap();
+        let token = CancellationToken::new();
+
+        let linked = workspace.resolve_shell_workdir("linked").unwrap();
+        let error = workspace.prepare_shell_workdir(linked, &token).unwrap_err();
+        assert!(error.has_code("SHELL_WORKDIR_OUTSIDE_WORKSPACE"));
+
+        let original = workspace.resolve_shell_workdir("original").unwrap();
+        let prepared = workspace.prepare_shell_workdir(original, &token).unwrap();
+        fs::rename(root.0.join("original"), root.0.join("moved")).unwrap();
+        fs::create_dir(root.0.join("original")).unwrap();
+        let error = prepared.revalidate(&token).unwrap_err();
+        assert!(error.has_code("SHELL_WORKDIR_CHANGED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_workdir_component_limit_is_exact() {
+        let root = TempRoot::new();
+        let workspace = Workspace::open(&root.0).unwrap();
+        let exact = (0..super::MAX_DIRECTORY_DEPTH)
+            .map(|index| format!("d{index}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(workspace.resolve_shell_workdir(&exact).is_ok());
+        let one_over = format!("{exact}/extra");
+        let error = match workspace.resolve_shell_workdir(&one_over) {
+            Err(error) => error,
+            Ok(_) => panic!("one-over shell path component count was accepted"),
+        };
+        assert!(error.has_code("INVALID_ARGS"));
     }
 }

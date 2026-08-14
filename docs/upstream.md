@@ -518,6 +518,246 @@ check-to-rename race, and four approval paths. Its own named checks all pass.
 The Rust comparison tests consume it directly, so normal Rust verification
 remains offline and needs neither Node nor an upstream checkout.
 
+## Phase 6 inspection
+
+Phase 6 studies the foreground `bash` tool, its subprocess owner, and the
+boundary between caller cancellation and observable process-group cleanup.
+The primary source files at the pinned revision are:
+
+- `packages/bundle/base/cordis.patch.yml`: the shipped 60-second bash timeout
+  override and default sandbox composition;
+- `packages/core/tools/src/index.ts`: caller-signal fusion, started-body
+  draining, and final `ABORTED`/`ABORTED_BEFORE_DISPATCH` materialization at the
+  public tool boundary;
+- `packages/shell/tool-bash/src/{index,render,invariant}.ts`: the model-facing
+  schema, argument checks, working-directory routing, foreground result shape,
+  rendering, and abort mapping;
+- `packages/shell/bash-local/src/{index,invariant}.ts`: command/default timeout
+  resolution, `bash -c`, terminal-friendly environment overrides, output caps,
+  and timeout-versus-caller-abort classification;
+- `packages/shell/shell/src/{types,index,render,invariant}.ts`: the executor
+  request/result seam and shared exit-marker vocabulary;
+- `packages/subprocess/subprocess/src/{types,index,invariant}.ts`: explicit
+  argv/cwd/env/stdio/grace ownership, bounded collection, and tree-scoped
+  termination contracts;
+- `packages/subprocess/subprocess-local/src/{spawn,process-inspector,index}.ts`:
+  detached POSIX sessions/process groups, Windows tree termination, tail
+  collection, private spill files, TERM-to-KILL escalation, inherited-pipe
+  draining, and whole-tree liveness;
+- `packages/shell/shell-env/src/{index,invariant}.ts`: the managed `DSH_*`
+  environment namespace contributed by trusted plugins.
+
+The official foreground input requires `command` and display-only
+`description`; it optionally accepts `timeoutMs` and `workdir`. It starts a
+fresh `bash -c` process for every call, so shell state does not persist. A
+relative workdir is resolved against the session workspace, while an absolute
+workdir is accepted. The executor library defaults to 120 seconds; the shipped
+base composition overrides that value to 60 seconds. It caps one request at 600
+seconds, keeps 64,000 bytes per output stream, permits at most 64 MiB in a
+complete spill file, and gives a TERM-trapping tree three seconds before
+SIGKILL.
+
+Normal exit zero, nonzero exit, and command timeout all return ordinary tool
+results. Nonzero status is rendered as `[exit code: N]`, stderr follows a
+`[stderr]` heading, and a timeout marker remains visible even if a TERM trap
+exits zero. Caller cancellation is different: the completed subprocess facts
+have `aborted: true`, after which the model-facing tool converts the call to the
+standard abort error. Spawn/infrastructure failures are tool errors rather than
+invented process exit statuses.
+
+The executable oracle now fixes that public caller-abort boundary with a real
+TERM-trapping Bash process. It waits until the command has published its PID,
+aborts the actual `ToolRuntime.execute` caller signal, and observes that the
+promise resolves only after the direct leader is gone. The returned value is the
+generic `AbortError`/`ABORTED` tool failure, contains no foreground shell value,
+and does not expose the caller's abort reason. `ToolBash` intentionally discards
+the completed `ShellRunResult` when `aborted` is true, so the public tool result
+cannot stably expose its exact internal exit code or signal; the fixture records
+that absence instead of reconstructing hidden process fields.
+
+The subprocess layer's detached POSIX spawn makes the child a new session and
+process-group leader, then signals the negative group ID. Termination is
+idempotent: it sends SIGTERM, keeps the escalation
+alive even if the direct shell exits, then sends SIGKILL after the grace period
+when a descendant survives. The foreground `LocalBashExecutor.run` awaits the
+handle's direct completion; the separate subprocess service `waitForExit` and
+service disposal own the stronger whole-group wait. On Linux that observer
+scans `/proc` after direct-child settlement so a group containing only zombies
+does not look like active work. Collected pipes are drained concurrently but
+only for a bounded grace after the direct child exits, preventing a descendant
+that inherited stdout or stderr from holding result settlement forever. Rust's
+per-call requirement to finish same-group cleanup before `tool/result` is
+therefore a stronger intentional difference, not part of the narrow compatible
+foreground-result claim.
+
+A second executable oracle case makes this split directly observable. A real
+foreground tool call starts a TERM-trapping, stdio-detached Bash helper in the
+same process group and then lets the direct shell exit zero. The foreground
+result is already a normal `direct-complete` success while the helper PID is
+still alive. The oracle then awaits the owning Context's subprocess-service
+disposal and verifies that the same PID is gone when disposal resolves. The PID
+is used only for live probes and is never serialized; no duration, numeric PID,
+or inferred cleanup status is placed in the fixture.
+
+A local Node/macOS kernel probe recorded `[pid, pgid, sid]` as parent
+`[48976, 48976, 48976]`, ordinary child `[48978, 48976, 48976]`, and detached
+child `[48979, 48979, 48979]`. The numeric IDs are ephemeral, but the equality
+relations confirm the detached child is both session and group leader; committed
+Rust tests, not these particular PIDs, will provide the lasting platform gate.
+
+Each stream keeps a byte-exact tail. Upstream can also spill the complete stream
+to a random owner-only file inside a private temporary directory, but deletes or
+stops advertising a spill once it can no longer prove completeness. The child
+environment begins with the parent environment after removing credential-shaped
+names (`KEY`, `PASSWORD`, `SECRET`, or `TOKEN`) and every ambient `DSH_*` name.
+Trusted explicit entries may deliberately restore values. Bash adds `NO_COLOR=1`,
+`TERM=dumb`, `PAGER=cat`, and `GIT_PAGER=cat`. The local executor invokes the
+name `bash` through `PATH` with `-c`; ordinary inherited names such as `BASH_ENV`
+and `SHELLOPTS` are not removed by the credential-name scrub. Rust's fixed
+`/bin/bash --noprofile --norc`, cleared startup environment, and explicit
+`argv[0] = "bash"` are therefore a paired executable/startup-policy difference.
+Two real executor probes supported that source reading: replacing `PATH` with a
+nonexistent directory produced `ENOENT: spawn bash ENOENT`, while an explicit
+fake `BASH_ENV` hook printed `<from-bash-env>`. The probes used no credential or
+network access.
+
+The official plugin also exposes `run_in_background` by default and hands such
+work to the jobs subsystem. Background jobs, completion wakes, and job tools
+are explicitly outside this project's v0.1 scope. Rust Phase 6 must therefore
+omit that field, reject injected attempts, and record the smaller foreground-only
+surface as an intentional difference. Official ordinary shell calls also do not
+ask merely because an approval service exists; approval appears for a policy or
+sandbox escalation. Rust's planned ask-by-default unsandboxed shell policy is a
+separate safety difference, not a claim of byte-identical policy behavior.
+
+The directly relevant deterministic tests are:
+
+- `packages/shell/tool-bash/tests/{tools,integration}.spec.ts`;
+- `packages/shell/bash-local/tests/{executor,settings}.spec.ts`;
+- `packages/shell/shell/tests/{service,render}.spec.ts` and
+  `packages/shell/shell-env/tests/shell-env.spec.ts`;
+- `packages/subprocess/subprocess/tests/service.spec.ts`;
+- `packages/subprocess/subprocess-local/tests/{spawn,local,process-exit,process-inspector}.spec.ts`.
+
+The accepted initial Phase 6 research run used the pinned checkout's Vitest
+4.1.8 and locked dependencies:
+
+```console
+pnpm exec vitest run \
+  packages/shell/tool-bash/tests \
+  packages/shell/bash-local/tests \
+  packages/shell/shell/tests \
+  packages/shell/shell-env/tests \
+  packages/subprocess/subprocess/tests \
+  packages/subprocess/subprocess-local/tests
+```
+
+Vitest reported 13 files and 270 passing tests. The run used no credential,
+public network request, or user project.
+
+The independent Phase 6 review then ran this expanded process, sandbox,
+approval, and Agent-cancellation matrix:
+
+```console
+pnpm exec vitest run \
+  packages/shell/tool-bash/tests/tools.spec.ts \
+  packages/shell/tool-bash/tests/integration.spec.ts \
+  packages/shell/bash-local/tests/executor.spec.ts \
+  packages/shell/bash-local/tests/settings.spec.ts \
+  packages/shell/shell/tests/service.spec.ts \
+  packages/shell/shell/tests/render.spec.ts \
+  packages/shell/shell-env/tests/shell-env.spec.ts \
+  packages/subprocess/subprocess/tests/service.spec.ts \
+  packages/subprocess/subprocess-local/tests/spawn.spec.ts \
+  packages/subprocess/subprocess-local/tests/local.spec.ts \
+  packages/subprocess/subprocess-local/tests/process-exit.spec.ts \
+  packages/subprocess/subprocess-local/tests/process-inspector.spec.ts \
+  packages/subprocess/subprocess-local/tests/terminal.spec.ts \
+  packages/sandbox/sandbox-local/tests/acl-grants.spec.ts \
+  packages/sandbox/sandbox-local/tests/local.spec.ts \
+  packages/sandbox/sandbox/tests/roots.spec.ts \
+  packages/sandbox/sandbox/tests/vocabulary.spec.ts \
+  packages/shell/bash-sandbox/tests/partial-landlock.spec.ts \
+  packages/shell/bash-sandbox/tests/sandbox.spec.ts \
+  packages/sandbox/sandbox-policy/tests/policy.spec.ts \
+  packages/core/agent-loop/tests/cancel.spec.ts \
+  packages/interaction/user-approval/tests/approval.spec.ts \
+  packages/interaction/permission-presets/tests/projection.spec.ts
+```
+
+Vitest reported 23 files and 490/490 passing tests. The related generic tool
+contract was rerun separately:
+
+```console
+pnpm exec vitest run \
+  packages/core/tools/tests/tools.spec.ts \
+  packages/core/tools/tests/schema.spec.ts \
+  packages/core/tools/tests/invariant.spec.ts \
+  packages/core/tools/tests/execution-mode.spec.ts
+```
+
+That run reported four files and 166/166 passing tests. The real macOS Seatbelt
+matrix used its E2E configuration:
+
+```console
+pnpm exec vitest run \
+  --config vitest.e2e.config.ts \
+  packages/sandbox/sandbox-local/tests/seatbelt.e2e.ts \
+  packages/shell/bash-sandbox/tests/seatbelt.e2e.ts
+```
+
+It reported two files and 10/10 passing tests. These commands were rerun on
+macOS 27.0 arm64 with Node 26.0.0, pnpm 11.19.0, and Vitest 4.1.8. The pinned
+checkout was clean before and after. These sandbox tests are upstream research
+evidence only: Rust Phase 6 deliberately makes no Seatbelt, Landlock, or general
+sandbox claim.
+
+The committed Phase 6 oracle is generated by the real upstream `ToolBash`,
+`LocalBashExecutor`, and local subprocess runtime. It records the foreground-only
+and default-background schema surfaces, library and shipped defaults, small
+success/silent/mixed/nonzero/real-self-signal/timeout results, pure rendering, three workdir
+forms, environment scrubbing, bare-`bash` PATH failure, a real `BASH_ENV` hook,
+`$0 == "bash"`, a real started caller abort at the public tool boundary, direct
+foreground completion while a same-group helper remains alive, awaited
+subprocess-service cleanup of that helper, and stable safety checks. Ordinary cases use a fixed PATH and
+clear ambient `BASH_ENV`, so a developer's shell configuration cannot change the
+fixture. The four short foreground comparisons and the self-signal case all
+carry the same explicit `timeoutMs: 25000` that Rust will consume; they therefore
+do not accidentally compare different implementation defaults. Random temporary
+paths and the platform timeout signal are the only normalized values. Lifecycle
+PIDs are asserted but omitted rather than normalized. The generator
+was type-checked and run twice against the clean pinned checkout; both outputs
+were byte-identical to `tests/fixtures/tools/upstream_phase6_oracle.json`.
+
+SHA-256:
+
+- checker: `e67df63e45f5acd639e50dc346b681127ed15adec9d4503b38d45a01241b3d1e`;
+- generator: `17756b2ccaf1f36a71367abbe7d80d628c73cd2971a96263bb300b5077bb8221`;
+- fixture: `15a7a05dcf36f5c1fcbc97946baf21b69d91ea573d1d51fcc8bf848735caacde`.
+
+The exact offline provenance commands, run from the pinned upstream checkout,
+were:
+
+```console
+node /Users/xizheyin/workspace/ds-harness-rs/scripts/typecheck-upstream-shell-fixtures.mjs \
+  /Users/xizheyin/workspace/deepseek-harness-upstream
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-shell-fixtures.ts \
+  /tmp/upstream-phase6-a.json
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-shell-fixtures.ts \
+  /tmp/upstream-phase6-b.json
+
+cmp -s /tmp/upstream-phase6-a.json /tmp/upstream-phase6-b.json
+cmp -s /tmp/upstream-phase6-a.json \
+  /Users/xizheyin/workspace/ds-harness-rs/tests/fixtures/tools/upstream_phase6_oracle.json
+```
+
+The type check and both comparisons passed. Normal Rust tests consume the
+committed fixture and do not need Node or the upstream checkout.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

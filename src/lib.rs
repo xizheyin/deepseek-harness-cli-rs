@@ -1,6 +1,6 @@
 //! Provider-neutral core for the `dsh` terminal agent.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod json_value;
 
