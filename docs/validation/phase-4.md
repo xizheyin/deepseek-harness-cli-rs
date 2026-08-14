@@ -18,7 +18,7 @@ Phase 6; interactive assembly is Phase 7.
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before the Phase 4 checkpoint: `b373920c1725f5882f0733600caa169a639d0dd9`
-- Tested Phase 4 checkpoint: pending the first non-force push
+- Tested Phase 4 checkpoint: `d88513093816b9b48b901bed0396c7bbd4cf9c8a`
 - Host: macOS 27.0 (build 26A5406e), arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 - Cargo: `cargo 1.85.0 (d73d2caf9 2024-12-31)`
@@ -183,4 +183,7 @@ and evidence wording to close before checkpointing.
 
 ## Remote acceptance
 
-Pending the coherent Phase 4 checkpoint push and exact Ubuntu GitHub Actions run.
+The Phase 4 checkpoint was pushed non-forced to `origin/main`. GitHub Actions run
+[31766159602](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31766159602)
+completed successfully on Ubuntu 24.04 for the exact checkpoint
+`d88513093816b9b48b901bed0396c7bbd4cf9c8a`.

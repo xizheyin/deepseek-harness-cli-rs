@@ -8,8 +8,8 @@ This roadmap records implementation status. It is a plan, not a list of current 
 | 1 | Core types and in-memory session | `complete` | [`validation/phase-1.md`](validation/phase-1.md) |
 | 2 | DeepSeek streaming provider | `complete` | [`validation/phase-2.md`](validation/phase-2.md) |
 | 3 | Agent Loop | `complete` | [`validation/phase-3.md`](validation/phase-3.md) |
-| 4 | Read-only tools | `in-progress` | — |
-| 5 | File changes and approval | `not-started` | — |
+| 4 | Read-only tools | `complete` | [`validation/phase-4.md`](validation/phase-4.md) |
+| 5 | File changes and approval | `in-progress` | — |
 | 6 | Shell, timeout, and cancellation | `not-started` | — |
 | 7 | Interactive CLI/TUI | `not-started` | — |
 | 8 | Persistence, resume, and compaction | `not-started` | — |
