@@ -388,16 +388,9 @@ impl PreparedWorkspaceMutation {
                     &stage_name,
                 )
             })
-            .and_then(|()| {
-                self.parent
-                    .try_clone()
-                    .and_then(|directory| directory.into_std_file().sync_all())
-            });
+            .and_then(|()| sync_directory(&self.parent));
         #[cfg(not(test))]
-        let sync_result = self
-            .parent
-            .try_clone()
-            .and_then(|directory| directory.into_std_file().sync_all());
+        let sync_result = sync_directory(&self.parent);
         Ok(WorkspaceCommitStatus::Committed {
             durability_uncertain: sync_result.is_err(),
             cleanup_warning: cleanup_result.is_err(),
@@ -1090,6 +1083,17 @@ fn open_child_directory_no_follow(parent: &Dir, name: &Path) -> io::Result<Dir> 
         }
     })?;
     Ok(Dir::from_std_file(std::fs::File::from(descriptor)))
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Dir) -> io::Result<()> {
+    // cap-std intentionally opens ambient directory capabilities with O_PATH
+    // on Linux.  O_PATH is suitable as an openat base but cannot be fsynced,
+    // so obtain a read-only handle to the same capability-relative directory
+    // before asking the kernel to make its entries durable.
+    open_child_directory_no_follow(directory, Path::new("."))?
+        .into_std_file()
+        .sync_all()
 }
 
 #[cfg(unix)]
