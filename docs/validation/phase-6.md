@@ -2,7 +2,8 @@
 
 ## Scope
 
-Phase 6 validates one public Rust foreground-Shell path on macOS. The new
+Phase 6 validates one public Rust foreground-Shell path on macOS and Ubuntu
+24.04. The new
 `LocalToolRegistry` keeps `list`, `glob`, `grep`, `read`, and `apply_patch`, then
 adds a closed `bash` schema. All six tools share the same retained Workspace
 capability. The Agent records the tool call before process work, resolves the
@@ -29,8 +30,7 @@ Terminal approval and wiring Ctrl+C to the current turn belong to Phase 7.
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before Phase 6: `7cd5fef4969c5aac3d7920ed5f372bbe5f1ca5e7`
-- Tested tree: stabilized pre-checkpoint Phase 6 working tree based on that
-  commit; the final immutable commit is pending
+- Tested Phase 6 checkpoint: `1e60c89542fd077261e0877255c584fdccd990bb`
 - Total Rust tests in the repository-wide run: 351
 - Host: macOS 27.0 (build 26A5406e), arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
@@ -201,19 +201,17 @@ Five independent tracks reviewed different ownership boundaries:
    repeated frozen-tree evidence did not support classifying it as a production
    defect.
 
-This closes the local/macOS implementation gate. Phase 6 must nevertheless
-remain `in-progress` until the remote Ubuntu acceptance below passes, because
-the Linux-only observer and exact-reap tests have not yet run in the official
-repository workflow.
+This closed the local/macOS implementation gate. The remote Ubuntu acceptance
+below subsequently exercised the Linux-only observer and exact-reap tests and
+closed the remaining platform gate.
 
 ## Known limitations
 
 - `LocalToolRegistry` and the Shell Action path are public Rust APIs only. The
   `dsh` executable cannot run a command, ask for approval, or turn Ctrl+C into a
   current-turn cancellation yet.
-- Local real-process acceptance has run only on macOS 27.0 arm64. The Linux
-  `/proc` implementation exists, but Ubuntu CI has not yet run; Windows and
-  other operating systems are not implemented or claimed.
+- Real-process acceptance has run on macOS 27.0 arm64 and Ubuntu 24.04. Windows
+  and other operating systems are not implemented or claimed.
 - An approved command is unsandboxed native code. The retained workdir prevents
   a startup path escape, not a later `cd`, absolute-path access, network access,
   or other action permitted to the current user.
@@ -246,9 +244,19 @@ repository workflow.
 
 ## Remote acceptance
 
-Pending. No Phase 6 checkpoint has been committed or pushed yet, and no Ubuntu
-GitHub Actions run has exercised the Linux process observer or real-process
-matrix. After a coherent non-force push, this section must record the exact
-checkpoint commit, workflow URL, Ubuntu image, and the exact platform test
-result. Until then, Phase 6 remains `in-progress` and Linux is not an accepted
-platform claim.
+The Phase 6 feature checkpoint was pushed non-forced to `origin/main`. GitHub
+Actions run
+[31799753803](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31799753803)
+completed successfully on the `ubuntu-24.04` image for exact checkpoint
+`1e60c89542fd077261e0877255c584fdccd990bb`; its only Rust verification job ran
+the same repository gate and finished in 2 minutes 4 seconds.
+
+Because anonymous GitHub log download was unavailable, the exact platform count
+was independently reproduced from a clean clone of the same commit on Ubuntu
+24.04.4 with Rust 1.85.0. `verify.sh` passed 358/358 tests with zero ignored:
+151 library tests plus 207 integration/CLI tests. The Linux process module
+contributed 48 tests, including the PID 1, child-subreaper, zombie-thread, and
+real `CLONE_PARENT`/`__WALL` exact-reap cases. The independent reproduction ran
+on arm64 while GitHub's hosted job used its standard runner architecture; the
+tree contains no `target_arch`-conditioned tests, so both select the same 358
+tests.
