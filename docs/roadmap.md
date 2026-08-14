@@ -11,8 +11,8 @@ This roadmap records implementation status. Phases 0–9 remain the finite v0.1 
 | 4 | Read-only tools | `complete` | [`validation/phase-4.md`](validation/phase-4.md) |
 | 5 | File changes and approval | `complete` | [`validation/phase-5.md`](validation/phase-5.md) |
 | 6 | Shell, timeout, and cancellation | `complete` | [`validation/phase-6.md`](validation/phase-6.md) |
-| 7 | Interactive CLI/TUI | `in-progress` | — |
-| 8 | Persistence, resume, and compaction | `not-started` | — |
+| 7 | Interactive CLI/TUI | `complete` | [`validation/phase-7.md`](validation/phase-7.md) |
+| 8 | Persistence, resume, and compaction | `in-progress` | — |
 | 9 | v0.1 integration and release candidate | `not-started` | — |
 | 10 | Bounded subprocess tool plugins and examples | `not-started` | — |
 

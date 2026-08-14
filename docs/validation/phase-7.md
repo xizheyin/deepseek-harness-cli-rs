@@ -2,17 +2,19 @@
 
 ## Status
 
-Phase 7 has passed its local macOS implementation, behavior, safety, upstream
-oracle, Rustdoc, and release-build gates. It is **not complete yet**. The tested
-working tree still needs to become one Git checkpoint, be pushed without force,
-and pass the Ubuntu 24.04 workflow for that exact commit.
+Phase 7 is **complete**. The corrected checkpoint passed the complete local
+macOS and Ubuntu 24.04 verification suites, independent review, and the exact
+GitHub Actions Ubuntu gate.
 
-During validation, the first checkpoint attempt was denied while creating
-`.git/index.lock`. A later staging operation succeeded, but the commit retry was
-again denied at the same lock-file boundary. This pre-checkpoint record
-deliberately leaves the checkpoint and remote run pending. A later closure
-change must record those facts before `docs/roadmap.md` can move Phase 7 from
-`in-progress` to `complete`.
+The implementation checkpoint
+`118e07f8ad87ba656a5acd9f8c977cbe779a219d` was committed and pushed without
+force after the earlier `.git/index.lock` permission problem was removed. Its
+Ubuntu run failed because one test compared two PTY master descriptors. Linux
+opens all PTY masters through the same `/dev/ptmx` clone device, so that did not
+construct the intended mismatched-device case. Production validation was not
+relaxed: checkpoint `7dd7362af49e6dcea4b03f51fe3825c379a4fd43`
+changes only the test to compare concrete PTY slave devices and has also been
+pushed without force. Its exact Ubuntu workflow is green.
 
 ## Scope
 
@@ -40,8 +42,8 @@ compaction; those are Phase 8 work.
 - Date: 2026-08-15 (Asia/Shanghai)
 - Git base before Phase 7:
   `0f7938c093f1f98a300d915c8b6c98a6b9a50445`
-- Tested Phase 7 checkpoint: pending because this environment cannot complete
-  the commit; the validated source is the staged tree atop that base
+- Tested Phase 7 checkpoint:
+  `7dd7362af49e6dcea4b03f51fe3825c379a4fd43`
 - Total default/all-feature Rust tests: 493
 - Ignored tests: 0
 - Library tests: 238
@@ -315,17 +317,41 @@ separate required gate, not an inferred result of macOS review.
   a real DeepSeek adapter against bounded loopback SSE servers and conspicuous
   fake credentials.
 
-## Remote acceptance — pending
+## Remote acceptance
 
-The locally validated source has not yet completed remote acceptance.
-Completion still requires all of the following:
+The first exact-commit run is retained as failure evidence rather than hidden:
 
-1. create one bounded Phase 7 commit after restoring `.git` write permission;
-2. push that commit to `origin/main` without force;
-3. wait for the repository's `ubuntu-24.04` workflow for that exact commit;
-4. record the commit, workflow URL, job result, Rust version, test count, and
-   ignored count here; and
-5. only then mark Phase 7 `complete` and Phase 8 `in-progress` in the roadmap.
+- GitHub Actions run
+  [`31842310652`](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31842310652)
+  tested `118e07f8ad87ba656a5acd9f8c977cbe779a219d` on
+  `ubuntu-24.04`;
+- checkout and the pinned Rust installation succeeded;
+- `./scripts/verify.sh` failed with exit 101 after 2 minutes 14 seconds in the
+  `Run repository checks` step; and
+- a local Ubuntu 24.04.4 reproduction identified
+  `cli::terminal::tests::independently_opened_terminal_devices_must_match` as
+  the only failure. The corrected fixture then passed both the focused test and
+  the complete verification script on Ubuntu and macOS.
 
-Until those facts exist, the local implementation is green but Phase 7 remains
-`in-progress`.
+Corrected checkpoint `7dd7362af49e6dcea4b03f51fe3825c379a4fd43` is on
+`origin/main`. Its GitHub Actions run
+[`31844031837`](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31844031837)
+completed successfully:
+
+- the only job, `Rust verification` (`94906709961`), ran on
+  `ubuntu-24.04` from `2026-08-14T21:48:46Z` through `21:51:46Z`;
+- checkout and installation of the pinned Rust 1.85.0 toolchain succeeded;
+- `Run repository checks` executed `./scripts/verify.sh` from `21:48:57Z`
+  through `21:51:44Z` and succeeded; and
+- every setup and cleanup step also succeeded.
+
+An independent clean Ubuntu 24.04.4 reproduction of the same checkpoint ran
+the same complete verification script and listed 500/500 default/all-feature
+tests with zero ignored. The platform difference from macOS's 493 tests is the
+expected Linux-only process/procfs coverage plus one Linux filename case, not a
+skipped test. The final read-only review confirmed that the fix changes only a
+test fixture; production terminal identity validation still requires a
+character device and matching `st_dev`, `st_ino`, and `st_rdev`.
+
+This closes the Phase 7 checkpoint. Durable storage, resume, damaged-tail
+recovery, and context compaction now become the single active Phase 8 scope.
