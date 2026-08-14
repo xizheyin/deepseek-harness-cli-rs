@@ -458,13 +458,17 @@ mod tests {
 
     #[test]
     fn independently_opened_terminal_devices_must_match() {
-        let (first, _first_slave) = blocking::open().expect("first PTY should open");
-        let duplicate = rustix::io::dup(&first).expect("first PTY should duplicate");
-        let (second, _second_slave) = blocking::open().expect("second PTY should open");
+        // Linux exposes every PTY master through the same `/dev/ptmx` clone
+        // device, so comparing masters does not prove that two terminal
+        // endpoints differ. Slave descriptors identify the actual terminal on
+        // both supported platforms and exercise the production identity check.
+        let (_first_master, first_slave) = blocking::open().expect("first PTY should open");
+        let duplicate = rustix::io::dup(&first_slave).expect("first PTY should duplicate");
+        let (_second_master, second_slave) = blocking::open().expect("second PTY should open");
 
-        assert!(validate_same_terminal_device(first.as_fd(), duplicate.as_fd()).is_ok());
+        assert!(validate_same_terminal_device(first_slave.as_fd(), duplicate.as_fd()).is_ok());
         assert_eq!(
-            validate_same_terminal_device(first.as_fd(), second.as_fd()),
+            validate_same_terminal_device(first_slave.as_fd(), second_slave.as_fd()),
             Err(TerminalError::Unsupported)
         );
     }
