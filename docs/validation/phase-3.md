@@ -19,7 +19,7 @@ persistence, and interactive assembly belong to later phases.
 
 - Date: 2026-08-14 (Asia/Shanghai)
 - Git base before the Phase 3 checkpoint: `989744d45fc8ff3c6adb9cb6aca1865d3538557b`
-- Tested Phase 3 checkpoint: candidate working tree; immutable commit added after checkpoint creation
+- Tested Phase 3 checkpoint: `66c91700c4c61f0f0032a4cf6f46e26005693348`
 - Host: macOS 27.0, arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 - Cargo: `cargo 1.85.0 (d73d2caf9 2024-12-31)`
@@ -147,8 +147,8 @@ success, multi-call infrastructure failure, unknown/duplicate tools, input and
 result amplification, extension panic closure, dangling-history replay guards,
 surface-provenance spoofing, dispatch-time oracle evidence, and stale broad
 compatibility claims. Final reviewers reported no remaining implementation,
-safety, Session, or scoped-oracle blocker; this record and the remote checkpoint
-remain the last acceptance steps.
+safety, Session, scoped-oracle, or documentation blocker on the tested
+checkpoint.
 
 ## Known limitations
 
@@ -164,4 +164,7 @@ remain the last acceptance steps.
 
 ## Remote acceptance
 
-Pending checkpoint commit, non-force push, and Ubuntu 24.04 GitHub Actions evidence.
+The Phase 3 checkpoint was pushed non-forced to `origin/main`. GitHub Actions
+run [31759801021](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31759801021)
+completed successfully on Ubuntu 24.04 for the exact checkpoint
+`66c91700c4c61f0f0032a4cf6f46e26005693348`.

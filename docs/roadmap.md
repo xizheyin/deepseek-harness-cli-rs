@@ -7,8 +7,8 @@ This roadmap records implementation status. It is a plan, not a list of current 
 | 0 | Reproducible Rust CLI foundation | `complete` | [`validation/phase-0.md`](validation/phase-0.md) |
 | 1 | Core types and in-memory session | `complete` | [`validation/phase-1.md`](validation/phase-1.md) |
 | 2 | DeepSeek streaming provider | `complete` | [`validation/phase-2.md`](validation/phase-2.md) |
-| 3 | Agent Loop | `in-progress` | — |
-| 4 | Read-only tools | `not-started` | — |
+| 3 | Agent Loop | `complete` | [`validation/phase-3.md`](validation/phase-3.md) |
+| 4 | Read-only tools | `in-progress` | — |
 | 5 | File changes and approval | `not-started` | — |
 | 6 | Shell, timeout, and cancellation | `not-started` | — |
 | 7 | Interactive CLI/TUI | `not-started` | — |
