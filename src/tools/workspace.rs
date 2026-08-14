@@ -19,6 +19,8 @@ use cap_std::{
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
+use crate::entropy::EntropySource;
+
 use super::{
     MAX_DIRECTORY_DEPTH, MAX_READ_CHUNK_BYTES, MAX_TRAVERSAL_PATH_BYTES,
     arguments::MAX_TOOL_ARGUMENT_STRING_BYTES,
@@ -33,6 +35,7 @@ pub(crate) struct Workspace {
     display_root: Arc<PathBuf>,
     startup_root: Arc<PathBuf>,
     mutation_lock: Arc<Mutex<()>>,
+    entropy: EntropySource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +94,7 @@ pub(crate) struct PreparedWorkspaceMutation {
     baseline: Option<Vec<u8>>,
     snapshot: Option<MutationSnapshot>,
     mutation_lock: Arc<Mutex<()>>,
+    entropy: EntropySource,
     #[cfg(test)]
     test_commit_hook: Option<MutationCommitTestHook>,
 }
@@ -268,7 +272,17 @@ impl PreparedWorkspaceMutation {
             return Ok(WorkspaceCommitStatus::not_committed(error));
         }
 
-        let stage_name = OsString::from(format!(".dsh-stage-{}", uuid::Uuid::new_v4()));
+        let stage_id = match self.entropy.uuid_v4() {
+            Ok(id) => id,
+            Err(_) => {
+                return Ok(WorkspaceCommitStatus::not_committed(ToolCallError::model(
+                    "FsError",
+                    "FS_IO_ERROR",
+                    "could not create a private staging directory",
+                )));
+            }
+        };
+        let stage_name = OsString::from(format!(".dsh-stage-{stage_id}"));
         let mut builder = cap_std::fs::DirBuilder::new();
         builder.mode(0o700);
         if self.parent.create_dir_with(&stage_name, &builder).is_err() {
@@ -676,6 +690,7 @@ impl Workspace {
             display_root: Arc::new(display_root),
             startup_root: Arc::new(startup_root),
             mutation_lock: Arc::new(Mutex::new(())),
+            entropy: EntropySource::system(),
         })
     }
 
@@ -694,6 +709,7 @@ impl Workspace {
         check_cancel(cancellation)?;
         let root = Arc::clone(&self.root);
         let mutation_lock = Arc::clone(&self.mutation_lock);
+        let entropy = self.entropy;
         let token = cancellation.clone();
         let prepared = task::spawn_blocking(move || {
             if token.is_cancelled() {
@@ -755,6 +771,7 @@ impl Workspace {
                 baseline,
                 snapshot,
                 mutation_lock,
+                entropy,
                 #[cfg(test)]
                 test_commit_hook: None,
             })
@@ -1996,6 +2013,50 @@ mod tests {
             }
             WorkspaceCommitStatus::Committed { .. } => {
                 panic!("an unsynchronized staging file must not publish")
+            }
+        }
+        assert_eq!(fs::read(&target).unwrap(), b"old contents\n");
+        assert!(!fs::read_dir(&root.0).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".dsh-stage-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_name_entropy_failure_is_definitely_not_committed() {
+        fn failing_entropy(_bytes: &mut [u8]) -> Result<(), crate::entropy::EntropyError> {
+            Err(crate::entropy::EntropyError)
+        }
+
+        let root = TempRoot::new();
+        let target = root.0.join("target.txt");
+        fs::write(&target, b"old contents\n").unwrap();
+        let workspace = Workspace::open(&root.0).unwrap();
+        let mut prepared =
+            prepare_mutation(&workspace, "target.txt", WorkspaceMutationOperation::Update).await;
+        prepared.entropy = crate::entropy::EntropySource::injected(failing_entropy);
+
+        let status = commit_mutation(
+            prepared,
+            b"agent candidate\n".to_vec(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        match status {
+            WorkspaceCommitStatus::NotCommitted {
+                error,
+                cleanup_warning,
+            } => {
+                assert!(error.has_code("FS_IO_ERROR"));
+                assert!(!cleanup_warning);
+            }
+            WorkspaceCommitStatus::Committed { .. } => {
+                panic!("entropy failure must happen before publication")
             }
         }
         assert_eq!(fs::read(&target).unwrap(), b"old contents\n");

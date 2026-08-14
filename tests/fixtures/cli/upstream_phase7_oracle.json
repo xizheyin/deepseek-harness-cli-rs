@@ -1,0 +1,1290 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a"
+  },
+  "evidence": {
+    "sourcePaths": [
+      "packages/acp/acp/src/index.ts",
+      "packages/acp/acp/src/codec.ts",
+      "packages/core/agent-loop/src/agent.ts",
+      "packages/core/agent-loop/src/tool-calls.ts",
+      "packages/core/tools/src/index.ts",
+      "packages/interaction/user-approval/src/index.ts",
+      "packages/bundle/headless/src/index.ts",
+      "packages/bundle/headless/src/startup.ts",
+      "packages/fs/tool-fs/src/diff.ts",
+      "packages/client/ui-primitives/src/DiffBlock.tsx",
+      "packages/client/ui-tool/src/client/tool/models/diff-card-model.ts"
+    ],
+    "testPaths": [
+      "packages/acp/acp/tests/harness.ts",
+      "packages/acp/acp/tests/bridge.spec.ts",
+      "packages/acp/acp/tests/turns.spec.ts",
+      "packages/acp/acp/tests/approval.spec.ts",
+      "packages/acp/acp/tests/edges.spec.ts",
+      "packages/core/agent-loop/tests/cancel.spec.ts",
+      "packages/interaction/user-approval/tests/approval.spec.ts",
+      "packages/bundle/headless/tests/headless.spec.ts",
+      "packages/bundle/headless/tests/startup.spec.ts",
+      "packages/fs/tool-fs/tests/diff.spec.ts",
+      "packages/client/ui-primitives/tests/diff-block.client.spec.tsx",
+      "packages/client/ui-tool/tests/diff-card.client.spec.tsx"
+    ],
+    "executionModes": {
+      "acp": "runtime public/test composition",
+      "approval": "runtime public/test composition with a temporary-file side-effect sentinel",
+      "headless": "runtime public/test composition",
+      "diffComputation": "runtime pure upstream function",
+      "diffWebRender": "source-and-official-test-derived checked fact; not runtime-rendered by this generator"
+    }
+  },
+  "scenarios": {
+    "acpTwoTurns": {
+      "composition": "real ACP bridge + real Agent Loop + scripted LlmAdapter over in-memory NDJSON streams",
+      "initialize": {
+        "protocolVersion": 1,
+        "agentInfo": {
+          "name": "deepseek-harness-acp",
+          "version": "0.0.1"
+        },
+        "agentCapabilities": {
+          "promptCapabilities": {
+            "image": false,
+            "audio": false,
+            "embeddedContext": false
+          }
+        },
+        "authMethods": []
+      },
+      "prompts": [
+        {
+          "text": "first prompt",
+          "response": {
+            "stopReason": "end_turn"
+          }
+        },
+        {
+          "text": "second prompt",
+          "response": {
+            "stopReason": "end_turn"
+          }
+        }
+      ],
+      "wireUpdates": [
+        {
+          "content": {
+            "text": "first committed answer",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        },
+        {
+          "content": {
+            "text": "second committed answer",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        }
+      ],
+      "providerRequestTranscripts": [
+        {
+          "ordinal": 1,
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "first prompt"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ]
+        },
+        {
+          "ordinal": 2,
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "first prompt"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "first committed answer"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock"
+              }
+            },
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "second prompt"
+                }
+              ],
+              "source": {
+                "kind": "user"
+              }
+            }
+          ]
+        }
+      ],
+      "durableTurnEnds": [
+        {
+          "turn": 1,
+          "reason": {
+            "kind": "completed"
+          }
+        },
+        {
+          "turn": 2,
+          "reason": {
+            "kind": "completed"
+          }
+        }
+      ],
+      "durableEvents": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700700000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "first prompt"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                },
+                "role": "user",
+                "id": "<uuid-01>"
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700700000013,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700700000026,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700700000039,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700700000052,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "first prompt"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            },
+            "role": "user",
+            "id": "<uuid-01>"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 5,
+          "time": 1700700000065,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "mock"
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 7 oracle."
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 6,
+          "time": 1700700000078,
+          "data": {
+            "provider": "mock",
+            "model": "mock"
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 7,
+          "time": 1700700000091,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700700000104,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "first committed answer"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700700000117,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "first committed answer"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700700000130,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 22
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700700000143,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 12,
+          "time": 1700700000156,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "first committed answer"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock"
+              },
+              "id": "<uuid-02>"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 22
+            }
+          },
+          "sourceEventSeqs": [
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 13,
+          "time": 1700700000169,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 14,
+          "time": 1700700000182,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 15,
+          "time": 1700700000195,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "second prompt"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                },
+                "role": "user",
+                "id": "<uuid-03>"
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 16,
+          "time": 1700700000208,
+          "data": {
+            "turn": 2
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 17,
+          "time": 1700700000221,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 18,
+          "time": 1700700000234,
+          "data": {
+            "turn": 2,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 19,
+          "time": 1700700000247,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "second prompt"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            },
+            "role": "user",
+            "id": "<uuid-03>"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 20,
+          "time": 1700700000260,
+          "data": {
+            "turn": 2,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 21,
+          "time": 1700700000273,
+          "data": {
+            "turn": 2,
+            "step": 1,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "second committed answer"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 22,
+          "time": 1700700000286,
+          "data": {
+            "turn": 2,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "second committed answer"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 23,
+          "time": 1700700000299,
+          "data": {
+            "turn": 2,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 23
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 24,
+          "time": 1700700000312,
+          "data": {
+            "turn": 2,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 25,
+          "time": 1700700000325,
+          "data": {
+            "turn": 2,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "second committed answer"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock"
+              },
+              "id": "<uuid-04>"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 23
+            }
+          },
+          "sourceEventSeqs": [
+            20,
+            21,
+            22,
+            23,
+            24
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 26,
+          "time": 1700700000338,
+          "data": {
+            "turn": 2,
+            "step": 1
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 27,
+          "time": 1700700000351,
+          "data": {
+            "turn": 2,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "checks": {
+        "protocolAdvertisesTextOnly": true,
+        "bothPromptsEndNormally": true,
+        "oneCommittedUpdatePerTurn": true,
+        "secondRequestRetainsConversation": true,
+        "twoCompletedDurableTurns": true
+      }
+    },
+    "acpCancelThenContinue": {
+      "composition": "real ACP bridge + real Agent Loop; adapter emits a durable text delta then waits for caller cancellation",
+      "firstPrompt": {
+        "response": {
+          "stopReason": "cancelled"
+        },
+        "wireUpdatesBeforeContinuation": []
+      },
+      "cancelledIntervalEvents": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700700000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "start cancellable turn"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                },
+                "role": "user",
+                "id": "<uuid-01>"
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700700000013,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700700000026,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700700000039,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700700000052,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "start cancellable turn"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            },
+            "role": "user",
+            "id": "<uuid-01>"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 5,
+          "time": 1700700000065,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "mock"
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 7 oracle."
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 6,
+          "time": 1700700000078,
+          "data": {
+            "provider": "mock",
+            "model": "mock"
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 7,
+          "time": 1700700000091,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700700000104,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "partial-before-cancel"
+            }
+          }
+        },
+        {
+          "type": "step/end",
+          "seq": 9,
+          "time": 1700700000117,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 10,
+          "time": 1700700000130,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "aborted",
+              "reason": {
+                "kind": "user"
+              }
+            }
+          }
+        }
+      ],
+      "secondPrompt": {
+        "response": {
+          "stopReason": "end_turn"
+        }
+      },
+      "finalWireUpdates": [
+        {
+          "content": {
+            "text": "continued after cancellation",
+            "type": "text"
+          },
+          "sessionUpdate": "agent_message_chunk"
+        }
+      ],
+      "finalDurableTurnEnds": [
+        {
+          "turn": 1,
+          "reason": {
+            "kind": "aborted",
+            "reason": {
+              "kind": "user"
+            }
+          }
+        },
+        {
+          "turn": 2,
+          "reason": {
+            "kind": "completed"
+          }
+        }
+      ],
+      "checks": {
+        "explicitClientCancelSettlesCancelled": true,
+        "partialChunkDurableBeforeClosure": true,
+        "cancelledStepHasNoCommittedAssistantMessage": true,
+        "partialChunkStaysOffAcpWire": true,
+        "durableReasonIsUserAbort": true,
+        "sameSessionContinues": true,
+        "abortedThenCompleted": true
+      }
+    },
+    "approval": {
+      "allow": {
+        "decision": "allow",
+        "composition": "real ACP permission bridge + real ApprovalService audit + real tool pre-execute pipeline",
+        "promptResponse": {
+          "stopReason": "end_turn"
+        },
+        "permissionRequest": {
+          "options": [
+            {
+              "kind": "allow_once",
+              "name": "Allow once",
+              "optionId": "allow-once"
+            },
+            {
+              "kind": "reject_once",
+              "name": "Reject",
+              "optionId": "reject-once"
+            }
+          ],
+          "sessionId": "<session>",
+          "toolCall": {
+            "toolCallId": "call-allow"
+          }
+        },
+        "trace": [
+          "session:tool/call",
+          "gate:ask",
+          "session:approval/asked",
+          "client:allow",
+          "session:approval/decided",
+          "tool-body",
+          "session:tool/result"
+        ],
+        "relevantDurableEvents": [
+          {
+            "type": "tool/call",
+            "seq": 13,
+            "time": 1700700000169,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "callId": "call-allow",
+              "name": "sentinel",
+              "arguments": "{}"
+            }
+          },
+          {
+            "type": "approval/asked",
+            "seq": 14,
+            "time": 1700700000182,
+            "data": {
+              "id": "<uuid-01>",
+              "toolName": "sentinel",
+              "callId": "call-allow",
+              "reason": "Phase 7 allow oracle"
+            }
+          },
+          {
+            "type": "approval/decided",
+            "seq": 15,
+            "time": 1700700000195,
+            "data": {
+              "id": "<uuid-01>",
+              "outcome": "allowed-once"
+            }
+          },
+          {
+            "type": "tool/result",
+            "seq": 16,
+            "time": 1700700000208,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-allow"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-allow",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "sentinel allow"
+                      }
+                    ],
+                    "isError": false
+                  }
+                ],
+                "role": "user",
+                "id": "<uuid-02>"
+              }
+            },
+            "sourceEventSeqs": [
+              13
+            ],
+            "surfaceOp": "append"
+          }
+        ],
+        "sideEffect": {
+          "path": "<workspace>/approval-allow.txt",
+          "diskAfter": "allow\n"
+        },
+        "wireUpdates": [
+          {
+            "content": {
+              "text": "finished allow",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        ],
+        "checks": {
+          "exactAuditAndSideEffectOrder": true,
+          "askedAndDecidedArePaired": true,
+          "durableOutcomeMatchesClient": true,
+          "onlyAllowRunsBody": true,
+          "toolResultMatchesGrant": true,
+          "onePermissionRequest": true,
+          "exactOneShotOptions": true,
+          "callIdentityPreserved": true,
+          "toolPresentationStaysOffAcpWire": true,
+          "promptCompletesAfterDeniedResult": true
+        }
+      },
+      "reject": {
+        "decision": "reject",
+        "composition": "real ACP permission bridge + real ApprovalService audit + real tool pre-execute pipeline",
+        "promptResponse": {
+          "stopReason": "end_turn"
+        },
+        "permissionRequest": {
+          "options": [
+            {
+              "kind": "allow_once",
+              "name": "Allow once",
+              "optionId": "allow-once"
+            },
+            {
+              "kind": "reject_once",
+              "name": "Reject",
+              "optionId": "reject-once"
+            }
+          ],
+          "sessionId": "<session>",
+          "toolCall": {
+            "toolCallId": "call-reject"
+          }
+        },
+        "trace": [
+          "session:tool/call",
+          "gate:ask",
+          "session:approval/asked",
+          "client:reject",
+          "session:approval/decided",
+          "session:tool/result"
+        ],
+        "relevantDurableEvents": [
+          {
+            "type": "tool/call",
+            "seq": 13,
+            "time": 1700700000169,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "callId": "call-reject",
+              "name": "sentinel",
+              "arguments": "{}"
+            }
+          },
+          {
+            "type": "approval/asked",
+            "seq": 14,
+            "time": 1700700000182,
+            "data": {
+              "id": "<uuid-01>",
+              "toolName": "sentinel",
+              "callId": "call-reject",
+              "reason": "Phase 7 reject oracle"
+            }
+          },
+          {
+            "type": "approval/decided",
+            "seq": 15,
+            "time": 1700700000195,
+            "data": {
+              "id": "<uuid-01>",
+              "outcome": "rejected"
+            }
+          },
+          {
+            "type": "tool/result",
+            "seq": 16,
+            "time": 1700700000208,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-reject"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-reject",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "Error: the user rejected tool \"sentinel\""
+                      }
+                    ],
+                    "isError": true
+                  }
+                ],
+                "role": "user",
+                "id": "<uuid-02>"
+              }
+            },
+            "sourceEventSeqs": [
+              13
+            ],
+            "surfaceOp": "append"
+          }
+        ],
+        "sideEffect": {
+          "path": "<workspace>/approval-reject.txt",
+          "diskAfter": null
+        },
+        "wireUpdates": [
+          {
+            "content": {
+              "text": "finished reject",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        ],
+        "checks": {
+          "exactAuditAndSideEffectOrder": true,
+          "askedAndDecidedArePaired": true,
+          "durableOutcomeMatchesClient": true,
+          "onlyAllowRunsBody": true,
+          "toolResultMatchesGrant": true,
+          "onePermissionRequest": true,
+          "exactOneShotOptions": true,
+          "callIdentityPreserved": true,
+          "toolPresentationStaysOffAcpWire": true,
+          "promptCompletesAfterDeniedResult": true
+        }
+      },
+      "cancel": {
+        "decision": "cancel",
+        "composition": "real ACP permission bridge + real ApprovalService audit + real tool pre-execute pipeline",
+        "promptResponse": {
+          "stopReason": "end_turn"
+        },
+        "permissionRequest": {
+          "options": [
+            {
+              "kind": "allow_once",
+              "name": "Allow once",
+              "optionId": "allow-once"
+            },
+            {
+              "kind": "reject_once",
+              "name": "Reject",
+              "optionId": "reject-once"
+            }
+          ],
+          "sessionId": "<session>",
+          "toolCall": {
+            "toolCallId": "call-cancel"
+          }
+        },
+        "trace": [
+          "session:tool/call",
+          "gate:ask",
+          "session:approval/asked",
+          "client:cancel",
+          "session:approval/decided",
+          "session:tool/result"
+        ],
+        "relevantDurableEvents": [
+          {
+            "type": "tool/call",
+            "seq": 13,
+            "time": 1700700000169,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "callId": "call-cancel",
+              "name": "sentinel",
+              "arguments": "{}"
+            }
+          },
+          {
+            "type": "approval/asked",
+            "seq": 14,
+            "time": 1700700000182,
+            "data": {
+              "id": "<uuid-01>",
+              "toolName": "sentinel",
+              "callId": "call-cancel",
+              "reason": "Phase 7 cancel oracle"
+            }
+          },
+          {
+            "type": "approval/decided",
+            "seq": 15,
+            "time": 1700700000195,
+            "data": {
+              "id": "<uuid-01>",
+              "outcome": "cancelled"
+            }
+          },
+          {
+            "type": "tool/result",
+            "seq": 16,
+            "time": 1700700000208,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-cancel"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-cancel",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "Error: approval for tool \"sentinel\" was cancelled"
+                      }
+                    ],
+                    "isError": true
+                  }
+                ],
+                "role": "user",
+                "id": "<uuid-02>"
+              }
+            },
+            "sourceEventSeqs": [
+              13
+            ],
+            "surfaceOp": "append"
+          }
+        ],
+        "sideEffect": {
+          "path": "<workspace>/approval-cancel.txt",
+          "diskAfter": null
+        },
+        "wireUpdates": [
+          {
+            "content": {
+              "text": "finished cancel",
+              "type": "text"
+            },
+            "sessionUpdate": "agent_message_chunk"
+          }
+        ],
+        "checks": {
+          "exactAuditAndSideEffectOrder": true,
+          "askedAndDecidedArePaired": true,
+          "durableOutcomeMatchesClient": true,
+          "onlyAllowRunsBody": true,
+          "toolResultMatchesGrant": true,
+          "onePermissionRequest": true,
+          "exactOneShotOptions": true,
+          "callIdentityPreserved": true,
+          "toolPresentationStaysOffAcpWire": true,
+          "promptCompletesAfterDeniedResult": true
+        }
+      }
+    },
+    "headless": {
+      "composition": "real exported headless apply() over the official test-style AgentRegistry/SessionStore factory seam",
+      "completed": {
+        "code": 0,
+        "stdout": "final answer\n",
+        "stderr": "",
+        "order": [
+          "flush",
+          "stdout",
+          "exit"
+        ]
+      },
+      "aborted": {
+        "code": 1,
+        "stdout": "\n",
+        "stderr": "",
+        "order": [
+          "flush",
+          "stdout",
+          "exit"
+        ]
+      },
+      "providerError": {
+        "code": 1,
+        "stdout": "\n",
+        "stderr": "dsh: SERVER: provider unavailable\n",
+        "order": [
+          "flush",
+          "stdout",
+          "stderr",
+          "exit"
+        ]
+      },
+      "checks": {
+        "completedPrintsOnlyLastOwnedAssistant": true,
+        "successfulStderrEmpty": true,
+        "flushPrecedesOutputAndExit": true,
+        "completedExitZero": true,
+        "abortedExitOneWithBlankStdout": true,
+        "providerErrorIsDurableFailure": true
+      }
+    },
+    "diff": {
+      "pureComputation": {
+        "mode": "executed computeHunkDiffs from the pinned upstream source",
+        "noTrailingNewline": [
+          {
+            "path": "n.txt",
+            "oldText": "x",
+            "newText": "y"
+          }
+        ],
+        "trailingNewline": [
+          {
+            "path": "new.txt",
+            "oldText": null,
+            "newText": "hello"
+          }
+        ],
+        "interiorBlank": [
+          {
+            "path": "blank.txt",
+            "oldText": null,
+            "newText": "x\n\ny"
+          }
+        ]
+      },
+      "webRenderContract": {
+        "mode": "source-and-official-test-derived; this standalone tsx generator does not claim to run the React/CSS/jsdom renderer",
+        "facts": {
+          "emptyTextProducesZeroRows": true,
+          "oneTrailingNewlineTerminatesTheLastLine": true,
+          "interiorBlankLineSurvives": true,
+          "sameFileSecondHunkUsesEllipsisGap": true,
+          "footerCountsAddedRemovedAndDistinctFiles": true
+        },
+        "sourcePath": "packages/client/ui-primitives/src/DiffBlock.tsx",
+        "testPath": "packages/client/ui-primitives/tests/diff-block.client.spec.tsx"
+      },
+      "checks": {
+        "pureDiffDropsPatchMarker": true,
+        "pureDiffTreatsTerminatorAsNotContent": true,
+        "pureDiffKeepsInteriorBlank": true,
+        "renderSourceDropsEmptySide": true,
+        "renderSourceDropsOneTrailingTerminator": true,
+        "renderSourceUsesSameFileGap": true,
+        "renderSourceCountsDistinctPaths": true,
+        "renderSourceHasExactFooter": true,
+        "officialRenderTestPinsTrailingNewline": true,
+        "officialRenderTestPinsDeletionAndInteriorBlank": true
+      }
+    }
+  },
+  "deterministic": {
+    "eventTimes": "normalized as 1700700000000 + seq * 13",
+    "randomUuids": "normalized by first appearance within each scenario",
+    "temporaryPaths": "normalized to <fixture-root> and <workspace>",
+    "freshTemporaryWorkspace": true
+  },
+  "safety": {
+    "networkAccess": "none",
+    "credentialAccess": "none",
+    "filesystemWrites": "fresh platform temporary directory and explicit output path only",
+    "realModelCalls": "none; all model streams are deterministic scripted adapters"
+  }
+}

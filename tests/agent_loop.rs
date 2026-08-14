@@ -33,6 +33,7 @@ use deepseek_harness_cli::{
 };
 use futures_util::stream;
 use serde_json::json;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -269,6 +270,11 @@ struct IgnoresCancelTools {
     dropped: Arc<AtomicBool>,
 }
 
+struct NotifyingReadyTools {
+    calls: AtomicUsize,
+    entered: Arc<Notify>,
+}
+
 impl ToolExecutor for PendingTools {
     fn execute(
         &self,
@@ -483,6 +489,21 @@ impl ToolExecutor for FakeTools {
     }
 }
 
+impl ToolExecutor for NotifyingReadyTools {
+    fn execute(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancel: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        Box::pin(async {
+            ToolExecutionResult::success(vec![ContentBlock::text("ready").unwrap()])
+                .map_err(|error| ToolExecutorError::new(error.to_string()))
+        })
+    }
+}
+
 fn user(text: &str) -> Message {
     user_with_id("user-1", text)
 }
@@ -539,6 +560,29 @@ fn two_tool_response() -> Vec<StreamChunk> {
         StreamChunk::block_end(1, second).unwrap(),
         StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
     ]
+}
+
+fn many_tool_response(count: usize) -> Vec<StreamChunk> {
+    let mut chunks = Vec::with_capacity(count * 2 + 1);
+    for index in 0..count {
+        let call_id = format!("call-{index}");
+        let block = ContentBlock::tool_call(call_id.as_str(), "calculator", "{}").unwrap();
+        chunks.push(StreamChunk::block_start(index as u64, ContentBlockType::ToolCall).unwrap());
+        chunks.push(StreamChunk::block_end(index as u64, block).unwrap());
+    }
+    chunks.push(StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap());
+    chunks
+}
+
+fn maximum_ready_text_response() -> Vec<StreamChunk> {
+    let delta_count = deepseek_harness_cli::provider::MAX_PROVIDER_STREAM_CHUNKS - 3;
+    let text = "x".repeat(delta_count);
+    let mut chunks = Vec::with_capacity(deepseek_harness_cli::provider::MAX_PROVIDER_STREAM_CHUNKS);
+    chunks.push(StreamChunk::block_start(0, ContentBlockType::Text).unwrap());
+    chunks.extend((0..delta_count).map(|_| StreamChunk::text_delta(0, "x").unwrap()));
+    chunks.push(StreamChunk::block_end(0, ContentBlock::text(text).unwrap()).unwrap());
+    chunks.push(StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap());
+    chunks
 }
 
 fn named_tool_response(name: &str) -> Vec<StreamChunk> {
@@ -770,6 +814,28 @@ struct CancelAtEofProvider {
     cancellation: CancellationToken,
 }
 
+struct Phase7CancelThenContinueProvider {
+    first_chunks: Mutex<Option<VecDeque<StreamChunk>>>,
+    partial_committed: Arc<Notify>,
+    requests: Mutex<Vec<Vec<Message>>>,
+    calls: AtomicUsize,
+}
+
+impl Phase7CancelThenContinueProvider {
+    fn new(first_chunks: Vec<StreamChunk>, partial_committed: Arc<Notify>) -> Self {
+        Self {
+            first_chunks: Mutex::new(Some(first_chunks.into())),
+            partial_committed,
+            requests: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
 impl ModelProvider for CancelAtEofProvider {
     fn prepare_call(
         &self,
@@ -793,6 +859,45 @@ impl ModelProvider for CancelAtEofProvider {
                 }
             },
         ))
+    }
+}
+
+impl ModelProvider for Phase7CancelThenContinueProvider {
+    fn prepare_call(
+        &self,
+        config: LlmCallConfig,
+    ) -> Result<PreparedProviderCall, ProviderPrepareError> {
+        Ok(prepared(config))
+    }
+
+    fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.messages().to_vec());
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let mut chunks = self.first_chunks.lock().unwrap().take().unwrap();
+                let partial_committed = self.partial_committed.clone();
+                let mut notified = false;
+                Box::pin(stream::poll_fn(move |_| {
+                    if let Some(chunk) = chunks.pop_front() {
+                        return std::task::Poll::Ready(Some(Ok(chunk)));
+                    }
+                    if !notified {
+                        notified = true;
+                        partial_committed.notify_one();
+                    }
+                    std::task::Poll::Pending
+                }))
+            }
+            1 => Box::pin(stream::iter(
+                text_response("continued after cancellation")
+                    .into_iter()
+                    .map(Ok),
+            )),
+            call => panic!("unexpected Phase 7 provider call {call}"),
+        }
     }
 }
 
@@ -1448,6 +1553,50 @@ async fn retry_wait_cancellation_logs_schedule_but_not_started() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retry_boundary_yields_before_the_second_attempt_and_resamples_cancellation() {
+    let failure = LlmFailure::new("temporary", "SERVER").unwrap();
+    let provider = Arc::new(FakeProvider::new(vec![
+        vec![StreamChunk::finish(FinishReason::error(failure).unwrap(), None).unwrap()],
+        text_response("must not be requested"),
+    ]));
+    let cancellation = CancellationToken::new();
+    let cancel_from_sibling = cancellation.clone();
+    let mut agent = AgentLoop::with_runtime(
+        session("retry-boundary-yield"),
+        provider.clone(),
+        Arc::new(FakeTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        biased;
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("retry fairly")]),
+            cancellation,
+        ),
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            cancel_from_sibling.cancel();
+        },
+    };
+    let outcome = outcome.unwrap();
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    assert_eq!(provider.requests().len(), 1);
+    let types = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| event.kind().event_type())
+        .collect::<Vec<_>>();
+    assert!(types.contains(&"llm/retry"));
+    assert!(!types.contains(&"llm/retry-started"));
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test(start_paused = true)]
 async fn retry_after_uses_provider_delay_or_policy_fallback_exactly() {
     let failure_with_delay = |delay_ms: f64| {
         LlmFailure::from_parts(
@@ -1805,6 +1954,195 @@ async fn cancellation_that_races_with_stream_eof_prevents_assistant_commit() {
             .any(|event| matches!(event.kind(), EventKind::AssistantMessage { .. }))
     );
     assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test]
+async fn always_ready_provider_yields_before_the_stream_chunk_ceiling() {
+    let cancellation = CancellationToken::new();
+    let cancel_from_sibling = cancellation.clone();
+    let provider = Arc::new(FakeProvider::new(vec![maximum_ready_text_response()]));
+    let mut agent = AgentLoop::with_runtime(
+        session("ready-stream-yield"),
+        provider,
+        Arc::new(FakeTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        biased;
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("stream fairly")]),
+            cancellation,
+        ),
+        async move { cancel_from_sibling.cancel(); },
+    };
+    let outcome = outcome.unwrap();
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    let chunks = agent
+        .session()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), EventKind::AssistantChunk { .. }))
+        .count();
+    assert!((1..=32).contains(&chunks), "observed {chunks} chunks");
+    assert!(
+        !agent
+            .session()
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind(), EventKind::AssistantMessage { .. }))
+    );
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_step_yield_resamples_the_turn_deadline_before_turn_end() {
+    let limits = AgentLimits::default()
+        .with_turn_duration(std::time::Duration::from_millis(1))
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("completed-step-yield"),
+        Arc::new(FakeProvider::new(vec![text_response("already committed")])),
+        Arc::new(FakeTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config().with_limits(limits),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        biased;
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("finish fairly")]),
+            CancellationToken::new(),
+        ),
+        async { tokio::time::advance(std::time::Duration::from_millis(2)).await; },
+    };
+    let outcome = outcome.unwrap();
+
+    assert!(matches!(
+        outcome.reason(),
+        TurnEndReason::Error { error } if error.code() == "AGENT_TURN_TIMEOUT"
+    ));
+    assert!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind(), EventKind::AssistantMessage { .. }))
+    );
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test]
+async fn immediate_step_continuations_yield_before_the_step_limit() {
+    let cancellation = CancellationToken::new();
+    let cancel_from_sibling = cancellation.clone();
+    let entered = Arc::new(Notify::new());
+    let tools = Arc::new(NotifyingReadyTools {
+        calls: AtomicUsize::new(0),
+        entered: Arc::clone(&entered),
+    });
+    let provider = Arc::new(FakeProvider::new(
+        (0..MAX_AGENT_STEPS_PER_TURN)
+            .map(|index| tool_response_with_id(&format!("step-call-{index}")))
+            .collect(),
+    ));
+    let limits = AgentLimits::default()
+        .with_max_steps_per_turn(MAX_AGENT_STEPS_PER_TURN)
+        .unwrap()
+        .with_max_attempts_per_turn(MAX_AGENT_ATTEMPTS_PER_TURN)
+        .unwrap()
+        .with_max_tool_calls_per_turn(MAX_AGENT_TOOL_CALLS_PER_TURN)
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("ready-step-yield"),
+        provider,
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config().with_limits(limits),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        biased;
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("continue fairly")]),
+            cancellation,
+        ),
+        async move {
+            entered.notified().await;
+            cancel_from_sibling.cancel();
+        },
+    };
+    let outcome = outcome.unwrap();
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test]
+async fn immediate_tool_group_yields_before_all_bodies_run() {
+    let cancellation = CancellationToken::new();
+    let cancel_from_sibling = cancellation.clone();
+    let entered = Arc::new(Notify::new());
+    let tools = Arc::new(NotifyingReadyTools {
+        calls: AtomicUsize::new(0),
+        entered: Arc::clone(&entered),
+    });
+    let provider = Arc::new(FakeProvider::new(vec![many_tool_response(
+        MAX_AGENT_TOOL_CALLS_PER_STEP,
+    )]));
+    let limits = AgentLimits::default()
+        .with_max_tool_calls_per_step(MAX_AGENT_TOOL_CALLS_PER_STEP)
+        .unwrap()
+        .with_max_tool_calls_per_turn(MAX_AGENT_TOOL_CALLS_PER_TURN)
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("ready-tools-yield"),
+        provider,
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config().with_limits(limits),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        biased;
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("tools fairly")]),
+            cancellation,
+        ),
+        async move {
+            entered.notified().await;
+            cancel_from_sibling.cancel();
+        },
+    };
+    let outcome = outcome.unwrap();
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    let executed = tools.calls.load(Ordering::SeqCst);
+    assert!((1..=32).contains(&executed), "executed {executed} bodies");
+    assert_eq!(agent.session().state().open_turn(), None);
+    let calls = agent
+        .session()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), EventKind::ToolCall { .. }))
+        .count();
+    let results = agent
+        .session()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), EventKind::ToolResult { .. }))
+        .count();
+    assert_eq!(
+        (calls, results),
+        (MAX_AGENT_TOOL_CALLS_PER_STEP, MAX_AGENT_TOOL_CALLS_PER_STEP)
+    );
 }
 
 #[tokio::test]
@@ -2951,6 +3289,215 @@ async fn partial_stream_that_hits_the_event_floor_still_cancels_and_closes() {
     );
 }
 
+#[tokio::test]
+async fn two_turns_match_the_committed_phase7_acp_oracle() {
+    let oracle: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/cli/upstream_phase7_oracle.json")).unwrap();
+    assert_eq!(oracle["schemaVersion"], 1);
+    assert_eq!(
+        oracle["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+    let expected = &oracle["scenarios"]["acpTwoTurns"];
+    assert!(all_boolean_checks_are_true(&expected["checks"]));
+
+    let attempts = [1_u64, 2]
+        .into_iter()
+        .map(|turn| phase7_chunks_for_turn(expected, turn))
+        .collect::<Vec<_>>();
+    let provider = Arc::new(FakeProvider::new(attempts));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "mock").unwrap())
+        .with_system("You are an AI agent powered by DeepSeek Harness.\n\nPhase 7 oracle.")
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("phase7-two-turns"),
+        provider.clone(),
+        Arc::new(NeverCalledTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    for (index, prompt) in expected["prompts"].as_array().unwrap().iter().enumerate() {
+        let text = prompt["text"].as_str().unwrap();
+        let outcome = agent
+            .run_turn(
+                TurnProposal::Enter(vec![user_with_id(
+                    &format!("phase7-user-{}", index + 1),
+                    text,
+                )]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(turn_reason_kind(outcome.reason()), "completed");
+    }
+
+    assert_eq!(
+        rust_event_types(agent.session()),
+        upstream_phase7_core_event_types(expected),
+        "Phase 7 two-turn durable event order"
+    );
+    assert_eq!(
+        rust_assistant_chunks(agent.session()),
+        upstream_phase7_assistant_chunks(expected),
+        "Phase 7 two-turn raw chunks"
+    );
+    assert_eq!(
+        phase7_turn_ends(agent.session()),
+        expected["durableTurnEnds"],
+        "Phase 7 two-turn reasons"
+    );
+    assert_eq!(
+        phase7_wire_updates(agent.session()),
+        expected["wireUpdates"],
+        "Phase 7 ACP committed assistant updates"
+    );
+
+    let requests = provider.requests();
+    let expected_requests = expected["providerRequestTranscripts"].as_array().unwrap();
+    assert_eq!(requests.len(), expected_requests.len());
+    for (actual, expected) in requests.iter().zip(expected_requests) {
+        assert_eq!(
+            messages_without_ids(actual),
+            expected["messages"],
+            "Phase 7 request history must retain the prior committed turn"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancellation_then_continuation_matches_the_committed_phase7_acp_oracle() {
+    let oracle: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/cli/upstream_phase7_oracle.json")).unwrap();
+    assert_eq!(
+        oracle["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+    let expected = &oracle["scenarios"]["acpCancelThenContinue"];
+    assert!(all_boolean_checks_are_true(&expected["checks"]));
+
+    let first_chunks = expected["cancelledIntervalEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "assistant/chunk")
+        .map(|event| serde_json::from_value(event["data"]["chunk"].clone()).unwrap())
+        .collect::<Vec<_>>();
+    let partial_committed = Arc::new(Notify::new());
+    let provider = Arc::new(Phase7CancelThenContinueProvider::new(
+        first_chunks,
+        partial_committed.clone(),
+    ));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "mock").unwrap())
+        .with_system("You are an AI agent powered by DeepSeek Harness.\n\nPhase 7 oracle.")
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("phase7-cancel-continue"),
+        provider.clone(),
+        Arc::new(NeverCalledTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let cancellation = CancellationToken::new();
+    let first_outcome = {
+        let first_turn = agent.run_turn(
+            TurnProposal::Enter(vec![user_with_id(
+                "phase7-cancel-user-1",
+                expected["firstPrompt"]["text"]
+                    .as_str()
+                    .unwrap_or("start cancellable turn"),
+            )]),
+            cancellation.clone(),
+        );
+        tokio::pin!(first_turn);
+        tokio::select! {
+            biased;
+            result = &mut first_turn => panic!("turn finished before the durable partial barrier: {result:?}"),
+            () = partial_committed.notified() => {
+                cancellation.cancel();
+                (&mut first_turn).await.unwrap()
+            }
+        }
+    };
+    assert!(matches!(
+        first_outcome.reason(),
+        TurnEndReason::Aborted { reason }
+            if matches!(reason, deepseek_harness_cli::session::TurnEndCancelCause::User)
+    ));
+
+    let first_interval_len = agent.session().events().len();
+    assert_eq!(
+        rust_event_types(agent.session()),
+        expected["cancelledIntervalEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .filter(|event_type| *event_type != "agent/inbox/spliced")
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rust_assistant_chunks(agent.session()),
+        expected["cancelledIntervalEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "assistant/chunk")
+            .map(|event| event["data"]["chunk"].clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !agent
+            .session()
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind(), EventKind::AssistantMessage { .. }))
+    );
+    assert!(
+        phase7_wire_updates(agent.session())
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // The fixed upstream generator supplies this prompt, but the current fixture records only
+    // its response. Keep the literal tied to the audited generator until the fixture grows it.
+    let second_outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id(
+                "phase7-cancel-user-2",
+                "continue in same session",
+            )]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(turn_reason_kind(second_outcome.reason()), "completed");
+    assert_eq!(
+        phase7_turn_ends(agent.session()),
+        expected["finalDurableTurnEnds"]
+    );
+    assert_eq!(
+        phase7_wire_updates(agent.session()),
+        expected["finalWireUpdates"]
+    );
+    assert!(
+        agent.session().events()[..first_interval_len]
+            .iter()
+            .all(|event| !matches!(event.kind(), EventKind::AssistantMessage { .. }))
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second_request = messages_without_ids(&requests[1]);
+    let second_request_json = serde_json::to_string(&second_request).unwrap();
+    assert!(second_request_json.contains("continue in same session"));
+    assert!(!second_request_json.contains("partial-before-cancel"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn rust_core_traces_match_the_committed_upstream_phase3_oracle() {
     let oracle: serde_json::Value =
@@ -3331,6 +3878,92 @@ async fn rust_core_traces_match_the_committed_upstream_phase3_oracle() {
             assert_eq!(started.retry(), retry.retry());
         }
     }
+}
+
+fn phase7_chunks_for_turn(scenario: &serde_json::Value, turn: u64) -> Vec<StreamChunk> {
+    scenario["durableEvents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event["type"] == "assistant/chunk" && event["data"]["turn"].as_u64() == Some(turn)
+        })
+        .map(|event| serde_json::from_value(event["data"]["chunk"].clone()).unwrap())
+        .collect()
+}
+
+fn upstream_phase7_core_event_types(scenario: &serde_json::Value) -> Vec<&str> {
+    scenario["durableEvents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|event_type| *event_type != "agent/inbox/spliced")
+        .collect()
+}
+
+fn upstream_phase7_assistant_chunks(scenario: &serde_json::Value) -> Vec<serde_json::Value> {
+    scenario["durableEvents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["type"] == "assistant/chunk")
+        .map(|event| event["data"]["chunk"].clone())
+        .collect()
+}
+
+fn messages_without_ids(messages: &[Message]) -> serde_json::Value {
+    let mut value = serde_json::to_value(messages).unwrap();
+    for message in value.as_array_mut().into_iter().flatten() {
+        message.as_object_mut().unwrap().remove("id");
+    }
+    value
+}
+
+fn phase7_turn_ends(session: &Session) -> serde_json::Value {
+    serde_json::Value::Array(
+        session
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                EventKind::TurnEnd { turn, reason } => Some(json!({
+                    "turn": turn,
+                    "reason": reason,
+                })),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+fn phase7_wire_updates(session: &Session) -> serde_json::Value {
+    serde_json::Value::Array(
+        session
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                EventKind::AssistantMessage { message, .. } => {
+                    let text = message
+                        .content()
+                        .iter()
+                        .filter_map(|block| match block.kind() {
+                            deepseek_harness_cli::model::ContentBlockKind::Text { text } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    (!text.is_empty()).then(|| {
+                        json!({
+                            "content": { "text": text, "type": "text" },
+                            "sessionUpdate": "agent_message_chunk",
+                        })
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn attempts_from_oracle(scenario: &serde_json::Value) -> Vec<Vec<StreamChunk>> {

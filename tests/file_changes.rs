@@ -25,7 +25,7 @@ use deepseek_harness_cli::{
         ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
         RetryBackoff, RetryPolicy,
     },
-    session::{ApprovalOutcome, EventKind, Session, ToolFailure},
+    session::{ApprovalOutcome, EventKind, Session, ToolFailure, TurnEndReason},
     tools::WorkspaceToolRegistry,
 };
 use diffy::{Line, create_patch};
@@ -90,22 +90,35 @@ fn mutation_file_with_size(size: usize) -> Vec<u8> {
 struct ScriptedProvider {
     attempts: Mutex<VecDeque<Vec<StreamChunk>>>,
     dispatches: AtomicU64,
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 impl ScriptedProvider {
     fn new(patch: &str) -> Self {
+        Self::with_response("call-1", patch, "done")
+    }
+
+    fn with_response(call_id: &str, patch: &str, final_text: &str) -> Self {
         Self {
             attempts: Mutex::new(
-                vec![tool_response(patch), text_response()]
-                    .into_iter()
-                    .collect(),
+                vec![
+                    tool_response_with_id(call_id, patch),
+                    text_response_with(final_text),
+                ]
+                .into_iter()
+                .collect(),
             ),
             dispatches: AtomicU64::new(0),
+            requests: Mutex::new(Vec::new()),
         }
     }
 
     fn dispatch_count(&self) -> u64 {
         self.dispatches.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -134,8 +147,12 @@ impl ModelProvider for ScriptedProvider {
         ))
     }
 
-    fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+    fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.messages().to_vec());
         Box::pin(stream::iter(
             self.attempts
                 .lock()
@@ -227,13 +244,13 @@ impl ApprovalProvider for FixedApproval {
     }
 }
 
-fn tool_response(patch: &str) -> Vec<StreamChunk> {
+fn tool_response_with_id(call_id: &str, patch: &str) -> Vec<StreamChunk> {
     vec![
         StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
         StreamChunk::block_end(
             0,
             ContentBlock::tool_call(
-                "call-1",
+                call_id,
                 "apply_patch",
                 json!({ "patch": patch }).to_string(),
             )
@@ -244,10 +261,10 @@ fn tool_response(patch: &str) -> Vec<StreamChunk> {
     ]
 }
 
-fn text_response() -> Vec<StreamChunk> {
+fn text_response_with(text: &str) -> Vec<StreamChunk> {
     vec![
         StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
-        StreamChunk::block_end(0, ContentBlock::text("done").unwrap()).unwrap(),
+        StreamChunk::block_end(0, ContentBlock::text(text).unwrap()).unwrap(),
         StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
     ]
 }
@@ -697,6 +714,288 @@ async fn approval_order_and_side_effects_match_the_committed_phase5_oracle_scope
             assert!(asked.is_none());
             assert!(decided.is_none());
         }
+    }
+}
+
+#[tokio::test]
+async fn approval_outcomes_match_the_committed_phase7_oracle_scope() {
+    let oracle: Value =
+        serde_json::from_str(include_str!("fixtures/cli/upstream_phase7_oracle.json")).unwrap();
+    assert_eq!(oracle["schemaVersion"], 1);
+    assert_eq!(
+        oracle["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+
+    for name in ["allow", "reject", "cancel"] {
+        let scenario = &oracle["scenarios"]["approval"][name];
+        assert!(
+            scenario["checks"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|check| check.as_bool() == Some(true))
+        );
+        let expected_events = scenario["relevantDurableEvents"].as_array().unwrap();
+        let call_id = expected_events[0]["data"]["callId"].as_str().unwrap();
+        assert_eq!(call_id, format!("call-{name}"));
+        assert_eq!(expected_events[0]["data"]["name"], "sentinel");
+        assert_eq!(expected_events[0]["data"]["arguments"], "{}");
+        assert_eq!(
+            expected_events[1]["data"]["reason"],
+            format!("Phase 7 {name} oracle")
+        );
+        assert_eq!(expected_events[1]["data"]["toolName"], "sentinel");
+        assert_eq!(expected_events[1]["data"]["callId"], call_id);
+        assert_eq!(
+            expected_events[3]["sourceEventSeqs"],
+            json!([expected_events[0]["seq"].as_u64().unwrap()])
+        );
+        assert_eq!(expected_events[3]["surfaceOp"], "append");
+        let final_text = scenario["wireUpdates"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        let relative_path = scenario["sideEffect"]["path"]
+            .as_str()
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap();
+        assert_eq!(
+            scenario["sideEffect"]["path"],
+            format!("<workspace>/approval-{name}.txt")
+        );
+        let requested = format!("{name}\n");
+        let patch = patch_from_before_after(relative_path, "", &requested, true);
+        let expected_outcome = match expected_events[2]["data"]["outcome"].as_str().unwrap() {
+            "allowed-once" => ApprovalOutcome::AllowedOnce,
+            "rejected" => ApprovalOutcome::Rejected,
+            "cancelled" => ApprovalOutcome::Cancelled,
+            other => panic!("unexpected Phase 7 approval outcome {other}"),
+        };
+        let expected_is_error = expected_events[3]["data"]["message"]["content"][0]["isError"]
+            .as_bool()
+            .unwrap();
+
+        let workspace = TempWorkspace::new(&format!("phase7-{name}"));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let approval = Arc::new(RecordingApproval {
+            outcome: expected_outcome,
+            requests: requests.clone(),
+        });
+        let provider = Arc::new(ScriptedProvider::with_response(call_id, &patch, final_text));
+        let session = run_patch_with_provider(
+            workspace.path(),
+            FileChangePolicy::Ask,
+            approval,
+            provider.clone(),
+        )
+        .await;
+
+        let relevant = session
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    EventKind::ToolCall { .. }
+                        | EventKind::ApprovalAsked { .. }
+                        | EventKind::ApprovalDecided { .. }
+                        | EventKind::ToolResult { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relevant
+                .iter()
+                .map(|event| event.kind().event_type())
+                .collect::<Vec<_>>(),
+            expected_events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            "scenario={name}: approval audit order"
+        );
+
+        let EventKind::ToolCall {
+            turn,
+            step,
+            call_id: actual_call_id,
+            name: actual_tool_name,
+            arguments,
+        } = relevant[0].kind()
+        else {
+            unreachable!()
+        };
+        assert_eq!(actual_call_id.as_str(), call_id, "scenario={name}");
+        assert_eq!(actual_tool_name, "apply_patch", "scenario={name}");
+        assert_eq!(
+            turn.get(),
+            expected_events[0]["data"]["turn"].as_u64().unwrap()
+        );
+        assert_eq!(
+            step.get(),
+            expected_events[0]["data"]["step"].as_u64().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap(),
+            json!({ "patch": patch }),
+            "scenario={name}"
+        );
+
+        let EventKind::ApprovalAsked { asked } = relevant[1].kind() else {
+            unreachable!()
+        };
+        let EventKind::ApprovalDecided { decided } = relevant[2].kind() else {
+            unreachable!()
+        };
+        assert_eq!(asked.id(), decided.id(), "scenario={name}");
+        assert_eq!(asked.call_id(), Some(actual_call_id), "scenario={name}");
+        assert_eq!(asked.tool_name(), actual_tool_name, "scenario={name}");
+        assert_eq!(
+            asked.reason(),
+            Some(format!("Create workspace file `{relative_path}`").as_str()),
+            "scenario={name}"
+        );
+        assert_eq!(decided.outcome(), expected_outcome, "scenario={name}");
+
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "scenario={name}");
+        assert_eq!(recorded[0].id(), asked.id(), "scenario={name}");
+        assert_eq!(recorded[0].call_id(), actual_call_id, "scenario={name}");
+        assert_eq!(recorded[0].tool_name(), actual_tool_name, "scenario={name}");
+        assert_eq!(recorded[0].reason(), asked.reason(), "scenario={name}");
+
+        let result = relevant[3];
+        assert_eq!(
+            result.source_event_seqs(),
+            Some([relevant[0].seq()].as_slice()),
+            "scenario={name}: result must cite its durable call"
+        );
+        let EventKind::ToolResult { message, error, .. } = result.kind() else {
+            unreachable!()
+        };
+        assert_eq!(error.is_some(), expected_is_error, "scenario={name}");
+        assert!(matches!(
+            message.source().kind(),
+            deepseek_harness_cli::model::MessageSourceKind::Tool { call_id: result_call }
+                if result_call == actual_call_id
+        ));
+
+        let (failure, meta, result_text) = result_facts(&session);
+        let expected_rust_text = match name {
+            "allow" => format!("Created workspace file `{relative_path}`."),
+            "reject" => "Error: the file change was rejected".to_owned(),
+            "cancel" => "Error: the approval request was cancelled".to_owned(),
+            _ => unreachable!(),
+        };
+        assert_eq!(result_text, expected_rust_text, "scenario={name}");
+        let expected_upstream_text = match name {
+            "allow" => "sentinel allow".to_owned(),
+            "reject" => "Error: the user rejected tool \"sentinel\"".to_owned(),
+            "cancel" => "Error: approval for tool \"sentinel\" was cancelled".to_owned(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            expected_events[3]["data"]["message"]["content"][0]["content"][0]["text"],
+            expected_upstream_text,
+            "scenario={name}: pinned upstream sentinel result"
+        );
+        assert_eq!(
+            failure.as_ref().map(|failure| failure.code.as_str()),
+            match name {
+                "allow" => None,
+                "reject" => Some("APPROVAL_REJECTED"),
+                "cancel" => Some("APPROVAL_CANCELLED"),
+                _ => unreachable!(),
+            },
+            "scenario={name}"
+        );
+        let meta = meta.unwrap().as_value();
+        assert_eq!(meta["path"], relative_path, "scenario={name}");
+        assert_eq!(meta["operation"], "create", "scenario={name}");
+        assert_eq!(meta["committed"], name == "allow", "scenario={name}");
+        assert_eq!(recorded[0].preview(), meta["diff"].as_str().unwrap());
+        drop(recorded);
+        let [result_block] = message.content() else {
+            panic!("scenario={name}: tool result must contain one block")
+        };
+        assert!(matches!(
+            result_block.kind(),
+            ContentBlockKind::ToolResult { tool_call_id, is_error }
+                if tool_call_id == actual_call_id
+                    && is_error.unwrap_or(false) == expected_is_error
+        ));
+
+        match scenario["sideEffect"]["diskAfter"].as_str() {
+            Some(expected) => assert_eq!(
+                fs::read_to_string(workspace.path().join(relative_path)).unwrap(),
+                expected,
+                "scenario={name}"
+            ),
+            None => assert!(
+                !workspace.path().join(relative_path).exists(),
+                "scenario={name}: denied approval must not create the file"
+            ),
+        }
+        assert_eq!(provider.dispatch_count(), 2, "scenario={name}");
+        let provider_requests = provider.requests();
+        assert_eq!(provider_requests.len(), 2, "scenario={name}");
+        let tool_results_per_request = provider_requests
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .flat_map(Message::content)
+                    .filter(|block| matches!(block.kind(), ContentBlockKind::ToolResult { .. }))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results_per_request, [0, 1], "scenario={name}");
+        assert!(provider_requests[1].iter().any(|message| {
+            matches!(
+                message.source().kind(),
+                deepseek_harness_cli::model::MessageSourceKind::Tool { call_id: result_call }
+                    if result_call.as_str() == call_id
+            ) && message.content().iter().any(|block| {
+                matches!(
+                    block.kind(),
+                    ContentBlockKind::ToolResult { tool_call_id, is_error }
+                        if tool_call_id.as_str() == call_id
+                            && is_error.unwrap_or(false) == expected_is_error
+                )
+            })
+        }));
+        let assistant_texts = session
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                EventKind::AssistantMessage { message, .. } => {
+                    let text = message
+                        .content()
+                        .iter()
+                        .filter_map(|block| match block.kind() {
+                            ContentBlockKind::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    (!text.is_empty()).then_some(text)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_texts, [final_text.to_owned()]);
+        assert!(matches!(
+            session
+                .events()
+                .iter()
+                .find_map(|event| match event.kind() {
+                    EventKind::TurnEnd { reason, .. } => Some(reason),
+                    _ => None,
+                }),
+            Some(TurnEndReason::Completed)
+        ));
+        assert_eq!(scenario["promptResponse"]["stopReason"], "end_turn");
     }
 }
 

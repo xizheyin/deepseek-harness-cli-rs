@@ -7,7 +7,7 @@ DeepSeek Harness is the semantic reference for this project's agent core. The Ru
 - Repository: <https://github.com/deepseek-ai/deepseek-harness>
 - Commit: [`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a)
 - Commit date: 2026-08-13
-- Baseline checked: 2026-08-14
+- Baseline checked: 2026-08-13
 - Upstream license at this revision: MIT
 
 The baseline must not move as part of ordinary feature work. Updating it requires a dedicated compatibility review and regenerated behavioral fixtures.
@@ -627,7 +627,7 @@ are explicitly outside this project's v0.1 scope. Rust Phase 6 must therefore
 omit that field, reject injected attempts, and record the smaller foreground-only
 surface as an intentional difference. Official ordinary shell calls also do not
 ask merely because an approval service exists; approval appears for a policy or
-sandbox escalation. Rust's planned ask-by-default unsandboxed shell policy is a
+sandbox escalation. Rust's ask-by-default unsandboxed shell policy is a
 separate safety difference, not a claim of byte-identical policy behavior.
 
 The directly relevant deterministic tests are:
@@ -757,6 +757,142 @@ cmp -s /tmp/upstream-phase6-a.json \
 
 The type check and both comparisons passed. Normal Rust tests consume the
 committed fixture and do not need Node or the upstream checkout.
+
+## Phase 7: interactive and script drivers
+
+The fixed upstream repository does not contain a built-in human terminal UI.
+The inspected launcher paths are:
+
+- `apps/cli/src/{args,bin,profile-boot,process-shutdown}.ts` and their tests:
+  the published `dsh` is a profile launcher, first SIGINT starts whole-process
+  cleanup, and the help surface deliberately omits/rejects the old `tui` name;
+- `apps/cli/README.md` and `apps/cli/reference/README.md`: the built-in product
+  surfaces are Web and one-shot headless, while a TUI requires the external
+  `deepseek-harness/turtle-ui` repository;
+- `packages/terminal/**`: a PTY capability used by the model, not the human
+  conversation input UI.
+
+The external TUI is not part of commit
+`47f943859bef60e4160492346772ded9b24f765a`, so this repository does not claim
+terminal visual or key-binding compatibility. Phase 7 instead uses these
+committed upstream seams as its semantic baseline:
+
+- `packages/bundle/headless/src/{startup,index}.ts`: one nonblank task, one new
+  Session, wait-until-idle and flush-before-output, final committed nonempty
+  assistant text on stdout, completed exit 0 and other durable outcomes exit 1;
+- `packages/acp/acp/src/{index,codec}.ts`: multiple sequential prompts in one
+  Session, user cancellation of one active Session, fail-closed one-shot
+  approval, and owner cleanup on stdio EOF/disconnect;
+- `packages/core/agent-loop/src/{agent,tool-calls}.ts`: partial chunk, tool, and
+  cancellation event ownership;
+- `packages/interaction/user-approval/src/index.ts`: paired asked/decided audit,
+  cancellation-first outcomes, and no side effect before allowed-once;
+- `packages/client/ui-conversation/src/client/conversation-nodes/{assistant,chat-snapshot-builder,turn-tail}.ts`,
+  `packages/client/ui-conversation/src/client/input/{submission-policy,hub}.ts`,
+  and `packages/client/ui-conversation/src/client/skeleton/ApprovalPanel.tsx`,
+  together with
+  `packages/client/ui-conversation/tests/{coverage-tails,submission-policy,input-scenarios,chat-view}.client.spec.*`:
+  committed chunks form partial display state, the final assistant message is
+  authoritative, cancellation retains partial output with stopped state,
+  approval takes over the composer, and running input can queue or steer;
+- `packages/interaction/commands/**`: Web-composition commands such as goal,
+  compact, plan, permission, and feedback create command audit events rather
+  than model turns; the fixed tree has no built-in terminal `/help` or `/exit`;
+- `packages/fs/tool-fs/src/diff.ts`,
+  `packages/client/ui-primitives/src/DiffBlock.tsx`, and
+  `packages/client/ui-tool/src/client/tool/models/diff-card-model.ts`: newline,
+  hunk, intended-versus-settled, and Web-card display facts.
+
+Read-only research also inspected Web input submission policy, approval composer
+takeover, and diff cards. Web supports Queue/Steer while running and displays
+approval and intended diff in separate UI regions. Rust Phase 7 deliberately
+uses one prompt at a time and places the complete Phase 5 canonical diff directly
+inside the terminal approval question. Interactive Ctrl+C follows Web Stop's
+turn-level user cancellation, not the launcher's process-level SIGINT contract.
+
+The focused upstream test command was:
+
+```console
+pnpm exec vitest run --configLoader runner --config vitest.config.ts \
+  packages/acp/acp/tests/bridge.spec.ts \
+  packages/acp/acp/tests/turns.spec.ts \
+  packages/acp/acp/tests/approval.spec.ts \
+  packages/acp/acp/tests/edges.spec.ts \
+  packages/interaction/user-approval/tests/approval.spec.ts \
+  packages/bundle/headless/tests/headless.spec.ts \
+  packages/bundle/headless/tests/startup.spec.ts \
+  packages/fs/tool-fs/tests/diff.spec.ts \
+  packages/client/ui-primitives/tests/diff-block.client.spec.tsx \
+  packages/client/ui-tool/tests/diff-card.client.spec.tsx
+```
+
+Vitest reported 10 files and 134/134 passing tests: ACP 39, approval 32,
+headless 14, filesystem diff 12, and client diff projections 37. There were no
+skipped, pending, or todo tests. A broader read-only research run also covered
+launcher shutdown, Agent cancellation, Web input orchestration, and approval
+composer behavior; those counts are research notes, while the reproducible
+134-test command above is the fixture's exact focused provenance.
+
+`--configLoader runner` keeps Vite's transient config loading inside the
+process, so the read-only pinned checkout does not need a writable
+`node_modules/.vite-temp`; it does not change the selected config or tests.
+
+The committed Phase 7 oracle runs real upstream public/test compositions. It
+records:
+
+- two ACP turns in one Session, including the second request's prior context;
+- a committed partial text chunk followed by user cancellation, balanced
+  step/turn closure, and a later successful prompt in the same Session;
+- allow-once, reject, and cancel approval flows through the real
+  `ApprovalService` and tool pipeline, with a temporary sentinel changed only by
+  allow-once;
+- headless final-assistant-only stdout, flush-before-output, completed/other exit
+  classification, and provider-error rendering;
+- real `computeHunkDiffs` output plus source/test-derived Web rendering facts.
+
+The standalone generator does not pretend to render the React/CSS/jsdom diff UI.
+It instead locks the pinned source assertions and the two real official UI test
+files, which passed 37/37 in the command above. It similarly uses the exported
+headless runner with the official test-style Agent/Session factory rather than a
+credentialed full model process.
+
+The generator and checker are:
+
+- `scripts/generate-upstream-interactive-fixtures.ts`;
+- `scripts/typecheck-upstream-interactive-fixtures.mjs`;
+- `tests/fixtures/cli/upstream_phase7_oracle.json`.
+
+The exact offline provenance commands, run against the clean pinned checkout,
+were:
+
+```console
+node /Users/xizheyin/workspace/ds-harness-rs/scripts/typecheck-upstream-interactive-fixtures.mjs \
+  /Users/xizheyin/workspace/deepseek-harness-upstream
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-interactive-fixtures.ts \
+  /tmp/upstream-phase7-a.json
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-interactive-fixtures.ts \
+  /tmp/upstream-phase7-b.json
+
+cmp -s /tmp/upstream-phase7-a.json /tmp/upstream-phase7-b.json
+cmp -s /tmp/upstream-phase7-a.json \
+  /Users/xizheyin/workspace/ds-harness-rs/tests/fixtures/cli/upstream_phase7_oracle.json
+```
+
+The type check and both comparisons passed. SHA-256:
+
+- checker: `e22d39db1f9b9b1a363c552636aa381463339cc2a95bd97efb77aab275579eee`;
+- generator: `f99046dfbf0a04ff95affb23a9ef56efcb4ed2e87ab9c803317bac3c607cc794`;
+- fixture: `bc293b7e6868cf54acb03edf2534891e8bb0bf0360c49f6a6b2c693a4f464b2f`.
+
+The run used macOS 27.0 arm64, Node 26.0.0, pnpm 11.19.0,
+TypeScript 6.0.3, tsx 4.22.4, Vitest 4.1.8, and Oxlint 1.76.0. The
+upstream tree was clean before and after. It made no network or real model call,
+read no credentials, and wrote only the requested output files and a fresh
+platform temporary directory.
 
 ## Local research copy
 

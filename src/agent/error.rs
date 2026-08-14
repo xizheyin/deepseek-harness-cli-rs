@@ -32,6 +32,8 @@ pub enum AgentBuildError {
 /// A deterministic ID/jitter source violated its small public contract.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AgentRuntimeError {
+    #[error("agent runtime entropy is unavailable")]
+    EntropyUnavailable,
     #[error("agent runtime returned an empty {kind} id")]
     EmptyId { kind: &'static str },
     #[error("agent runtime jitter sample must be finite and between zero and one")]

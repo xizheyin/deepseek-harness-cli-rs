@@ -1,0 +1,1347 @@
+#![cfg(any(target_os = "macos", target_os = "linux"))]
+
+mod support;
+
+use std::{
+    io::Write,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
+
+use rustix::process::Signal;
+
+use support::{
+    fake_deepseek::{
+        BacklogThenStalledSseServer, CancelThenSseServer, GatedFirstSseServer, SequenceSseServer,
+        SplitSseServer, StalledSseServer,
+    },
+    process_state,
+    pty::{DisabledTerminalMode, JobControlHarness, PtyHarness},
+};
+
+static WORKSPACE_NUMBER: AtomicUsize = AtomicUsize::new(0);
+
+struct TestWorkspace(std::path::PathBuf);
+
+impl TestWorkspace {
+    fn new() -> Self {
+        let number = WORKSPACE_NUMBER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("dsh-phase7-pty-{}-{number}", std::process::id()));
+        std::fs::create_dir(&path).expect("test workspace should be created");
+        Self(path)
+    }
+}
+
+fn text_sse(text: &str) -> String {
+    let text = serde_json::to_string(text).expect("test text should encode");
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{text}}}}}]}}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+         data: [DONE]\n\n"
+    )
+}
+
+fn repeated_text_sse(delta_count: usize) -> String {
+    repeated_text_sse_with_width(delta_count, 1)
+}
+
+fn repeated_text_sse_with_width(delta_count: usize, text_bytes: usize) -> String {
+    let text = "x".repeat(text_bytes);
+    let delta = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+        serde_json::to_string(&text).expect("bounded test text should encode")
+    );
+    let ending = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let mut body = String::new();
+    body.try_reserve(delta.len() * delta_count + ending.len())
+        .expect("bounded test response should allocate");
+    for _ in 0..delta_count {
+        body.push_str(&delta);
+    }
+    body.push_str(ending);
+    body
+}
+
+fn text_backlog_then_read_tool_sse(delta_count: usize, text_bytes: usize) -> String {
+    let text = "x".repeat(text_bytes);
+    let text_delta = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+        serde_json::to_string(&text).expect("bounded test text should encode")
+    );
+    let tool_delta = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-backlog-read",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"file_path\":\"note.txt\"}"
+                    }
+                }]
+            }
+        }]
+    });
+    let mut body = String::new();
+    body.try_reserve(
+        text_delta
+            .len()
+            .saturating_mul(delta_count)
+            .saturating_add(512),
+    )
+    .expect("bounded backlog response should allocate");
+    for _ in 0..delta_count {
+        body.push_str(&text_delta);
+    }
+    body.push_str("data: ");
+    body.push_str(&tool_delta.to_string());
+    body.push_str(concat!(
+        "\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ));
+    body
+}
+
+fn many_invalid_read_calls_sse(prefix: &str, count: usize, padding_bytes: usize) -> String {
+    let mut body = String::new();
+    body.try_reserve(count.saturating_mul(padding_bytes.saturating_add(256)))
+        .expect("bounded tool-call response should allocate");
+    let arguments = serde_json::json!({
+        "file_path": "missing.txt",
+        "padding": "x".repeat(padding_bytes),
+    })
+    .to_string();
+    assert!(arguments.len() < 256 * 1_024);
+    for index in 0..count {
+        let delta = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": format!("{prefix}-{index}"),
+                        "type": "function",
+                        "function": { "name": "read", "arguments": arguments }
+                    }]
+                }
+            }]
+        });
+        body.push_str("data: ");
+        body.push_str(&delta.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str(concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ));
+    body
+}
+
+fn tool_sse(call_id: &str, name: &str, arguments: serde_json::Value) -> String {
+    let arguments = serde_json::to_string(&arguments).expect("tool arguments should encode");
+    let delta = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments }
+                }]
+            }
+        }]
+    });
+    format!(
+        "data: {delta}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+         data: [DONE]\n\n"
+    )
+}
+
+fn wait_for_file(path: &std::path::Path, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for test marker {path:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn job_control_shell_command() -> &'static str {
+    r#"owner=$$;
+(
+  trap '' HUP INT QUIT TERM
+  /bin/sleep 8 & timer=$!
+  printf '%s\n' "$timer" > guard.timer
+  wait "$timer"
+  [ -e guard.cancel ] || kill -KILL -- "-$owner"
+) & guard=$!
+printf '%s\n' "$guard" > approved.guard.pid
+while [ ! -s guard.timer ]; do /bin/sleep 0.01; done
+read -r timer < guard.timer
+trap ': > cleanup-entered; while [ ! -e cleanup-release ]; do /bin/sleep 0.01; done; : > guard.cancel; kill -KILL "$guard" "$timer" 2>/dev/null; wait "$guard" 2>/dev/null; exit 0' TERM
+printf '%s\n' "$owner" > approved.pid
+: > shell-started
+while :; do /bin/sleep 1; done"#
+}
+
+impl Drop for TestWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn interactive_dsh_streams_before_completion_and_exits_cleanly() {
+    let first = concat!("data: {\"choices\":[{\"delta\":{\"content\":\"first-marker \"}}]}\n\n",);
+    let second = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"second-marker\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let mut server = SplitSseServer::start(first, second);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"stream this\r");
+    dsh.expect(b"assistant | first-marker ");
+    assert!(
+        !dsh.snapshot()
+            .windows(b"second-marker".len())
+            .any(|window| window == b"second-marker")
+    );
+
+    server.release();
+    dsh.expect(b"second-marker");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+    let request = server.finish();
+
+    assert!(status.success());
+    assert!(request.contains("\"content\":\"stream this\""));
+    assert!(!transcript.contains(&0x1b));
+}
+
+#[test]
+fn interactive_help_quit_and_idle_ctrl_d_are_real_terminal_commands() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut quit = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    quit.expect(b"[dsh interactive; session is in memory]");
+    quit.expect(b"dsh > ");
+    quit.write(b"/help\r");
+    quit.expect(b"[commands]");
+    quit.expect(b"/exit  exit dsh");
+    quit.expect_occurrences(b"dsh > ", 2);
+    quit.write(b"/quit\r");
+    let (status, _) = quit.wait_for_exit(Duration::from_secs(5));
+    assert!(status.success());
+    assert!(server.finish().is_empty());
+
+    let server = SequenceSseServer::start(Vec::new());
+    let mut eof = PtyHarness::spawn(&server.base_url, &workspace.0);
+    eof.expect(b"dsh > ");
+    eof.write(&[0x04]);
+    let (status, _) = eof.wait_for_exit(Duration::from_secs(5));
+    assert!(status.success());
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn unsafe_echo_and_output_terminal_modes_are_rejected_before_the_first_prompt() {
+    for mode in [
+        DisabledTerminalMode::EchoControls,
+        DisabledTerminalMode::OutputPostprocess,
+        DisabledTerminalMode::OutputNewlineMapping,
+    ] {
+        let server = SequenceSseServer::start(Vec::new());
+        let workspace = TestWorkspace::new();
+        let dsh =
+            PtyHarness::spawn_with_disabled_terminal_mode(&server.base_url, &workspace.0, mode);
+        let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+
+        assert_eq!(status.code(), Some(1));
+        assert!(
+            transcript
+                .windows(b"CLI_TERMINAL_UNSUPPORTED".len())
+                .any(|window| window == b"CLI_TERMINAL_UNSUPPORTED")
+        );
+        assert!(!transcript.windows(6).any(|window| window == b"dsh > "));
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn real_canonical_terminal_bounds_records_recovers_huge_paste_and_submits_non_lf_veof() {
+    let server = SequenceSseServer::start(vec![
+        text_sse("exact canonical input accepted"),
+        text_sse("veof input accepted"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    let exact = "x".repeat(1_000);
+    dsh.write(format!("{exact}\r").as_bytes());
+    dsh.expect(b"assistant | exact canonical input accepted");
+    dsh.expect_occurrences(b"dsh > ", 2);
+
+    dsh.write(format!("{}\r", "y".repeat(1_001)).as_bytes());
+    dsh.expect(b"[input exceeds 1000 bytes]");
+    dsh.expect_occurrences(b"dsh > ", 3);
+
+    dsh.write("z".repeat(8 * 1_024).as_bytes());
+    // macOS deliberately stops accepting a canonical record when the kernel
+    // queue fills, before dsh can observe it. The application must not submit
+    // that truncated paste, and the standard Ctrl+C recovery must flush it.
+    dsh.expect(&vec![b'z'; 1_023]);
+    assert_eq!(
+        dsh.snapshot()
+            .windows(b"[working; press Ctrl+C to stop]".len())
+            .filter(|window| *window == b"[working; press Ctrl+C to stop]")
+            .count(),
+        1
+    );
+    dsh.write(&[0x03]);
+    dsh.expect_occurrences(b"dsh > ", 4);
+
+    dsh.write(b"veof prompt without newline");
+    dsh.write(&[0x04]);
+    dsh.expect(b"assistant | veof input accepted");
+    dsh.expect_occurrences(b"dsh > ", 5);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains(&format!("\"content\":\"{exact}\"")));
+    assert!(requests[1].contains("\"content\":\"veof prompt without newline\""));
+}
+
+#[test]
+fn idle_hup_quit_and_term_use_stable_exit_codes() {
+    let workspace = TestWorkspace::new();
+    for (signal, expected) in [(Signal::HUP, 129), (Signal::QUIT, 131), (Signal::TERM, 143)] {
+        let server = SequenceSseServer::start(Vec::new());
+        let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+        dsh.expect(b"dsh > ");
+        dsh.signal(signal);
+        let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+
+        assert_eq!(status.code(), Some(expected));
+        assert!(!transcript.windows(5).any(|bytes| bytes == b"CLI_"));
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn active_eof_cancels_the_stalled_turn_and_exits_zero_after_cleanup() {
+    let partial =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial-before-eof\"}}]}\n\n".to_owned();
+    let server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"stall until eof\r");
+    dsh.expect(b"assistant | partial-before-eof");
+    dsh.write(&[0x04]);
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let (request, closed) = server.finish();
+
+    assert!(status.success());
+    assert!(closed);
+    assert!(request.contains("\"content\":\"stall until eof\""));
+}
+
+#[test]
+fn active_hup_quit_and_term_cancel_before_their_stable_exit() {
+    let workspace = TestWorkspace::new();
+    for (signal, expected, marker) in [
+        (Signal::HUP, 129, "partial-before-hup"),
+        (Signal::QUIT, 131, "partial-before-quit"),
+        (Signal::TERM, 143, "partial-before-term"),
+    ] {
+        let partial = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(marker).unwrap()
+        );
+        let server = StalledSseServer::start(partial);
+        let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+        dsh.expect(b"dsh > ");
+        dsh.write(b"stall for signal\r");
+        dsh.expect(format!("assistant | {marker}").as_bytes());
+        dsh.signal(signal);
+        let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+        let (request, closed) = server.finish();
+
+        assert_eq!(status.code(), Some(expected));
+        assert!(closed);
+        assert!(request.contains("\"content\":\"stall for signal\""));
+        assert!(!transcript.windows(5).any(|bytes| bytes == b"CLI_"));
+    }
+}
+
+#[test]
+fn a_non_reading_terminal_hits_one_output_deadline_and_exits_without_recursive_diagnostics() {
+    let large_delta = "x".repeat(128 * 1_024);
+    let partial =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{large_delta}\"}}}}]}}\n\n");
+    let server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.pause_reading();
+    let started = std::time::Instant::now();
+    dsh.write(b"fill the terminal output queue\r");
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(7));
+    let elapsed = started.elapsed();
+    let (request, closed) = server.finish();
+
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        closed,
+        "output failure must cancel and close the provider stream"
+    );
+    assert!(request.contains("fill the terminal output queue"));
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "elapsed={elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(7), "elapsed={elapsed:?}");
+    assert!(
+        !transcript.windows(5).any(|bytes| bytes == b"CLI_"),
+        "the final error must not write recursively to the blocked terminal"
+    );
+}
+
+#[test]
+fn trickle_progress_cannot_restart_the_final_backlog_deadline() {
+    let server = SequenceSseServer::start(vec![repeated_text_sse_with_width(3_900, 256)]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_rolling(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.pause_reading();
+    let mut trickle = dsh.duplicate_observed_reader();
+    let started = Instant::now();
+    dsh.write(b"build a maximum bounded final-drain backlog\r");
+    let progress = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(4));
+        let mut scratch = [0_u8; 512];
+        trickle
+            .read_with_timeout(&mut scratch, Duration::from_secs(1))
+            .expect("trickle PTY read should make bounded progress")
+    });
+
+    let progressed = progress.join().expect("trickle reader should join");
+    let overall_deadline = started + Duration::from_secs(9);
+    let (status, transcript) =
+        dsh.wait_for_exit(overall_deadline.saturating_duration_since(Instant::now()));
+    let elapsed = started.elapsed();
+    let requests = server.finish();
+
+    assert_eq!(status.code(), Some(1));
+    assert!(progressed > 0, "the PTY must make observable late progress");
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "the test must reach its deliberately late progress window: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "final drain must use one total deadline instead of restarting per frame: {elapsed:?}"
+    );
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !transcript
+            .windows(b"CLI_OUTPUT_FAILED".len())
+            .any(|window| window == b"CLI_OUTPUT_FAILED"),
+        "a broken terminal must not trigger a second blocking diagnostic"
+    );
+}
+
+#[test]
+fn maximum_backlog_signals_discard_without_per_event_output_deadlines() {
+    for signal in [Signal::INT, Signal::TSTP, Signal::TERM] {
+        let server =
+            BacklogThenStalledSseServer::start(text_backlog_then_read_tool_sse(3_800, 256));
+        let workspace = TestWorkspace::new();
+        std::fs::write(workspace.0.join("note.txt"), "backlog tool input\n")
+            .expect("read fixture should be created");
+        let mut dsh = PtyHarness::spawn_rolling(&server.base_url, &workspace.0);
+
+        dsh.expect(b"dsh > ");
+        dsh.pause_reading();
+        dsh.write(b"build a bounded backlog before the signal\r");
+        server.wait_until_second_request();
+        let signalled = Instant::now();
+        dsh.signal(signal);
+        dsh.resume_reading();
+
+        match signal {
+            Signal::INT => {
+                dsh.expect(b"stopped; skipped");
+                dsh.expect_occurrences(b"dsh > ", 2);
+                assert!(signalled.elapsed() < Duration::from_secs(3));
+                let transcript = dsh.snapshot();
+                let transcript_text = String::from_utf8_lossy(&transcript);
+                let skipped_start = transcript_text
+                    .rfind("stopped; skipped ")
+                    .expect("stopped summary should include the skipped count")
+                    + "stopped; skipped ".len();
+                let skipped_end = transcript_text[skipped_start..]
+                    .find(" updates")
+                    .map(|offset| skipped_start + offset)
+                    .expect("stopped summary should close the skipped count");
+                let skipped = transcript_text[skipped_start..skipped_end]
+                    .parse::<usize>()
+                    .expect("stopped summary count should be numeric");
+                assert!(
+                    skipped >= 3_000,
+                    "the test must exercise a maximum-scale committed backlog, got {skipped}"
+                );
+                assert_eq!(
+                    transcript
+                        .windows(b"stopped; skipped".len())
+                        .filter(|window| *window == b"stopped; skipped")
+                        .count(),
+                    1
+                );
+                let (status, _) = dsh.exit_cleanly();
+                assert!(status.success());
+                let (requests, second_closed) = server.finish();
+                assert_eq!(requests.len(), 2);
+                assert!(second_closed);
+            }
+            Signal::TSTP => {
+                dsh.wait_until_stopped();
+                assert!(signalled.elapsed() < Duration::from_secs(3));
+                assert!(
+                    !dsh.snapshot()
+                        .windows(b"stopped; skipped".len())
+                        .any(|window| window == b"stopped; skipped")
+                );
+                dsh.signal(Signal::CONT);
+                dsh.expect_occurrences(b"dsh > ", 2);
+                let (status, _) = dsh.exit_cleanly();
+                assert!(status.success());
+                let (requests, second_closed) = server.finish();
+                assert_eq!(requests.len(), 2);
+                assert!(second_closed);
+            }
+            Signal::TERM => {
+                let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(3));
+                assert_eq!(status.code(), Some(143));
+                assert!(signalled.elapsed() < Duration::from_secs(3));
+                assert!(
+                    !transcript
+                        .windows(b"stopped; skipped".len())
+                        .any(|window| window == b"stopped; skipped")
+                );
+                let (requests, second_closed) = server.finish();
+                assert_eq!(requests.len(), 2);
+                assert!(second_closed);
+            }
+            _ => unreachable!("the table contains only the three tested signals"),
+        }
+    }
+}
+
+#[test]
+fn interactive_dsh_keeps_committed_history_across_two_turns() {
+    let server = SequenceSseServer::start(vec![
+        text_sse("first committed answer"),
+        text_sse("second committed answer"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"first prompt\r");
+    dsh.expect(b"assistant | first committed answer");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    dsh.write(b"second prompt\r");
+    dsh.expect(b"assistant | second committed answer");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("\"content\":\"first prompt\""));
+    assert!(requests[1].contains("\"content\":\"first prompt\""));
+    assert!(requests[1].contains("\"content\":\"first committed answer\""));
+    assert!(requests[1].contains("\"content\":\"second prompt\""));
+}
+
+#[test]
+fn real_event_ceiling_renders_the_terminal_failure_once_and_does_not_offer_a_dead_prompt() {
+    // The first ordinary turn leaves only a small amount of Session capacity.
+    // The second stream then reaches the real 4,096-event ceiling while the
+    // Agent still retains enough reserved room to close step/turn honestly.
+    let server = SequenceSseServer::start(vec![repeated_text_sse(3_975), repeated_text_sse(120)]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"nearly fill the session event log\r");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+
+    dsh.write(b"reach the remaining event ceiling\r");
+    dsh.expect(b"[turn error]");
+    dsh.expect(b"AGENT_EVENT_BUDGET");
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(10));
+    let requests = server.finish();
+
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        transcript
+            .windows(b"AGENT_EVENT_BUDGET".len())
+            .filter(|window| *window == b"AGENT_EVENT_BUDGET")
+            .count(),
+        1
+    );
+    assert_eq!(
+        transcript
+            .windows(b"dsh > ".len())
+            .filter(|window| *window == b"dsh > ")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn real_retained_json_ceiling_renders_once_and_exits_without_a_dead_prompt() {
+    // Twenty tool calls are far below the 4,096-event ceiling. Their bounded
+    // arguments are invalid for `read`: they enter durable Agent facts, while
+    // the UI omits the bodies and the tool performs no filesystem read.
+    let server = SequenceSseServer::start(vec![
+        many_invalid_read_calls_sse("large-call-a", 16, 220_000),
+        many_invalid_read_calls_sse("large-call-b", 4, 220_000),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_rolling(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"cross the retained session byte ceiling with hidden arguments\r");
+    dsh.expect(b"[turn error]");
+    dsh.expect(b"AGENT_EVENT_BUDGET");
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(10));
+    let requests = server.finish();
+
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("large-call-a-15"));
+    assert_eq!(
+        transcript
+            .windows(b"AGENT_EVENT_BUDGET".len())
+            .filter(|window| *window == b"AGENT_EVENT_BUDGET")
+            .count(),
+        1
+    );
+    let error = transcript
+        .windows(b"AGENT_EVENT_BUDGET".len())
+        .rposition(|window| window == b"AGENT_EVENT_BUDGET")
+        .expect("terminal error should remain in the rolling tail");
+    assert!(
+        !transcript[error..]
+            .windows(b"dsh > ".len())
+            .any(|window| window == b"dsh > "),
+        "an exhausted in-memory Session must not offer another prompt"
+    );
+}
+
+#[test]
+fn ctrl_c_cancels_a_stalled_stream_and_the_next_turn_still_works() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"partial-before-cancel\"}}]}\n\n",)
+            .to_owned();
+    let server = CancelThenSseServer::start(partial, text_sse("answer-after-cancel"));
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    let initial_terminal_state = dsh.terminal_state();
+    dsh.write(b"stall this turn\r");
+    dsh.expect(b"assistant | partial-before-cancel");
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    dsh.write(b"continue after cancel\r");
+    dsh.expect(b"assistant | answer-after-cancel");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    assert_eq!(dsh.terminal_state(), initial_terminal_state);
+    let (status, _) = dsh.exit_cleanly();
+    let (requests, first_connection_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(first_connection_closed);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("\"content\":\"stall this turn\""));
+    assert!(requests[1].contains("\"content\":\"continue after cancel\""));
+    assert!(!requests[1].contains("partial-before-cancel"));
+}
+
+#[test]
+fn approval_and_suspend_resume_leave_the_real_terminal_state_unchanged() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-terminal-state",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("rejection kept terminal state"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    let initial = dsh.terminal_state();
+    dsh.write(b"test approval terminal state\r");
+    let _challenge = dsh.approval_challenge();
+    assert_eq!(dsh.terminal_state(), initial);
+    dsh.write(b"reject\r");
+    dsh.expect(b"assistant | rejection kept terminal state");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    assert_eq!(dsh.terminal_state(), initial);
+
+    dsh.signal(Signal::TSTP);
+    dsh.wait_until_stopped();
+    assert_eq!(dsh.terminal_state(), initial);
+    dsh.signal(Signal::CONT);
+    dsh.expect_occurrences(b"dsh > ", 3);
+    assert_eq!(dsh.terminal_state(), initial);
+
+    let (status, _) = dsh.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn ctrl_z_cleans_an_approved_shell_group_before_bash_fg_resumes_dsh() {
+    let server = SequenceSseServer::start(vec![tool_sse(
+        "call-job-control",
+        "bash",
+        serde_json::json!({
+            "command": job_control_shell_command(),
+            "description": "exercise bounded job cleanup",
+            "timeoutMs": 25_000
+        }),
+    )]);
+    let workspace = TestWorkspace::new();
+    let mut terminal = JobControlHarness::spawn(&server.base_url, &workspace.0);
+    let dsh_group = terminal.start_dsh_job();
+
+    terminal.write(b"run the job-control cleanup fixture\r");
+    let challenge = terminal.approval_challenge();
+    terminal.write(format!("allow {challenge}\r").as_bytes());
+    terminal.expect(b"[approval: allowed once]");
+    wait_for_file(&workspace.0.join("shell-started"), Duration::from_secs(5));
+    let approved_group = terminal.remember_approved_group();
+    assert_eq!(terminal.foreground_group(), dsh_group);
+    assert_eq!(process_state::is_stopped(dsh_group), Some(false));
+
+    terminal.write(&[0x1a]);
+    wait_for_file(&workspace.0.join("cleanup-entered"), Duration::from_secs(5));
+    assert_eq!(
+        process_state::is_stopped(dsh_group),
+        Some(false),
+        "dsh must keep supervising its tool while cleanup is still pending"
+    );
+    assert_eq!(terminal.foreground_group(), dsh_group);
+    assert!(rustix::process::test_kill_process_group(approved_group).is_ok());
+    std::fs::write(workspace.0.join("cleanup-release"), b"").expect("cleanup gate should release");
+
+    terminal.expect_occurrences(JobControlHarness::SHELL_PROMPT, 3);
+    assert_eq!(process_state::is_stopped(dsh_group), Some(true));
+    assert_eq!(terminal.foreground_group(), terminal.shell_group());
+    assert!(
+        terminal.approved_group_is_gone(Duration::from_secs(2)),
+        "approved process group must be gone before dsh suspends"
+    );
+
+    let background_checkpoint = terminal.checkpoint();
+    terminal.write(b"bg %1\r");
+    terminal.expect_after(background_checkpoint, JobControlHarness::SHELL_PROMPT);
+    let stopped_checkpoint = terminal.checkpoint();
+    terminal.write(
+        b"limit=$((SECONDS+5)); while ! jobs -s %1 | /usr/bin/grep -q Stopped && [ \"$SECONDS\" -lt \"$limit\" ]; do :; done; jobs -s %1 | /usr/bin/grep -q Stopped && printf 'JC_BG_STOPPED\\n'\r",
+    );
+    terminal.expect_after(stopped_checkpoint, b"JC_BG_STOPPED");
+    assert_eq!(process_state::is_stopped(dsh_group), Some(true));
+    assert_eq!(terminal.foreground_group(), terminal.shell_group());
+    assert!(
+        !terminal.snapshot()[background_checkpoint..]
+            .windows(b"dsh > ".len())
+            .any(|window| window == b"dsh > "),
+        "a background dsh must stop again without writing to the terminal"
+    );
+
+    let foreground_checkpoint = terminal.checkpoint();
+    terminal.write(b"fg %1\r");
+    terminal.expect_after(foreground_checkpoint, b"dsh > ");
+    assert_eq!(process_state::is_stopped(dsh_group), Some(false));
+    assert_eq!(terminal.foreground_group(), dsh_group);
+    let exit_checkpoint = terminal.checkpoint();
+    terminal.write(b"/exit\r");
+    terminal.expect_after(exit_checkpoint, JobControlHarness::SHELL_PROMPT);
+    let status_checkpoint = terminal.checkpoint();
+    terminal.write(b"printf 'JC_DSH_STATUS:%s\\n' \"$?\"\r");
+    terminal.expect_after(status_checkpoint, b"JC_DSH_STATUS:0");
+    let (status, transcript) = terminal.finish_shell(Duration::from_secs(5));
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert!(!transcript.windows(5).any(|bytes| bytes == b"CLI_"));
+}
+
+#[test]
+fn terminating_signals_override_a_pending_ctrl_z_after_shell_cleanup() {
+    for (signal, expected) in [(Signal::HUP, 129), (Signal::QUIT, 131), (Signal::TERM, 143)] {
+        let server = SequenceSseServer::start(vec![tool_sse(
+            "call-job-control-exit",
+            "bash",
+            serde_json::json!({
+                "command": job_control_shell_command(),
+                "description": "exercise terminating signal priority",
+                "timeoutMs": 25_000
+            }),
+        )]);
+        let workspace = TestWorkspace::new();
+        let mut terminal = JobControlHarness::spawn(&server.base_url, &workspace.0);
+        let dsh_group = terminal.start_dsh_job();
+
+        terminal.write(b"run the terminating-signal fixture\r");
+        let challenge = terminal.approval_challenge();
+        terminal.write(format!("allow {challenge}\r").as_bytes());
+        wait_for_file(&workspace.0.join("shell-started"), Duration::from_secs(5));
+        terminal.remember_approved_group();
+        terminal.write(&[0x1a]);
+        wait_for_file(&workspace.0.join("cleanup-entered"), Duration::from_secs(5));
+        assert_eq!(process_state::is_stopped(dsh_group), Some(false));
+
+        rustix::process::kill_process(dsh_group, signal)
+            .expect("owned dsh job should accept the terminating signal");
+        // Keep the tool cleanup gate closed briefly so the dispatcher observes
+        // the stronger exit intent before the original suspend can settle.
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(workspace.0.join("cleanup-release"), b"")
+            .expect("cleanup gate should release");
+
+        terminal.expect_occurrences(JobControlHarness::SHELL_PROMPT, 3);
+        assert_ne!(process_state::is_stopped(dsh_group), Some(true));
+        assert_eq!(terminal.foreground_group(), terminal.shell_group());
+        assert!(terminal.approved_group_is_gone(Duration::from_secs(2)));
+        terminal.write(b"printf 'JC_DSH_STATUS:%s\\n' \"$?\"\r");
+        terminal.expect(format!("JC_DSH_STATUS:{expected}").as_bytes());
+        let (status, transcript) = terminal.finish_shell(Duration::from_secs(5));
+        let requests = server.finish();
+
+        assert!(status.success());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            transcript
+                .windows(b"dsh > ".len())
+                .filter(|window| *window == b"dsh > ")
+                .count(),
+            1,
+            "a terminating signal must exit instead of resuming a suspended dsh"
+        );
+    }
+}
+
+#[test]
+fn exact_approval_challenge_allows_one_patch_after_the_preview() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-patch",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("patch finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note\r");
+    dsh.expect(b"[approval requested]");
+    dsh.expect(b"--- a/note.txt");
+    let challenge = dsh.approval_challenge();
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "old\n",
+        "the file must not change before approval"
+    );
+    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"[tool result: success]");
+    dsh.expect(b"assistant | patch finished");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("call-patch"));
+}
+
+#[test]
+fn complete_and_partial_input_before_a_fresh_approval_cannot_authorize() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let tool = tool_sse(
+        "call-fenced",
+        "apply_patch",
+        serde_json::json!({ "patch": patch }),
+    );
+    let split = tool
+        .find("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}")
+        .expect("tool fixture should contain a final response boundary");
+    let mut server = GatedFirstSseServer::start(
+        tool[..split].to_owned(),
+        tool[split..].to_owned(),
+        vec![text_sse("fenced patch finished")],
+    );
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note safely\r");
+    dsh.expect(b"[working; press Ctrl+C to stop]");
+    dsh.write(b"y\rallow stale-partial");
+    server.release();
+
+    let challenge = dsh.approval_challenge();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"assistant | fenced patch finished");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !transcript
+            .windows(b"[approval answer not recognized]".len())
+            .any(|bytes| bytes == b"[approval answer not recognized]")
+    );
+}
+
+#[test]
+fn continuous_stale_approval_input_and_non_lf_allow_remain_fail_closed() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let tool = tool_sse(
+        "call-stale-flood",
+        "apply_patch",
+        serde_json::json!({ "patch": patch }),
+    );
+    let split = tool
+        .find("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}")
+        .expect("tool fixture should contain a final response boundary");
+    let mut server = GatedFirstSseServer::start(
+        tool[..split].to_owned(),
+        tool[split..].to_owned(),
+        vec![text_sse("stale input never authorized the patch")],
+    );
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note behind a fresh fence\r");
+    dsh.expect(b"[working; press Ctrl+C to stop]");
+    let mut stale_writer = dsh.duplicate_writer();
+    let flood = std::thread::spawn(move || {
+        for _ in 0..250 {
+            if stale_writer
+                .write_all(b"y\rallow 00000000-0000-4000-8000-000000000000\r")
+                .is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    server.release();
+    flood.join().expect("stale input writer should join");
+
+    let challenge = dsh.approval_challenge();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    let ready_before = dsh
+        .snapshot()
+        .windows(b"[approval input ready]".len())
+        .filter(|window| *window == b"[approval input ready]")
+        .count();
+    dsh.write(format!("allow {challenge}").as_bytes());
+    dsh.write(&[0x04]);
+    dsh.expect_occurrences(b"[approval input ready]", ready_before + 1);
+    let repeated_challenge = dsh.approval_challenge();
+    assert_eq!(repeated_challenge, challenge);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"assistant | stale input never authorized the patch");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn approval_preview_output_failure_is_bounded_and_never_changes_the_file() {
+    let addition = "x".repeat(48 * 1_024);
+    let patch = format!("--- /dev/null\n+++ b/large-preview.txt\n@@ -0,0 +1 @@\n+{addition}\n");
+    let tool = tool_sse(
+        "call-preview-output",
+        "apply_patch",
+        serde_json::json!({ "patch": patch }),
+    );
+    let split = tool
+        .find("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}")
+        .expect("tool fixture should contain a final response boundary");
+    let mut server = GatedFirstSseServer::start(
+        tool[..split].to_owned(),
+        tool[split..].to_owned(),
+        Vec::new(),
+    );
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("large-preview.txt");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"prepare a large patch preview\r");
+    dsh.expect(b"[working; press Ctrl+C to stop]");
+    dsh.pause_reading();
+    let started = std::time::Instant::now();
+    server.release();
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(7));
+    let elapsed = started.elapsed();
+    let requests = server.finish();
+
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !target.exists(),
+        "an unseen approval must never commit a patch"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "elapsed={elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(7), "elapsed={elapsed:?}");
+    assert!(
+        !transcript
+            .windows(b"dsh approval > allow ".len())
+            .any(|bytes| bytes == b"dsh approval > allow "),
+        "the transcript must not claim a challenge became answerable"
+    );
+}
+
+#[test]
+fn rejecting_a_patch_keeps_the_file_unchanged_and_the_session_continues() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-reject",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("rejection recorded"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note\r");
+    dsh.expect(b"[approval requested]");
+    let _challenge = dsh.approval_challenge();
+    dsh.write(b"reject\r");
+    dsh.expect(b"[approval: rejected]");
+    dsh.expect(b"[tool result: error]");
+    dsh.expect(b"assistant | rejection recorded");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("call-reject"));
+    assert!(requests[1].to_ascii_lowercase().contains("rejected"));
+}
+
+#[test]
+fn ctrl_c_at_patch_approval_cancels_without_a_write_and_a_later_turn_works() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-cancel",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("answer after approval cancel"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note\r");
+    let _challenge = dsh.approval_challenge();
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    dsh.write(b"continue safely\r");
+    dsh.expect(b"assistant | answer after approval cancel");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("\"content\":\"continue safely\""));
+}
+
+#[test]
+fn ctrl_d_at_patch_approval_cancels_without_a_write_and_exits_zero() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![tool_sse(
+        "call-eof",
+        "apply_patch",
+        serde_json::json!({ "patch": patch }),
+    )]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note\r");
+    let _challenge = dsh.approval_challenge();
+    dsh.write(&[0x04]);
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn hangup_at_patch_approval_exits_129_without_a_write() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![tool_sse(
+        "call-hangup-approval",
+        "apply_patch",
+        serde_json::json!({ "patch": patch }),
+    )]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"request a patch, then lose the terminal\r");
+    let _challenge = dsh.approval_challenge();
+    dsh.signal(Signal::HUP);
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+    let requests = server.finish();
+
+    assert_eq!(status.code(), Some(129));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !transcript
+            .windows(b"[approval: allowed once]".len())
+            .any(|window| window == b"[approval: allowed once]")
+    );
+}
+
+#[test]
+fn foreground_shell_runs_only_after_the_exact_terminal_approval() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-shell",
+            "bash",
+            serde_json::json!({
+                "command": "printf shell-ok > shell-result.txt",
+                "description": "create a bounded test sentinel",
+                "timeoutMs": 25_000
+            }),
+        ),
+        text_sse("shell finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("shell-result.txt");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"run the safe shell command\r");
+    dsh.expect(b"[tool requested]");
+    dsh.expect(b"tool | bash");
+    let challenge = dsh.approval_challenge();
+    assert!(!target.exists());
+    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"[tool result: success]");
+    dsh.expect(b"assistant | shell finished");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "shell-ok");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("call-shell"));
+}
+
+#[test]
+fn read_only_tool_status_and_result_reach_the_real_terminal() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-read",
+            "read",
+            serde_json::json!({ "file_path": "note.txt" }),
+        ),
+        text_sse("read finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    std::fs::write(workspace.0.join("note.txt"), "read-only sentinel\n")
+        .expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"read note\r");
+    dsh.expect(b"[tool requested]");
+    dsh.expect(b"tool | read");
+    dsh.expect(b"[tool result: success]");
+    dsh.expect(b"assistant | read finished");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("read-only sentinel"));
+}
+
+#[test]
+fn model_terminal_controls_are_rendered_as_visible_plain_text() {
+    let malicious = "safe\u{1b}]52;c;clipboard\u{7}\u{202e}end";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-visible-tool",
+            "unknown\u{202e}",
+            serde_json::json!({}),
+        ),
+        text_sse(malicious),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"show unsafe text\r");
+    dsh.expect(b"tool | unknown\\u{202e}");
+    dsh.expect(b"assistant | safe\\u{1b}]52;c;clipboard\\u{7}\\u{202e}end");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(!transcript.contains(&0x1b));
+    assert!(
+        !transcript
+            .windows(3)
+            .any(|bytes| bytes == [0xe2, 0x80, 0xae])
+    );
+}
+
+#[test]
+fn approval_preview_and_path_bidi_are_visible_text_not_terminal_controls() {
+    let unsafe_name = "note\u{202e}.txt";
+    let unsafe_line = "safe\u{202e}end";
+    let patch = format!("--- /dev/null\n+++ b/{unsafe_name}\n@@ -0,0 +1 @@\n+{unsafe_line}\n");
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-visible-preview",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("unsafe preview rejected"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join(unsafe_name);
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"show a control-safe patch preview\r");
+    let _challenge = dsh.approval_challenge();
+    let transcript = dsh.snapshot();
+    assert!(
+        transcript
+            .windows(b"note\\u{202e}.txt".len())
+            .any(|window| window == b"note\\u{202e}.txt")
+    );
+    assert!(
+        transcript
+            .windows(b"safe\\u{202e}end".len())
+            .any(|window| window == b"safe\\u{202e}end")
+    );
+    assert!(!transcript.contains(&0x1b));
+    assert!(
+        !transcript
+            .windows("\u{202e}".len())
+            .any(|window| window == "\u{202e}".as_bytes())
+    );
+
+    dsh.write(b"reject\r");
+    dsh.expect(b"assistant | unsafe preview rejected");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert!(!target.exists());
+    assert_eq!(requests.len(), 2);
+    assert!(!transcript.contains(&0x1b));
+}

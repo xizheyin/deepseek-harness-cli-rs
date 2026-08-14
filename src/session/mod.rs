@@ -4,8 +4,11 @@ mod clock;
 mod codec;
 mod error;
 mod event;
+mod observer;
 #[cfg(test)]
 mod phase5_tests;
+#[cfg(test)]
+mod phase7_tests;
 mod projection;
 
 use std::sync::Arc;
@@ -26,6 +29,13 @@ pub use event::{
     UnixMillis,
 };
 pub use projection::SessionState;
+
+pub(crate) use observer::{
+    CommittedUiEvent, CommittedUiKind, CommittedUiReceiver, SourceSeqBitmap, UiAssistantBlockKind,
+    UiAssistantContent, UiObserverAttachError, UiTurnEndReason,
+};
+#[cfg(test)]
+pub(crate) use observer::{UiAssistantBlock, UiToolFailure};
 
 use crate::model::{JsonValue, Message};
 
@@ -110,6 +120,8 @@ pub struct Session {
     first_live_seq: usize,
     retained_json_bytes: usize,
     clock: Box<dyn Clock>,
+    ui_observer: Option<observer::CommittedUiSender>,
+    ui_observer_attached: bool,
 }
 
 impl Session {
@@ -133,6 +145,8 @@ impl Session {
             projection: Projection::empty(),
             first_live_seq: 0,
             clock: Box::new(clock),
+            ui_observer: None,
+            ui_observer_attached: false,
         })
     }
 
@@ -153,6 +167,8 @@ impl Session {
             first_live_seq,
             retained_json_bytes,
             clock: Box::new(clock),
+            ui_observer: None,
+            ui_observer_attached: false,
         };
         if !matches!(
             session.events.last().map(SessionEvent::kind),
@@ -269,9 +285,42 @@ impl Session {
         self.events.push(candidate);
         self.projection = next_projection;
         self.retained_json_bytes = next_retained_json_bytes;
-        // The push above makes this index valid, and no fallible work occurs after it.
+        // The push above makes this index valid. Observer projection below may
+        // fail, but it cannot change this committed append or its return value.
         let committed_index = self.events.len() - 1;
+        observer::publish_committed(&mut self.ui_observer, &self.events[committed_index]);
         Ok(&self.events[committed_index])
+    }
+
+    /// Attach the CLI's single live view before any event is committed.
+    pub(crate) fn attach_ui_observer(
+        &mut self,
+    ) -> Result<CommittedUiReceiver, UiObserverAttachError> {
+        self.attach_ui_observer_with_capacity(MAX_SESSION_EVENTS)
+    }
+
+    fn attach_ui_observer_with_capacity(
+        &mut self,
+        capacity: usize,
+    ) -> Result<CommittedUiReceiver, UiObserverAttachError> {
+        if self.ui_observer_attached {
+            return Err(UiObserverAttachError::AlreadyAttached);
+        }
+        if !self.events.is_empty() || self.first_live_seq != 0 {
+            return Err(UiObserverAttachError::NotFresh);
+        }
+        let (sender, receiver) = observer::channel(capacity);
+        self.ui_observer = Some(sender);
+        self.ui_observer_attached = true;
+        Ok(receiver)
+    }
+
+    #[cfg(test)]
+    fn attach_ui_observer_for_test(
+        &mut self,
+        capacity: usize,
+    ) -> Result<CommittedUiReceiver, UiObserverAttachError> {
+        self.attach_ui_observer_with_capacity(capacity)
     }
 
     fn validate_prepared(&self, prepared: &PreparedEvent) -> Result<(), AppendError> {

@@ -17,20 +17,26 @@ path = "src/main.rs"
 cap-std = "=3.4.5"
 diffy = { version = "=0.5.1", features = ["std"] }
 futures-util = "0.3"
+getrandom = "=0.4.3"
 globset = "=0.4.18"
 httpdate = "1.0"
 libc = "=0.2.189"
 regex = "=1.12.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 ryu-js = "=1.0.3"
-rustix = { version = "=1.1.4", features = ["fs", "process"] }
+rustix = { version = "=1.1.4", features = ["fs", "process", "termios"] }
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.53", features = ["macros", "net", "rt", "time"] }
+tokio = { version = "1.53", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 tokio-util = "0.7"
-uuid = { version = "=1.18.1", features = ["v4"] }
+uuid = "=1.18.1"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "test-util"] }
+uuid = { version = "=1.18.1", features = ["v4"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+pty-process = { version = "=0.5.3", default-features = false }
+rustix = { version = "=1.1.4", features = ["event"] }

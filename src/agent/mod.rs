@@ -5,6 +5,8 @@ mod assembler;
 mod error;
 #[cfg(test)]
 mod phase6_tests;
+#[cfg(test)]
+mod phase7_tests;
 mod retry;
 mod tool;
 
@@ -20,6 +22,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    entropy::EntropySource,
     model::{
         CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
         LlmFailure, Message, MessageRole, MessageSource, StreamChunkKind, ToolSchema,
@@ -75,6 +78,7 @@ pub const MAX_AGENT_ACTION_RESULT_EVENT_BYTES: usize = 128 * 1024;
 pub const MAX_AGENT_COMMITTED_TOOL_RESULT_EVENT_BYTES: usize = 512 * 1024;
 pub const MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AGENT_FIXED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const AGENT_READY_WORK_BUDGET: usize = 32;
 
 /// Configurable limits that also remain below fixed process safety ceilings.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -513,16 +517,46 @@ pub trait AgentRuntime: Send + Sync {
     fn sample_unit(&self) -> Result<f64, AgentRuntimeError>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemAgentRuntime;
+#[derive(Clone, Copy)]
+pub struct SystemAgentRuntime {
+    entropy: EntropySource,
+}
+
+impl Default for SystemAgentRuntime {
+    fn default() -> Self {
+        Self {
+            entropy: EntropySource::system(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SystemAgentRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SystemAgentRuntime").finish()
+    }
+}
+
+impl SystemAgentRuntime {
+    #[cfg(test)]
+    fn with_entropy_for_test(entropy: EntropySource) -> Self {
+        Self { entropy }
+    }
+}
 
 impl AgentRuntime for SystemAgentRuntime {
     fn next_id(&self, kind: AgentIdKind) -> Result<String, AgentRuntimeError> {
-        Ok(format!("{}-{}", kind.prefix(), uuid::Uuid::new_v4()))
+        let id = self
+            .entropy
+            .uuid_v4()
+            .map_err(|_| AgentRuntimeError::EntropyUnavailable)?;
+        Ok(format!("{}-{id}", kind.prefix()))
     }
 
     fn sample_unit(&self) -> Result<f64, AgentRuntimeError> {
-        let value = uuid::Uuid::new_v4().as_u128();
+        let value = self
+            .entropy
+            .random_u128()
+            .map_err(|_| AgentRuntimeError::EntropyUnavailable)?;
         Ok(value as f64 / u128::MAX as f64)
     }
 }
@@ -598,7 +632,7 @@ impl AgentLoop {
             session,
             provider,
             tools,
-            Arc::new(SystemAgentRuntime),
+            Arc::new(SystemAgentRuntime::default()),
             config,
         )
     }
@@ -921,6 +955,9 @@ async fn run_entered_turn(
             )?)),
         };
         reservation.settle_exact(&mut step_end)?;
+        // Even a completely ready final step must give signals and output
+        // deadlines one scheduling turn before the turn is classified.
+        tokio::task::yield_now().await;
         match resolution.latched_turn_stop {
             ToolActionTurnStop::CallerCancelled => {
                 return Ok(TurnEndReason::Aborted {
@@ -1267,6 +1304,7 @@ async fn run_step(
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
+            tokio::task::yield_now().await;
             if cancellation.is_cancelled() {
                 return Ok(StepResolution::new(StepOutcome::Cancelled));
             }
@@ -1317,6 +1355,7 @@ async fn consume_stream(
     let mut validator = StreamValidator::default();
     let mut assembler = AssistantAssembler::default();
     let mut sources = Vec::new();
+    let mut ready_chunks = 0_usize;
     loop {
         let next = AssertUnwindSafe(stream.next()).catch_unwind();
         let item = tokio::select! {
@@ -1394,6 +1433,20 @@ async fn consume_stream(
         }
         sources.push(seq);
         assembler.push(&chunk);
+        ready_chunks += 1;
+        if ready_chunks == AGENT_READY_WORK_BUDGET {
+            ready_chunks = 0;
+            tokio::task::yield_now().await;
+            if cancellation.is_cancelled() {
+                return Ok(StreamOutcome::Cancelled);
+            }
+            if Instant::now() >= driver.deadline {
+                return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?));
+            }
+        }
     }
 }
 
@@ -1895,6 +1948,11 @@ async fn commit_tool_round(
                     "the agent turn timed out",
                 )?);
             }
+        }
+        if (index + 1) % AGENT_READY_WORK_BUDGET == 0 {
+            // A group of immediately-ready tool bodies must still give the
+            // owning CLI a chance to deliver cancellation before the next one.
+            tokio::task::yield_now().await;
         }
         // A stop may become ready while a truthful result is being encoded and
         // appended. Preserve the first such outer stop before any later tool is
