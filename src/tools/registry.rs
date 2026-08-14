@@ -19,6 +19,11 @@ use super::{
     {glob, grep, list, read},
 };
 
+#[cfg(unix)]
+use super::patch;
+#[cfg(unix)]
+use crate::agent::{ToolPreparation, ToolPreparationFuture};
+
 /// Immutable catalogue and capability root for the four Phase 4 read-only tools.
 pub struct ReadOnlyToolRegistry {
     workspace: Workspace,
@@ -75,6 +80,124 @@ impl ToolExecutor for ReadOnlyToolRegistry {
                 Ok(text) => normalize_success(text),
                 Err(error) => error.into_execution_result(),
             }
+        })
+    }
+}
+
+/// Capability-bound catalogue containing the four read tools plus one
+/// approval-gated, two-stage `apply_patch` mutation tool.
+#[cfg(unix)]
+pub struct WorkspaceToolRegistry {
+    workspace: Workspace,
+    schemas: Arc<[ToolSchema]>,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for WorkspaceToolRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceToolRegistry")
+            .field("workspace_configured", &true)
+            .field("schema_count", &self.schemas.len())
+            .finish()
+    }
+}
+
+#[cfg(unix)]
+impl WorkspaceToolRegistry {
+    pub fn open(workspace: impl AsRef<Path>) -> Result<Self, ToolRegistryBuildError> {
+        let workspace = Workspace::open(workspace.as_ref())?;
+        let mut schemas = build_schemas()?;
+        schemas.push(schema(
+            "apply_patch",
+            "Prepare one bounded single-file unified diff for approval and atomic publication.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "One strict create/update unified diff; runtime maximum is 262144 UTF-8 bytes",
+                        "minLength": 1,
+                        "maxLength": 262144
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        )?);
+        Ok(Self {
+            workspace,
+            schemas: schemas.into(),
+        })
+    }
+
+    #[must_use]
+    pub fn schemas(&self) -> &[ToolSchema] {
+        &self.schemas
+    }
+
+    #[must_use]
+    pub fn workspace(&self) -> &Path {
+        self.workspace.display_root()
+    }
+}
+
+#[cfg(unix)]
+impl ToolExecutor for WorkspaceToolRegistry {
+    fn execute(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        if request.name() == "apply_patch" {
+            return Box::pin(async {
+                ToolCallError::model(
+                    "ApprovalError",
+                    "APPROVAL_REQUIRED",
+                    "apply_patch must use the Agent approval preparation stage",
+                )
+                .into_execution_result()
+            });
+        }
+        let workspace = self.workspace.clone();
+        Box::pin(async move {
+            let outcome = dispatch(
+                &workspace,
+                request.name(),
+                request.arguments().as_value(),
+                &cancellation,
+            )
+            .await;
+            match outcome {
+                Ok(text) => normalize_success(text),
+                Err(error) => error.into_execution_result(),
+            }
+        })
+    }
+
+    fn prepare(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolPreparationFuture<'_> {
+        let workspace = self.workspace.clone();
+        Box::pin(async move {
+            if request.name() == "apply_patch" {
+                return patch::prepare(&workspace, request.arguments().as_value(), &cancellation)
+                    .await;
+            }
+            let outcome = dispatch(
+                &workspace,
+                request.name(),
+                request.arguments().as_value(),
+                &cancellation,
+            )
+            .await;
+            let result = match outcome {
+                Ok(text) => normalize_success(text),
+                Err(error) => error.into_execution_result(),
+            }?;
+            Ok(ToolPreparation::Complete(result))
         })
     }
 }

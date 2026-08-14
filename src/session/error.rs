@@ -120,6 +120,23 @@ pub enum TransitionError {
         retry_id: super::RetryId,
         retry: super::RetryNumber,
     },
+    #[error("approval request id {approval_id} is already pending")]
+    ApprovalIdAlreadyPending {
+        approval_id: super::ApprovalRequestId,
+    },
+    #[error("approval request id {approval_id} was already used")]
+    ApprovalIdAlreadyOwned {
+        approval_id: super::ApprovalRequestId,
+    },
+    #[error("approval decision id {approval_id} has no pending request")]
+    ApprovalDecisionWithoutRequest {
+        approval_id: super::ApprovalRequestId,
+    },
+    #[error("{event_type} cannot close while approval request {approval_id} is pending")]
+    ApprovalStillPending {
+        event_type: &'static str,
+        approval_id: super::ApprovalRequestId,
+    },
     #[error("turn or step number has no representable successor")]
     IdentifierExhausted,
 }
@@ -184,6 +201,8 @@ pub enum EventValidationError {
     InconsistentTurnEndReason,
     #[error("invalid llm retry event: {0}")]
     InvalidRetryEvent(&'static str),
+    #[error("invalid approval event: {0}")]
+    InvalidApprovalEvent(&'static str),
     #[error("session contains {actual} events; maximum is {maximum}")]
     TooManyEvents { maximum: usize, actual: usize },
 }
@@ -211,6 +230,10 @@ pub enum AppendError {
     ReservedRetainedJsonLimit { maximum: usize, reserved: usize },
     #[error("event claim does not belong to this active session reservation")]
     InvalidClaim,
+    #[error(
+        "event claim protects {reserved} compact JSON bytes, but the rebound payload needs {actual}"
+    )]
+    ClaimPayloadTooLarge { reserved: usize, actual: usize },
     #[error("could not reserve memory for the next session event")]
     Capacity,
 }

@@ -164,16 +164,7 @@ impl ToolCallError {
     }
 
     pub(crate) fn into_execution_result(self) -> Result<ToolExecutionResult, ToolExecutorError> {
-        let Self::Model {
-            name,
-            code,
-            message,
-        } = self
-        else {
-            return Err(ToolExecutorError::new(
-                "read-only tool infrastructure failed",
-            ));
-        };
+        let (name, code, message) = self.into_model_parts()?;
         let content = ContentBlock::text(format!("Error: {message}"))
             .map_err(|_| ToolExecutorError::new("read-only tool error normalization failed"))?;
         ToolExecutionResult::model_error(
@@ -184,6 +175,22 @@ impl ToolCallError {
             },
         )
         .map_err(|_| ToolExecutorError::new("read-only tool error normalization failed"))
+    }
+
+    pub(crate) fn into_model_parts(
+        self,
+    ) -> Result<(&'static str, &'static str, String), ToolExecutorError> {
+        let Self::Model {
+            name,
+            code,
+            message,
+        } = self
+        else {
+            return Err(ToolExecutorError::new(
+                "built-in tool infrastructure failed",
+            ));
+        };
+        Ok((name, code, message))
     }
 }
 

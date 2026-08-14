@@ -806,6 +806,7 @@ impl AgentRuntime for EmptyMessageIdRuntime {
         Ok(match kind {
             AgentIdKind::Message => String::new(),
             AgentIdKind::Retry => "retry-ok".to_owned(),
+            AgentIdKind::Approval => "approval-ok".to_owned(),
         })
     }
 

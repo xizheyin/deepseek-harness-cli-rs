@@ -1,16 +1,20 @@
-//! Workspace-confined, deterministic, read-only model tools.
+//! Workspace-confined deterministic tools, including approval-gated file changes.
 
 mod arguments;
 mod error;
 mod glob;
 mod grep;
 mod list;
+#[cfg(unix)]
+mod patch;
 mod read;
 mod registry;
 mod workspace;
 
 pub use error::ToolRegistryBuildError;
 pub use registry::ReadOnlyToolRegistry;
+#[cfg(unix)]
+pub use registry::WorkspaceToolRegistry;
 
 const MAX_TOOL_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_READ_CHUNK_BYTES: usize = 64 * 1024;

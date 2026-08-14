@@ -279,6 +279,12 @@ fn decode_kind(
         "llm/retry-started" => EventKind::LlmRetryStarted {
             started: payload!(super::LlmRetryStartedEvent),
         },
+        "approval/asked" => EventKind::ApprovalAsked {
+            asked: payload!(super::ApprovalAskedEvent),
+        },
+        "approval/decided" => EventKind::ApprovalDecided {
+            decided: payload!(super::ApprovalDecidedEvent),
+        },
         "session/end-seed" => {
             let _: EmptyData = payload!(EmptyData);
             EventKind::EndSeed
@@ -409,6 +415,8 @@ pub(crate) fn kind_data_value(kind: &EventKind) -> Result<Value, serde_json::Err
         EventKind::RequestContext { context } => serde_json::to_value(context),
         EventKind::LlmRetry { retry } => serde_json::to_value(retry),
         EventKind::LlmRetryStarted { started } => serde_json::to_value(started),
+        EventKind::ApprovalAsked { asked } => serde_json::to_value(asked),
+        EventKind::ApprovalDecided { decided } => serde_json::to_value(decided),
         EventKind::EndSeed => serde_json::to_value(EmptyData {}),
         EventKind::Unknown { data, .. } => Ok(data.as_value().clone()),
     }

@@ -374,6 +374,150 @@ Vitest 4.1.8 reported 26 files: 848 tests passed and one Windows-specific test
 was skipped on macOS. It used locked local dependencies, no credential, and no
 public network request.
 
+## Phase 5 inspection
+
+Phase 5 studies guarded text-file changes, applied diff facts, approval, and the
+commit boundary. The primary source files at the pinned revision are:
+
+- `packages/fs/tool-fs/src/{write,edit,diff,error,sandbox}.ts`: full-file write,
+  literal edit, applied contextual diff, error remediation, and sandbox
+  escalation;
+- `packages/fs/tool-str-replace-editor/src/index.ts`: the alternate
+  view/create/replace/insert surface used by the minimal upstream preset;
+- `packages/fs/fs/src/{index,types}.ts` and
+  `packages/fs/fs-local/src/{index,fsio,win32}.ts`: target/version vocabulary,
+  per-target serialization, guarded create/update, staging, synchronization,
+  permissions, and atomic publication;
+- `packages/fs/fs-observation-policy/src/index.ts`: the process-local
+  unseen/absent/present observation fold and write/edit intent decisions;
+- `packages/core/tools/src/index.ts` and
+  `packages/core/agent-loop/src/tool-calls.ts`: allow/deny/ask pre-decisions,
+  intention-before-body, post-processing, cancellation, and durable result order;
+- `packages/interaction/user-approval/src/{index,types,invariant}.ts`: ask/never
+  session policy, one-shot outcomes, paired audit events, and cancellation;
+- `packages/interaction/permission-presets/src/index.ts` and
+  `packages/sandbox/sandbox/src/escalation.ts`: the shipped workspace/full-access
+  bundles and the precise cases that ask for a wider capability.
+
+The directly relevant deterministic tests are:
+
+- `packages/fs/tool-fs/tests/{tools,integration,diff,error}.spec.ts`;
+- `packages/fs/tool-str-replace-editor/tests/tools.spec.ts`;
+- `packages/fs/fs-local/tests/{filesystem,fsio}.spec.ts` and
+  `packages/fs/fs-observation-policy/tests/policy.spec.ts`;
+- `packages/fs/fs-sandbox/tests`, `packages/util/atomic-write/tests`, and the
+  core filesystem service tests;
+- `packages/core/tools/tests/{tools,invariant}.spec.ts` and
+  `packages/core/agent-loop/tests/{interception,tool-calls}.spec.ts`;
+- `packages/interaction/user-approval/tests/{approval,invariant}.spec.ts`,
+  `packages/interaction/permission-presets/tests`, and
+  `packages/sandbox/sandbox/tests/escalation.spec.ts`.
+
+There is no upstream `apply_patch` or unified-diff input tool. Official `write`
+creates or replaces a whole file, while `edit` performs one literal replacement
+(or every match when requested). Their result-time presentation computes
+three-context-line hunks from the actual `before` and `after` content and stores
+those diffs in tool-result metadata. Call-time cards are only argument previews:
+an overwrite is shown like a new file and an edit shows just the requested
+old/new strings. Rust Phase 5 therefore treats its strict single-file patch and
+pre-approval exact applied diff as an intentional product/safety difference,
+while comparing final content, conflict facts, result order, and approval pairs.
+
+The upstream filesystem observation policy is process-local and session-owned.
+An unseen/known-absent write uses `createIfAbsent`; a known-present write and edit
+carry an opaque version derived from device, inode, size, mtime, and ctime.
+Guarded create publishes with a no-replace hard link. Existing-file update checks
+the version, stages and synchronizes a complete sibling file, then renames it.
+That check and rename are not one portable cross-process CAS: a deterministic
+upstream hook demonstrates that an external write in the last window can still be
+overwritten. Rust can narrow and test ordinary conflict windows but must not claim
+absolute linearizability against an uncooperative external process.
+
+Approval has three distinct vocabularies. A pre-tool listener returns `allow`,
+`deny`, or `ask`; the session ask policy is `ask` or `never`; and one question
+settles `allowed-once`, `rejected`, `cancelled`, or `unavailable`. Only
+`allowed-once` executes the body. Missing/throwing answerers and absent approval
+composition fail closed. A cancellation while waiting writes a matching
+`approval/decided {cancelled}` and discards a late answer. Normal workspace writes
+do not ask merely because the session policy is `ask`; asks come from an explicit
+pre-rule or wider sandbox escalation. Rust's default of asking for every
+`apply_patch` is consequently an intentional difference.
+
+The stable durable order is `tool/call`, optional `approval/asked` and
+`approval/decided`, external side effect, then correlated `tool/result`.
+Approval events are log-only and do not duplicate arguments. The applied
+before/after value is execution-local; model-visible result content and optional
+diff metadata are durable. A crash does not replay a mutation or restore a
+one-shot grant. Observation versions also are not persisted.
+
+The accepted Phase 5 research run exercised 27 keyless test files: 669 tests
+passed and one platform-specific case was skipped on macOS. A separate focused
+approval/tool-pipeline run exercised 271 tests, all passing. Neither run used a
+credential, network request, or user project.
+
+### Phase 5 runtime oracle
+
+The independently authored Phase 5 oracle is tied to the same clean upstream
+checkout at commit `47f943859bef60e4160492346772ded9b24f765a`:
+
+- `scripts/typecheck-upstream-file-change-fixtures.mjs` checks the generator
+  against the pinned TypeScript source graph;
+- `scripts/generate-upstream-file-change-fixtures.ts` runs real upstream
+  filesystem tools, observation policy, approval service, and Agent Loop code
+  only in fresh temporary workspaces;
+- `tests/fixtures/tools/upstream_phase5_oracle.json` retains the normalized,
+  deterministic observations consumed by the offline Rust tests.
+
+The accepted focused upstream run was:
+
+```console
+pnpm exec vitest run \
+  packages/core/tools/tests/tools.spec.ts \
+  packages/fs/fs-local/tests/filesystem.spec.ts \
+  packages/fs/fs-local/tests/fsio.spec.ts \
+  packages/fs/fs-observation-policy/tests/policy.spec.ts \
+  packages/fs/tool-fs/tests/diff.spec.ts \
+  packages/fs/tool-fs/tests/integration.spec.ts \
+  packages/interaction/user-approval/tests/approval.spec.ts
+```
+
+Vitest 4.1.8 reported seven files and 375 passing tests; one platform-specific
+test was skipped on macOS. The run used the checkout's locked dependencies and
+no credential, public network request, or user project.
+
+Node 26.0.0, TypeScript 6.0.3, and the checkout's locked `tsx` 4.22.4 then
+type-checked the generator and reproduced the fixture twice:
+
+```console
+node /Users/xizheyin/workspace/ds-harness-rs/scripts/typecheck-upstream-file-change-fixtures.mjs \
+  /Users/xizheyin/workspace/deepseek-harness-upstream
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-file-change-fixtures.ts \
+  /tmp/upstream-phase5-a.json
+
+./node_modules/.bin/tsx --tsconfig tsconfig.base.json \
+  /Users/xizheyin/workspace/ds-harness-rs/scripts/generate-upstream-file-change-fixtures.ts \
+  /tmp/upstream-phase5-b.json
+
+cmp -s /tmp/upstream-phase5-a.json /tmp/upstream-phase5-b.json
+cmp -s /tmp/upstream-phase5-a.json \
+  /Users/xizheyin/workspace/ds-harness-rs/tests/fixtures/tools/upstream_phase5_oracle.json
+```
+
+The type check passed, both generated files were byte-identical, and both
+matched the committed fixture. SHA-256:
+
+- checker: `47fab188d4e452ebdad0d6e2e19cad569b192302aa70cabe758b3b5c0193ef3a`;
+- generator: `f8bac3d965e95d6bb626659bf221d75c7f980effd9c798171b0257b650f884e0`;
+- fixture: `604e047677431366200c7b9550e62815847ccb03baa4e63e9b07aed8aa9f451f`.
+
+The fixture records the official tool surface, four canonical mutations,
+unobserved and stale failures, one windowed observation, the final
+check-to-rename race, and four approval paths. Its own named checks all pass.
+The Rust comparison tests consume it directly, so normal Rust verification
+remains offline and needs neither Node nor an upstream checkout.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

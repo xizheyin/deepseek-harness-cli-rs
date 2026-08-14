@@ -12,6 +12,8 @@ pub enum AgentBuildError {
     SessionNotIdle,
     #[error("agent session contains an unresolved tool call and requires append-only repair")]
     UnresolvedToolCall,
+    #[error("agent session contains an unresolved approval and requires append-only repair")]
+    UnresolvedApproval,
     #[error("agent limit {name} must be between {minimum} and {maximum}, got {actual}")]
     InvalidLimit {
         name: &'static str,

@@ -1,0 +1,3144 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a"
+  },
+  "evidence": {
+    "sourcePaths": [
+      "packages/core/agent-loop/src/tool-calls.ts",
+      "packages/core/tools/src/index.ts",
+      "packages/core/tools/src/invariant.ts",
+      "packages/fs/fs/src/index.ts",
+      "packages/fs/fs/src/types.ts",
+      "packages/fs/fs-local/src/index.ts",
+      "packages/fs/fs-local/src/fsio.ts",
+      "packages/fs/fs-observation-policy/src/index.ts",
+      "packages/fs/fs-sandbox/src/index.ts",
+      "packages/fs/tool-fs/src/diff.ts",
+      "packages/fs/tool-fs/src/edit.ts",
+      "packages/fs/tool-fs/src/index.ts",
+      "packages/fs/tool-fs/src/read.ts",
+      "packages/fs/tool-fs/src/sandbox.ts",
+      "packages/fs/tool-fs/src/write.ts",
+      "packages/interaction/user-approval/src/index.ts",
+      "packages/interaction/user-approval/src/invariant.ts",
+      "packages/interaction/user-approval/src/types.ts",
+      "packages/sandbox/sandbox-policy/src/index.ts"
+    ],
+    "testPaths": [
+      "packages/core/agent-loop/tests/interception.spec.ts",
+      "packages/core/agent-loop/tests/tool-calls.spec.ts",
+      "packages/core/tools/tests/tools.spec.ts",
+      "packages/fs/fs-local/tests/filesystem.spec.ts",
+      "packages/fs/fs-local/tests/fsio.spec.ts",
+      "packages/fs/fs-observation-policy/tests/policy.spec.ts",
+      "packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts",
+      "packages/fs/tool-fs/tests/diff.spec.ts",
+      "packages/fs/tool-fs/tests/integration.spec.ts",
+      "packages/fs/tool-fs/tests/tools.spec.ts",
+      "packages/interaction/user-approval/tests/approval.spec.ts",
+      "packages/interaction/user-approval/tests/invariant.spec.ts"
+    ]
+  },
+  "toolSurface": {
+    "registeredNames": [
+      "edit",
+      "read",
+      "write"
+    ],
+    "applyPatchPresent": false,
+    "repositoryApplyPatchToolDefinitions": [],
+    "write": {
+      "name": "write",
+      "description": "Create or fully replace a UTF-8 text file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "Path to write, resolved by the filesystem backend."
+          },
+          "content": {
+            "type": "string",
+            "description": "Full UTF-8 text content to write."
+          },
+          "sandbox_permissions": {
+            "type": "string",
+            "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+            "enum": [
+              "workspace-write",
+              "danger-full-access"
+            ]
+          },
+          "justification": {
+            "type": "string",
+            "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+          }
+        },
+        "required": [
+          "file_path",
+          "content"
+        ]
+      }
+    },
+    "edit": {
+      "name": "edit",
+      "description": "Edit an existing UTF-8 text file by replacing literal text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "Path to edit, resolved by the filesystem backend."
+          },
+          "old_string": {
+            "type": "string",
+            "description": "Literal text to replace. Must match exactly."
+          },
+          "new_string": {
+            "type": "string",
+            "description": "Literal replacement text. Use an empty string to delete the match."
+          },
+          "replace_all": {
+            "type": "boolean",
+            "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+          },
+          "sandbox_permissions": {
+            "type": "string",
+            "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+            "enum": [
+              "workspace-write",
+              "danger-full-access"
+            ]
+          },
+          "justification": {
+            "type": "string",
+            "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+          }
+        },
+        "required": [
+          "file_path",
+          "old_string",
+          "new_string"
+        ]
+      }
+    },
+    "checks": {
+      "canonicalFsToolsPresent": true,
+      "noApplyPatchSchema": true,
+      "noTrackedApplyPatchToolDefinition": true
+    }
+  },
+  "canonicalMutations": {
+    "writeCreate": {
+      "input": {
+        "file_path": "created.txt",
+        "content": "line one\nline two\n"
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/created.txt",
+          "operation": "create",
+          "before": null,
+          "after": "line one\nline two\n"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/created.txt</path>\n<type>file</type>\n<content>\nCreated file\n</content>"
+          }
+        ],
+        "meta": {
+          "diffs": []
+        }
+      },
+      "diskAfter": "line one\nline two\n",
+      "checks": {
+        "operationCreate": true,
+        "exactBytes": true
+      }
+    },
+    "readThenWriteUpdate": {
+      "initial": "alpha\nbeta\n",
+      "read": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/updated.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "alpha"
+            },
+            {
+              "number": 2,
+              "text": "beta"
+            }
+          ],
+          "totalLines": 2
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/updated.txt</path>\n<type>file</type>\n<content>\n1: alpha\n2: beta\n\n(End of file - total 2 lines)\n</content>"
+          }
+        ],
+        "meta": {
+          "path": "<workspace>/updated.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "alpha"
+            },
+            {
+              "number": 2,
+              "text": "beta"
+            }
+          ],
+          "totalLines": 2
+        }
+      },
+      "input": {
+        "file_path": "updated.txt",
+        "content": "alpha\nBETA\n"
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/updated.txt",
+          "operation": "update",
+          "before": "alpha\nbeta\n",
+          "after": "alpha\nBETA\n"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/updated.txt</path>\n<type>file</type>\n<content>\nUpdated file\n</content>"
+          }
+        ],
+        "meta": {
+          "diffs": [
+            {
+              "path": "updated.txt",
+              "oldText": "alpha\nbeta",
+              "newText": "alpha\nBETA"
+            }
+          ]
+        }
+      },
+      "diskAfter": "alpha\nBETA\n",
+      "checks": {
+        "readSucceeded": true,
+        "operationUpdate": true,
+        "beforeCaptured": true,
+        "exactBytes": true
+      }
+    },
+    "uniqueEdit": {
+      "initial": "hello world\n",
+      "read": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/unique.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "hello world"
+            }
+          ],
+          "totalLines": 1
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/unique.txt</path>\n<type>file</type>\n<content>\n1: hello world\n\n(End of file - total 1 lines)\n</content>"
+          }
+        ],
+        "meta": {
+          "path": "<workspace>/unique.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "hello world"
+            }
+          ],
+          "totalLines": 1
+        }
+      },
+      "input": {
+        "file_path": "unique.txt",
+        "old_string": "world",
+        "new_string": "there"
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/unique.txt",
+          "before": "hello world\n",
+          "after": "hello there\n"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "The file <workspace>/unique.txt has been updated successfully."
+          }
+        ],
+        "meta": {
+          "diffs": [
+            {
+              "path": "unique.txt",
+              "oldText": "hello world",
+              "newText": "hello there"
+            }
+          ]
+        }
+      },
+      "diskAfter": "hello there\n",
+      "checks": {
+        "readSucceeded": true,
+        "beforeCaptured": true,
+        "afterCaptured": true,
+        "exactBytes": true
+      }
+    },
+    "replaceAllDiff": {
+      "initial": "line 1\nline 2\nneedle at line 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nneedle at line 16\nline 17\nline 18\nline 19\nline 20\n",
+      "read": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/replace-all.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "line 1"
+            },
+            {
+              "number": 2,
+              "text": "line 2"
+            },
+            {
+              "number": 3,
+              "text": "needle at line 3"
+            },
+            {
+              "number": 4,
+              "text": "line 4"
+            },
+            {
+              "number": 5,
+              "text": "line 5"
+            },
+            {
+              "number": 6,
+              "text": "line 6"
+            },
+            {
+              "number": 7,
+              "text": "line 7"
+            },
+            {
+              "number": 8,
+              "text": "line 8"
+            },
+            {
+              "number": 9,
+              "text": "line 9"
+            },
+            {
+              "number": 10,
+              "text": "line 10"
+            },
+            {
+              "number": 11,
+              "text": "line 11"
+            },
+            {
+              "number": 12,
+              "text": "line 12"
+            },
+            {
+              "number": 13,
+              "text": "line 13"
+            },
+            {
+              "number": 14,
+              "text": "line 14"
+            },
+            {
+              "number": 15,
+              "text": "line 15"
+            },
+            {
+              "number": 16,
+              "text": "needle at line 16"
+            },
+            {
+              "number": 17,
+              "text": "line 17"
+            },
+            {
+              "number": 18,
+              "text": "line 18"
+            },
+            {
+              "number": 19,
+              "text": "line 19"
+            },
+            {
+              "number": 20,
+              "text": "line 20"
+            }
+          ],
+          "totalLines": 20
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/replace-all.txt</path>\n<type>file</type>\n<content>\n1: line 1\n2: line 2\n3: needle at line 3\n4: line 4\n5: line 5\n6: line 6\n7: line 7\n8: line 8\n9: line 9\n10: line 10\n11: line 11\n12: line 12\n13: line 13\n14: line 14\n15: line 15\n16: needle at line 16\n17: line 17\n18: line 18\n19: line 19\n20: line 20\n\n(End of file - total 20 lines)\n</content>"
+          }
+        ],
+        "meta": {
+          "path": "<workspace>/replace-all.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "line 1"
+            },
+            {
+              "number": 2,
+              "text": "line 2"
+            },
+            {
+              "number": 3,
+              "text": "needle at line 3"
+            },
+            {
+              "number": 4,
+              "text": "line 4"
+            },
+            {
+              "number": 5,
+              "text": "line 5"
+            },
+            {
+              "number": 6,
+              "text": "line 6"
+            },
+            {
+              "number": 7,
+              "text": "line 7"
+            },
+            {
+              "number": 8,
+              "text": "line 8"
+            },
+            {
+              "number": 9,
+              "text": "line 9"
+            },
+            {
+              "number": 10,
+              "text": "line 10"
+            },
+            {
+              "number": 11,
+              "text": "line 11"
+            },
+            {
+              "number": 12,
+              "text": "line 12"
+            },
+            {
+              "number": 13,
+              "text": "line 13"
+            },
+            {
+              "number": 14,
+              "text": "line 14"
+            },
+            {
+              "number": 15,
+              "text": "line 15"
+            },
+            {
+              "number": 16,
+              "text": "needle at line 16"
+            },
+            {
+              "number": 17,
+              "text": "line 17"
+            },
+            {
+              "number": 18,
+              "text": "line 18"
+            },
+            {
+              "number": 19,
+              "text": "line 19"
+            },
+            {
+              "number": 20,
+              "text": "line 20"
+            }
+          ],
+          "totalLines": 20
+        }
+      },
+      "input": {
+        "file_path": "replace-all.txt",
+        "old_string": "needle",
+        "new_string": "TOKEN",
+        "replace_all": true
+      },
+      "result": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/replace-all.txt",
+          "before": "line 1\nline 2\nneedle at line 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nneedle at line 16\nline 17\nline 18\nline 19\nline 20\n",
+          "after": "line 1\nline 2\nTOKEN at line 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nTOKEN at line 16\nline 17\nline 18\nline 19\nline 20\n"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "The file <workspace>/replace-all.txt has been updated. All occurrences were successfully replaced."
+          }
+        ],
+        "meta": {
+          "diffs": [
+            {
+              "path": "replace-all.txt",
+              "oldText": "line 1\nline 2\nneedle at line 3\nline 4\nline 5\nline 6",
+              "newText": "line 1\nline 2\nTOKEN at line 3\nline 4\nline 5\nline 6"
+            },
+            {
+              "path": "replace-all.txt",
+              "oldText": "line 13\nline 14\nline 15\nneedle at line 16\nline 17\nline 18\nline 19",
+              "newText": "line 13\nline 14\nline 15\nTOKEN at line 16\nline 17\nline 18\nline 19"
+            }
+          ]
+        }
+      },
+      "diskAfter": "line 1\nline 2\nTOKEN at line 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nTOKEN at line 16\nline 17\nline 18\nline 19\nline 20\n",
+      "checks": {
+        "readSucceeded": true,
+        "bothOccurrencesReplaced": true,
+        "twoContextualHunks": true,
+        "diffPathsUseInputSpelling": true
+      }
+    },
+    "deterministicCallIds": [
+      "phase5-direct-01",
+      "phase5-direct-02",
+      "phase5-direct-03",
+      "phase5-direct-04",
+      "phase5-direct-05",
+      "phase5-direct-06",
+      "phase5-direct-07"
+    ]
+  },
+  "observationFailures": {
+    "unobservedWrite": {
+      "result": {
+        "isError": true,
+        "error": {
+          "message": "cannot overwrite existing \"<workspace>/unobserved-write.txt\" without reading it first — read the file, then retry",
+          "info": {
+            "name": "FsError",
+            "code": "FS_NOT_OBSERVED"
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Error: cannot overwrite existing \"<workspace>/unobserved-write.txt\" without reading it first — read the file, then retry"
+          }
+        ]
+      },
+      "diskAfter": "keep write\n",
+      "checks": {
+        "code": true,
+        "untouched": true
+      }
+    },
+    "unobservedEdit": {
+      "result": {
+        "isError": true,
+        "error": {
+          "message": "edit requires reading \"<workspace>/unobserved-edit.txt\" first — read the file, then retry",
+          "info": {
+            "name": "FsError",
+            "code": "FS_NOT_OBSERVED"
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Error: edit requires reading \"<workspace>/unobserved-edit.txt\" first — read the file, then retry"
+          }
+        ]
+      },
+      "diskAfter": "keep edit\n",
+      "checks": {
+        "code": true,
+        "untouched": true
+      }
+    },
+    "staleWrite": {
+      "read": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/stale-write.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "observed v1"
+            }
+          ],
+          "totalLines": 1
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/stale-write.txt</path>\n<type>file</type>\n<content>\n1: observed v1\n\n(End of file - total 1 lines)\n</content>"
+          }
+        ],
+        "meta": {
+          "path": "<workspace>/stale-write.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "observed v1"
+            }
+          ],
+          "totalLines": 1
+        }
+      },
+      "result": {
+        "isError": true,
+        "error": {
+          "message": "cannot write \"<workspace>/stale-write.txt\": file changed since it was read — re-read the file, then retry",
+          "info": {
+            "name": "FsError",
+            "code": "FS_STALE_VERSION"
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Error: cannot write \"<workspace>/stale-write.txt\": file changed since it was read — re-read the file, then retry"
+          }
+        ]
+      },
+      "diskAfter": "external v2\n",
+      "checks": {
+        "readSucceeded": true,
+        "code": true,
+        "externalContentPreserved": true
+      }
+    },
+    "staleEdit": {
+      "read": {
+        "isError": false,
+        "value": {
+          "path": "<workspace>/stale-edit.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "hello world"
+            }
+          ],
+          "totalLines": 1
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "<path><workspace>/stale-edit.txt</path>\n<type>file</type>\n<content>\n1: hello world\n\n(End of file - total 1 lines)\n</content>"
+          }
+        ],
+        "meta": {
+          "path": "<workspace>/stale-edit.txt",
+          "offset": 1,
+          "lines": [
+            {
+              "number": 1,
+              "text": "hello world"
+            }
+          ],
+          "totalLines": 1
+        }
+      },
+      "result": {
+        "isError": true,
+        "error": {
+          "message": "cannot edit \"<workspace>/stale-edit.txt\": file changed since it was read — re-read the file, then retry",
+          "info": {
+            "name": "FsError",
+            "code": "FS_STALE_VERSION"
+          }
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Error: cannot edit \"<workspace>/stale-edit.txt\": file changed since it was read — re-read the file, then retry"
+          }
+        ]
+      },
+      "diskAfter": "external content\n",
+      "checks": {
+        "readSucceeded": true,
+        "staleWinsBeforeLiteralMatch": true,
+        "externalContentPreserved": true
+      }
+    },
+    "deterministicCallIds": [
+      "phase5-direct-01",
+      "phase5-direct-02",
+      "phase5-direct-03",
+      "phase5-direct-04",
+      "phase5-direct-05",
+      "phase5-direct-06"
+    ]
+  },
+  "windowedObservation": {
+    "readWindow": {
+      "offset": 1,
+      "limit": 1
+    },
+    "read": {
+      "isError": false,
+      "value": {
+        "path": "<workspace>/window.txt",
+        "offset": 1,
+        "lines": [
+          {
+            "number": 1,
+            "text": "line 1"
+          }
+        ],
+        "totalLines": 20
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "<path><workspace>/window.txt</path>\n<type>file</type>\n<content>\n1: line 1\n\n(Showing lines 1-1 of 20. Use offset=2 to continue.)\n</content>"
+        }
+      ],
+      "meta": {
+        "path": "<workspace>/window.txt",
+        "offset": 1,
+        "lines": [
+          {
+            "number": 1,
+            "text": "line 1"
+          }
+        ],
+        "totalLines": 20
+      }
+    },
+    "editOutsideWindow": {
+      "isError": false,
+      "value": {
+        "path": "<workspace>/window.txt",
+        "before": "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20",
+        "after": "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nLINE 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20"
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "The file <workspace>/window.txt has been updated successfully."
+        }
+      ],
+      "meta": {
+        "diffs": [
+          {
+            "path": "window.txt",
+            "oldText": "line 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15",
+            "newText": "line 9\nline 10\nline 11\nLINE 12\nline 13\nline 14\nline 15"
+          }
+        ]
+      }
+    },
+    "diskAfter": "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nLINE 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20",
+    "checks": {
+      "oneLineReadSucceeded": true,
+      "editOutsideWindowAuthorized": true,
+      "wholeFileVersionNotWindowCoverage": true
+    }
+  },
+  "lastWindowOverwrite": {
+    "observedBefore": "baseline",
+    "externalWriteInjectedAfterStaging": "external-in-last-window",
+    "requested": "official-final-write",
+    "outcome": {
+      "operation": "update",
+      "before": "baseline",
+      "after": "official-final-write"
+    },
+    "diskAfter": "official-final-write",
+    "checks": {
+      "competitorInjected": true,
+      "guardedCallStillSucceeded": true,
+      "finalRenameOverwroteLastWindowCompetitor": true
+    }
+  },
+  "approvalPipeline": {
+    "defaultAllow": {
+      "decision": "default-allow",
+      "answererCalls": 0,
+      "trace": [
+        "session:tool/call",
+        "filesystem:staged",
+        "session:tool/result"
+      ],
+      "relevantEventTypes": [
+        "tool/call",
+        "tool/result"
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700500000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-default-allow",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "exercise default-allow"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700500000011,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700500000022,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700500000033,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700500000044,
+          "data": {
+            "id": "user-default-allow",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "exercise default-allow"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "user/message",
+          "seq": 5,
+          "time": 1700500000055,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCurrent DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable.\n\nApproval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+              }
+            ],
+            "source": {
+              "kind": "plugin",
+              "plugin": "@deepseek-ai/dsh-system-prompt",
+              "form": "snapshot",
+              "sections": [
+                {
+                  "name": "sandbox:policy",
+                  "text": "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable."
+                },
+                {
+                  "name": "approval:policy",
+                  "text": "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+                }
+              ]
+            },
+            "role": "user",
+            "id": "00000000-0000-4000-8000-000000000001"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 6,
+          "time": 1700500000066,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 5 approval oracle.\n\nUse the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.\n\nUse the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.\n\nUse the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.",
+              "tools": [
+                {
+                  "name": "edit",
+                  "description": "Edit an existing UTF-8 text file by replacing literal text.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to edit, resolved by the filesystem backend."
+                      },
+                      "old_string": {
+                        "type": "string",
+                        "description": "Literal text to replace. Must match exactly."
+                      },
+                      "new_string": {
+                        "type": "string",
+                        "description": "Literal replacement text. Use an empty string to delete the match."
+                      },
+                      "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "old_string",
+                      "new_string"
+                    ]
+                  }
+                },
+                {
+                  "name": "read",
+                  "description": "Read a UTF-8 text file and return line-numbered content.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to read, resolved by the filesystem backend."
+                      },
+                      "offset": {
+                        "type": "number",
+                        "description": "1-based first line to return. Defaults to 1."
+                      },
+                      "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to return. Defaults to 2000."
+                      }
+                    },
+                    "required": [
+                      "file_path"
+                    ]
+                  }
+                },
+                {
+                  "name": "write",
+                  "description": "Create or fully replace a UTF-8 text file.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to write, resolved by the filesystem backend."
+                      },
+                      "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 text content to write."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "content"
+                    ]
+                  }
+                }
+              ]
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 7,
+          "time": 1700500000077,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700500000088,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "tool-call"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700500000099,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 0,
+              "id": "call-default-allow",
+              "name": "write",
+              "argumentsDelta": "{\"file_path\":\"decision.txt\",\"content\":\"default-allow\\n\"}"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700500000110,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "tool-call",
+                "id": "call-default-allow",
+                "name": "write",
+                "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"default-allow\\n\"}"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700500000121,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 3
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700500000132,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "tool-calls"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 13,
+          "time": 1700500000143,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-default-allow",
+                  "name": "write",
+                  "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"default-allow\\n\"}"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000002"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 3
+            }
+          },
+          "sourceEventSeqs": [
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "tool/call",
+          "seq": 14,
+          "time": 1700500000154,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "callId": "call-default-allow",
+            "name": "write",
+            "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"default-allow\\n\"}"
+          }
+        },
+        {
+          "type": "tool/result",
+          "seq": 15,
+          "time": 1700500000165,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "source": {
+                "kind": "tool",
+                "callId": "call-default-allow"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-default-allow",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "<path><workspace>/decision.txt</path>\n<type>file</type>\n<content>\nCreated file\n</content>"
+                    }
+                  ],
+                  "isError": false
+                }
+              ],
+              "role": "user",
+              "id": "00000000-0000-4000-8000-000000000003"
+            },
+            "meta": {
+              "diffs": []
+            }
+          },
+          "sourceEventSeqs": [
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 16,
+          "time": 1700500000176,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 17,
+          "time": 1700500000187,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 18,
+          "time": 1700500000198,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 19,
+          "time": 1700500000209,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "finished default-allow"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 20,
+          "time": 1700500000220,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "finished default-allow"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 21,
+          "time": 1700500000231,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 22,
+          "time": 1700500000242,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 23,
+          "time": 1700500000253,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "finished default-allow"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000004"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 24,
+          "time": 1700500000264,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 25,
+          "time": 1700500000275,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "diskAfter": "default-allow\n",
+      "resultIsError": false,
+      "dispatchCount": 2,
+      "checks": {
+        "exactRelevantEventOrder": true,
+        "exactLiveTrace": true,
+        "defaultWorkspaceWriteDoesNotAsk": true,
+        "answererCalledOnlyForAsk": true,
+        "sideEffectMatchesDecision": true,
+        "resultMatchesDecision": true,
+        "continuedToSecondModelStep": true
+      }
+    },
+    "deny": {
+      "decision": "deny",
+      "answererCalls": 0,
+      "trace": [
+        "session:tool/call",
+        "gate:deny",
+        "session:tool/result"
+      ],
+      "relevantEventTypes": [
+        "tool/call",
+        "tool/result"
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700500000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-deny",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "exercise deny"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700500000011,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700500000022,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700500000033,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700500000044,
+          "data": {
+            "id": "user-deny",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "exercise deny"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "user/message",
+          "seq": 5,
+          "time": 1700500000055,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCurrent DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable.\n\nApproval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+              }
+            ],
+            "source": {
+              "kind": "plugin",
+              "plugin": "@deepseek-ai/dsh-system-prompt",
+              "form": "snapshot",
+              "sections": [
+                {
+                  "name": "sandbox:policy",
+                  "text": "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable."
+                },
+                {
+                  "name": "approval:policy",
+                  "text": "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+                }
+              ]
+            },
+            "role": "user",
+            "id": "00000000-0000-4000-8000-000000000005"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 6,
+          "time": 1700500000066,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 5 approval oracle.\n\nUse the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.\n\nUse the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.\n\nUse the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.",
+              "tools": [
+                {
+                  "name": "edit",
+                  "description": "Edit an existing UTF-8 text file by replacing literal text.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to edit, resolved by the filesystem backend."
+                      },
+                      "old_string": {
+                        "type": "string",
+                        "description": "Literal text to replace. Must match exactly."
+                      },
+                      "new_string": {
+                        "type": "string",
+                        "description": "Literal replacement text. Use an empty string to delete the match."
+                      },
+                      "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "old_string",
+                      "new_string"
+                    ]
+                  }
+                },
+                {
+                  "name": "read",
+                  "description": "Read a UTF-8 text file and return line-numbered content.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to read, resolved by the filesystem backend."
+                      },
+                      "offset": {
+                        "type": "number",
+                        "description": "1-based first line to return. Defaults to 1."
+                      },
+                      "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to return. Defaults to 2000."
+                      }
+                    },
+                    "required": [
+                      "file_path"
+                    ]
+                  }
+                },
+                {
+                  "name": "write",
+                  "description": "Create or fully replace a UTF-8 text file.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to write, resolved by the filesystem backend."
+                      },
+                      "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 text content to write."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "content"
+                    ]
+                  }
+                }
+              ]
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 7,
+          "time": 1700500000077,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700500000088,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "tool-call"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700500000099,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 0,
+              "id": "call-deny",
+              "name": "write",
+              "argumentsDelta": "{\"file_path\":\"decision.txt\",\"content\":\"deny\\n\"}"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700500000110,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "tool-call",
+                "id": "call-deny",
+                "name": "write",
+                "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"deny\\n\"}"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700500000121,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 3
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700500000132,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "tool-calls"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 13,
+          "time": 1700500000143,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-deny",
+                  "name": "write",
+                  "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"deny\\n\"}"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000006"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 3
+            }
+          },
+          "sourceEventSeqs": [
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "tool/call",
+          "seq": 14,
+          "time": 1700500000154,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "callId": "call-deny",
+            "name": "write",
+            "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"deny\\n\"}"
+          }
+        },
+        {
+          "type": "tool/result",
+          "seq": 15,
+          "time": 1700500000165,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "source": {
+                "kind": "tool",
+                "callId": "call-deny"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-deny",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Error: phase5 oracle deny"
+                    }
+                  ],
+                  "isError": true
+                }
+              ],
+              "role": "user",
+              "id": "00000000-0000-4000-8000-000000000007"
+            }
+          },
+          "sourceEventSeqs": [
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 16,
+          "time": 1700500000176,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 17,
+          "time": 1700500000187,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 18,
+          "time": 1700500000198,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 19,
+          "time": 1700500000209,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "finished deny"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 20,
+          "time": 1700500000220,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "finished deny"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 21,
+          "time": 1700500000231,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 22,
+          "time": 1700500000242,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 23,
+          "time": 1700500000253,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "finished deny"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000008"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 24,
+          "time": 1700500000264,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 25,
+          "time": 1700500000275,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "diskAfter": null,
+      "resultIsError": true,
+      "dispatchCount": 2,
+      "checks": {
+        "exactRelevantEventOrder": true,
+        "exactLiveTrace": true,
+        "defaultWorkspaceWriteDoesNotAsk": true,
+        "answererCalledOnlyForAsk": true,
+        "sideEffectMatchesDecision": true,
+        "resultMatchesDecision": true,
+        "continuedToSecondModelStep": true
+      }
+    },
+    "askAllowed": {
+      "decision": "ask-allowed",
+      "answererCalls": 1,
+      "trace": [
+        "session:tool/call",
+        "gate:ask",
+        "session:approval/asked",
+        "answerer:allowed-once",
+        "session:approval/decided",
+        "filesystem:staged",
+        "session:tool/result"
+      ],
+      "relevantEventTypes": [
+        "tool/call",
+        "approval/asked",
+        "approval/decided",
+        "tool/result"
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700500000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-ask-allowed",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "exercise ask-allowed"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700500000011,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700500000022,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700500000033,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700500000044,
+          "data": {
+            "id": "user-ask-allowed",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "exercise ask-allowed"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "user/message",
+          "seq": 5,
+          "time": 1700500000055,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCurrent DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable.\n\nApproval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+              }
+            ],
+            "source": {
+              "kind": "plugin",
+              "plugin": "@deepseek-ai/dsh-system-prompt",
+              "form": "snapshot",
+              "sections": [
+                {
+                  "name": "sandbox:policy",
+                  "text": "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable."
+                },
+                {
+                  "name": "approval:policy",
+                  "text": "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+                }
+              ]
+            },
+            "role": "user",
+            "id": "00000000-0000-4000-8000-000000000009"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 6,
+          "time": 1700500000066,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 5 approval oracle.\n\nUse the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.\n\nUse the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.\n\nUse the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.",
+              "tools": [
+                {
+                  "name": "edit",
+                  "description": "Edit an existing UTF-8 text file by replacing literal text.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to edit, resolved by the filesystem backend."
+                      },
+                      "old_string": {
+                        "type": "string",
+                        "description": "Literal text to replace. Must match exactly."
+                      },
+                      "new_string": {
+                        "type": "string",
+                        "description": "Literal replacement text. Use an empty string to delete the match."
+                      },
+                      "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "old_string",
+                      "new_string"
+                    ]
+                  }
+                },
+                {
+                  "name": "read",
+                  "description": "Read a UTF-8 text file and return line-numbered content.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to read, resolved by the filesystem backend."
+                      },
+                      "offset": {
+                        "type": "number",
+                        "description": "1-based first line to return. Defaults to 1."
+                      },
+                      "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to return. Defaults to 2000."
+                      }
+                    },
+                    "required": [
+                      "file_path"
+                    ]
+                  }
+                },
+                {
+                  "name": "write",
+                  "description": "Create or fully replace a UTF-8 text file.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to write, resolved by the filesystem backend."
+                      },
+                      "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 text content to write."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "content"
+                    ]
+                  }
+                }
+              ]
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 7,
+          "time": 1700500000077,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700500000088,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "tool-call"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700500000099,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 0,
+              "id": "call-ask-allowed",
+              "name": "write",
+              "argumentsDelta": "{\"file_path\":\"decision.txt\",\"content\":\"ask-allowed\\n\"}"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700500000110,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "tool-call",
+                "id": "call-ask-allowed",
+                "name": "write",
+                "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"ask-allowed\\n\"}"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700500000121,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 3
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700500000132,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "tool-calls"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 13,
+          "time": 1700500000143,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-ask-allowed",
+                  "name": "write",
+                  "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"ask-allowed\\n\"}"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000010"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 3
+            }
+          },
+          "sourceEventSeqs": [
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "tool/call",
+          "seq": 14,
+          "time": 1700500000154,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "callId": "call-ask-allowed",
+            "name": "write",
+            "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"ask-allowed\\n\"}"
+          }
+        },
+        {
+          "type": "approval/asked",
+          "seq": 15,
+          "time": 1700500000165,
+          "data": {
+            "id": "approval-1",
+            "toolName": "write",
+            "callId": "call-ask-allowed",
+            "reason": "phase5 oracle asks"
+          }
+        },
+        {
+          "type": "approval/decided",
+          "seq": 16,
+          "time": 1700500000176,
+          "data": {
+            "id": "approval-1",
+            "outcome": "allowed-once"
+          }
+        },
+        {
+          "type": "tool/result",
+          "seq": 17,
+          "time": 1700500000187,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "source": {
+                "kind": "tool",
+                "callId": "call-ask-allowed"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-ask-allowed",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "<path><workspace>/decision.txt</path>\n<type>file</type>\n<content>\nCreated file\n</content>"
+                    }
+                  ],
+                  "isError": false
+                }
+              ],
+              "role": "user",
+              "id": "00000000-0000-4000-8000-000000000011"
+            },
+            "meta": {
+              "diffs": []
+            }
+          },
+          "sourceEventSeqs": [
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 18,
+          "time": 1700500000198,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 19,
+          "time": 1700500000209,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 20,
+          "time": 1700500000220,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 21,
+          "time": 1700500000231,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "finished ask-allowed"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 22,
+          "time": 1700500000242,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "finished ask-allowed"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 23,
+          "time": 1700500000253,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 24,
+          "time": 1700500000264,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 25,
+          "time": 1700500000275,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "finished ask-allowed"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000012"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            20,
+            21,
+            22,
+            23,
+            24
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 26,
+          "time": 1700500000286,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 27,
+          "time": 1700500000297,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "diskAfter": "ask-allowed\n",
+      "resultIsError": false,
+      "dispatchCount": 2,
+      "checks": {
+        "exactRelevantEventOrder": true,
+        "exactLiveTrace": true,
+        "defaultWorkspaceWriteDoesNotAsk": true,
+        "answererCalledOnlyForAsk": true,
+        "sideEffectMatchesDecision": true,
+        "resultMatchesDecision": true,
+        "continuedToSecondModelStep": true
+      }
+    },
+    "askRejected": {
+      "decision": "ask-rejected",
+      "answererCalls": 1,
+      "trace": [
+        "session:tool/call",
+        "gate:ask",
+        "session:approval/asked",
+        "answerer:rejected",
+        "session:approval/decided",
+        "session:tool/result"
+      ],
+      "relevantEventTypes": [
+        "tool/call",
+        "approval/asked",
+        "approval/decided",
+        "tool/result"
+      ],
+      "events": [
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 0,
+          "time": 1700500000000,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "inserted": [
+              {
+                "id": "user-ask-rejected",
+                "role": "user",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "exercise ask-rejected"
+                  }
+                ],
+                "source": {
+                  "kind": "user"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "turn/start",
+          "seq": 1,
+          "time": 1700500000011,
+          "data": {
+            "turn": 1
+          }
+        },
+        {
+          "type": "agent/inbox/spliced",
+          "seq": 2,
+          "time": 1700500000022,
+          "data": {
+            "target": "next-turn",
+            "start": 0,
+            "removedCount": 1,
+            "inserted": []
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 3,
+          "time": 1700500000033,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "user/message",
+          "seq": 4,
+          "time": 1700500000044,
+          "data": {
+            "id": "user-ask-rejected",
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "exercise ask-rejected"
+              }
+            ],
+            "source": {
+              "kind": "user"
+            }
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "user/message",
+          "seq": 5,
+          "time": 1700500000055,
+          "data": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\nCurrent DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable.\n\nApproval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+              }
+            ],
+            "source": {
+              "kind": "plugin",
+              "plugin": "@deepseek-ai/dsh-system-prompt",
+              "form": "snapshot",
+              "sections": [
+                {
+                  "name": "sandbox:policy",
+                  "text": "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"<workspace>\". Some platform temporary areas may also be writable."
+                },
+                {
+                  "name": "approval:policy",
+                  "text": "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed."
+                }
+              ]
+            },
+            "role": "user",
+            "id": "00000000-0000-4000-8000-000000000013"
+          },
+          "surfaceOp": "append"
+        },
+        {
+          "type": "request/header",
+          "seq": 6,
+          "time": 1700500000066,
+          "data": {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 5 approval oracle.\n\nUse the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.\n\nUse the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.\n\nUse the edit tool for targeted changes to existing UTF-8 text files. It replaces literal old_string with new_string; by default old_string must appear exactly once. If old_string appears multiple times, provide a more specific old_string or set replace_all to true. Read the file first (the default fs-observation-policy requires it), unless you just created or edited it in this session.",
+              "tools": [
+                {
+                  "name": "edit",
+                  "description": "Edit an existing UTF-8 text file by replacing literal text.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to edit, resolved by the filesystem backend."
+                      },
+                      "old_string": {
+                        "type": "string",
+                        "description": "Literal text to replace. Must match exactly."
+                      },
+                      "new_string": {
+                        "type": "string",
+                        "description": "Literal replacement text. Use an empty string to delete the match."
+                      },
+                      "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "old_string",
+                      "new_string"
+                    ]
+                  }
+                },
+                {
+                  "name": "read",
+                  "description": "Read a UTF-8 text file and return line-numbered content.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to read, resolved by the filesystem backend."
+                      },
+                      "offset": {
+                        "type": "number",
+                        "description": "1-based first line to return. Defaults to 1."
+                      },
+                      "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to return. Defaults to 2000."
+                      }
+                    },
+                    "required": [
+                      "file_path"
+                    ]
+                  }
+                },
+                {
+                  "name": "write",
+                  "description": "Create or fully replace a UTF-8 text file.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "file_path": {
+                        "type": "string",
+                        "description": "Path to write, resolved by the filesystem backend."
+                      },
+                      "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 text content to write."
+                      },
+                      "sandbox_permissions": {
+                        "type": "string",
+                        "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval.",
+                        "enum": [
+                          "workspace-write",
+                          "danger-full-access"
+                        ]
+                      },
+                      "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                      }
+                    },
+                    "required": [
+                      "file_path",
+                      "content"
+                    ]
+                  }
+                }
+              ]
+            },
+            "reason": "initial"
+          }
+        },
+        {
+          "type": "request/context",
+          "seq": 7,
+          "time": 1700500000077,
+          "data": {
+            "provider": "mock",
+            "model": "oracle-model",
+            "contextWindow": 4096
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 8,
+          "time": 1700500000088,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "tool-call"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 9,
+          "time": 1700500000099,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "tool-call-delta",
+              "index": 0,
+              "id": "call-ask-rejected",
+              "name": "write",
+              "argumentsDelta": "{\"file_path\":\"decision.txt\",\"content\":\"ask-rejected\\n\"}"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 10,
+          "time": 1700500000110,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "tool-call",
+                "id": "call-ask-rejected",
+                "name": "write",
+                "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"ask-rejected\\n\"}"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 11,
+          "time": 1700500000121,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 5,
+                "outputTokens": 3
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 12,
+          "time": 1700500000132,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "tool-calls"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 13,
+          "time": 1700500000143,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-ask-rejected",
+                  "name": "write",
+                  "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"ask-rejected\\n\"}"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000014"
+            },
+            "usage": {
+              "inputTokens": 5,
+              "outputTokens": 3
+            }
+          },
+          "sourceEventSeqs": [
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "tool/call",
+          "seq": 14,
+          "time": 1700500000154,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "callId": "call-ask-rejected",
+            "name": "write",
+            "arguments": "{\"file_path\":\"decision.txt\",\"content\":\"ask-rejected\\n\"}"
+          }
+        },
+        {
+          "type": "approval/asked",
+          "seq": 15,
+          "time": 1700500000165,
+          "data": {
+            "id": "approval-1",
+            "toolName": "write",
+            "callId": "call-ask-rejected",
+            "reason": "phase5 oracle asks"
+          }
+        },
+        {
+          "type": "approval/decided",
+          "seq": 16,
+          "time": 1700500000176,
+          "data": {
+            "id": "approval-1",
+            "outcome": "rejected"
+          }
+        },
+        {
+          "type": "tool/result",
+          "seq": 17,
+          "time": 1700500000187,
+          "data": {
+            "turn": 1,
+            "step": 1,
+            "message": {
+              "source": {
+                "kind": "tool",
+                "callId": "call-ask-rejected"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-ask-rejected",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Error: the user rejected tool \"write\""
+                    }
+                  ],
+                  "isError": true
+                }
+              ],
+              "role": "user",
+              "id": "00000000-0000-4000-8000-000000000015"
+            }
+          },
+          "sourceEventSeqs": [
+            14
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 18,
+          "time": 1700500000198,
+          "data": {
+            "turn": 1,
+            "step": 1
+          }
+        },
+        {
+          "type": "step/start",
+          "seq": 19,
+          "time": 1700500000209,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 20,
+          "time": 1700500000220,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-start",
+              "index": 0,
+              "blockType": "text"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 21,
+          "time": 1700500000231,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "text-delta",
+              "index": 0,
+              "text": "finished ask-rejected"
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 22,
+          "time": 1700500000242,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "block-end",
+              "index": 0,
+              "block": {
+                "type": "text",
+                "text": "finished ask-rejected"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 23,
+          "time": 1700500000253,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "usage",
+              "usage": {
+                "inputTokens": 3,
+                "outputTokens": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/chunk",
+          "seq": 24,
+          "time": 1700500000264,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "chunk": {
+              "type": "finish",
+              "reason": {
+                "kind": "stop"
+              }
+            }
+          }
+        },
+        {
+          "type": "assistant/message",
+          "seq": 25,
+          "time": 1700500000275,
+          "data": {
+            "turn": 1,
+            "step": 2,
+            "message": {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "finished ask-rejected"
+                }
+              ],
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "oracle-model"
+              },
+              "id": "00000000-0000-4000-8000-000000000016"
+            },
+            "usage": {
+              "inputTokens": 3,
+              "outputTokens": 2
+            }
+          },
+          "sourceEventSeqs": [
+            20,
+            21,
+            22,
+            23,
+            24
+          ],
+          "surfaceOp": "append"
+        },
+        {
+          "type": "step/end",
+          "seq": 26,
+          "time": 1700500000286,
+          "data": {
+            "turn": 1,
+            "step": 2
+          }
+        },
+        {
+          "type": "turn/end",
+          "seq": 27,
+          "time": 1700500000297,
+          "data": {
+            "turn": 1,
+            "reason": {
+              "kind": "completed"
+            }
+          }
+        }
+      ],
+      "diskAfter": null,
+      "resultIsError": true,
+      "dispatchCount": 2,
+      "checks": {
+        "exactRelevantEventOrder": true,
+        "exactLiveTrace": true,
+        "defaultWorkspaceWriteDoesNotAsk": true,
+        "answererCalledOnlyForAsk": true,
+        "sideEffectMatchesDecision": true,
+        "resultMatchesDecision": true,
+        "continuedToSecondModelStep": true
+      }
+    }
+  },
+  "deterministic": {
+    "freshTemporaryWorkspaces": true,
+    "temporaryPathsNormalized": true,
+    "eventTimes": "normalized as 1700500000000 + seq * 11",
+    "approvalIds": "normalized by first appearance within each scenario"
+  },
+  "safety": {
+    "networkAccess": "none",
+    "credentialAccess": "none",
+    "filesystemWrites": "fresh directories below the platform temporary directory only"
+  }
+}

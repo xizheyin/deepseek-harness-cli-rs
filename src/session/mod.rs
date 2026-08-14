@@ -4,6 +4,8 @@ mod clock;
 mod codec;
 mod error;
 mod event;
+#[cfg(test)]
+mod phase5_tests;
 mod projection;
 
 use std::sync::Arc;
@@ -15,10 +17,11 @@ pub use error::{
     ReplayError, SessionError, SurfaceError, TransitionError,
 };
 pub use event::{
-    EpochHeader, EventKind, EventSeq, LlmRetryEvent, LlmRetryMode, LlmRetryStartedEvent,
-    MAX_SAFE_INTEGER, MAX_SESSION_HEADER_BYTES, MAX_SOURCE_EVENT_SEQS, NewEvent, RequestContext,
-    RequestHeaderReason, RetryId, RetryNumber, SESSION_FORMAT_VERSION, SessionEvent, SessionHeader,
-    SessionId, SessionOrigin, StepId, SurfaceAppend, SurfaceIntent, SurfaceOp, SurfaceReplace,
+    ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId, EpochHeader,
+    EventKind, EventSeq, LlmRetryEvent, LlmRetryMode, LlmRetryStartedEvent, MAX_SAFE_INTEGER,
+    MAX_SESSION_HEADER_BYTES, MAX_SOURCE_EVENT_SEQS, NewEvent, RequestContext, RequestHeaderReason,
+    RetryId, RetryNumber, SESSION_FORMAT_VERSION, SessionEvent, SessionHeader, SessionId,
+    SessionOrigin, StepId, SurfaceAppend, SurfaceIntent, SurfaceOp, SurfaceReplace,
     TOOL_NOT_STARTED, TodoItem, TodoStatus, ToolFailure, TurnEndCancelCause, TurnEndReason, TurnId,
     UnixMillis,
 };
@@ -54,6 +57,7 @@ pub enum ClaimedAppend {
 pub struct EventClaim {
     owner: Arc<()>,
     fallback: PreparedEvent,
+    reserved_retained_json_bytes: usize,
     settled: bool,
 }
 
@@ -435,6 +439,7 @@ impl SessionReservation<'_> {
         for fallback in prepared {
             claims.push(EventClaim {
                 owner: self.owner.clone(),
+                reserved_retained_json_bytes: fallback.retained_json_bytes,
                 fallback,
                 settled: false,
             });
@@ -464,7 +469,7 @@ impl SessionReservation<'_> {
         let preferred = Session::prepare_event(preferred)?;
         self.session.validate_prepared(&preferred)?;
         let other_events = self.reserved_events - 1;
-        let other_bytes = self.reserved_retained_json_bytes - claim.fallback.retained_json_bytes;
+        let other_bytes = self.reserved_retained_json_bytes - claim.reserved_retained_json_bytes;
         let preferred_fits = self
             .session
             .events
@@ -501,7 +506,7 @@ impl SessionReservation<'_> {
     pub fn settle_exact(&mut self, claim: &mut EventClaim) -> Result<EventSeq, AppendError> {
         self.validate_claim(claim)?;
         let other_events = self.reserved_events - 1;
-        let other_bytes = self.reserved_retained_json_bytes - claim.fallback.retained_json_bytes;
+        let other_bytes = self.reserved_retained_json_bytes - claim.reserved_retained_json_bytes;
         let seq = self
             .session
             .append_prepared(claim.fallback.clone(), other_events, other_bytes)?
@@ -522,9 +527,97 @@ impl SessionReservation<'_> {
     pub fn release(&mut self, claim: &mut EventClaim) -> Result<(), AppendError> {
         self.validate_claim(claim)?;
         self.reserved_events -= 1;
-        self.reserved_retained_json_bytes -= claim.fallback.retained_json_bytes;
+        self.reserved_retained_json_bytes -= claim.reserved_retained_json_bytes;
         claim.settled = true;
         Ok(())
+    }
+
+    /// Increase one active claim's protected byte ceiling without changing its
+    /// fallback. This is used when a read-only preparation stage discovers the
+    /// exact maximum size of a possible committed result.
+    pub(crate) fn reserve_claim_retained_json_bytes(
+        &mut self,
+        claim: &mut EventClaim,
+        requested: usize,
+    ) -> Result<(), AppendError> {
+        self.validate_claim(claim)?;
+        if requested <= claim.reserved_retained_json_bytes {
+            return Ok(());
+        }
+        let other_bytes = self
+            .reserved_retained_json_bytes
+            .checked_sub(claim.reserved_retained_json_bytes)
+            .ok_or(AppendError::InvalidClaim)?;
+        let next_reserved_bytes =
+            other_bytes
+                .checked_add(requested)
+                .ok_or(AppendError::ReservedRetainedJsonLimit {
+                    maximum: MAX_SESSION_RETAINED_JSON_BYTES,
+                    reserved: usize::MAX,
+                })?;
+        if self
+            .session
+            .retained_json_bytes
+            .checked_add(next_reserved_bytes)
+            .is_none_or(|total| total > MAX_SESSION_RETAINED_JSON_BYTES)
+        {
+            return Err(AppendError::ReservedRetainedJsonLimit {
+                maximum: MAX_SESSION_RETAINED_JSON_BYTES,
+                reserved: next_reserved_bytes,
+            });
+        }
+        claim.reserved_retained_json_bytes = requested;
+        self.reserved_retained_json_bytes = next_reserved_bytes;
+        Ok(())
+    }
+
+    /// Replace an active claim's exact fallback while staying within its
+    /// already-protected byte ceiling. No event, projection, sequence, or clock
+    /// state changes until the claim is later settled.
+    pub(crate) fn rebind_claim_fallback(
+        &mut self,
+        claim: &mut EventClaim,
+        fallback: NewEvent,
+    ) -> Result<(), AppendError> {
+        self.validate_claim(claim)?;
+        let fallback = Session::prepare_event(fallback)?;
+        if fallback.retained_json_bytes > claim.reserved_retained_json_bytes {
+            return Err(AppendError::ClaimPayloadTooLarge {
+                reserved: claim.reserved_retained_json_bytes,
+                actual: fallback.retained_json_bytes,
+            });
+        }
+        claim.fallback = fallback;
+        Ok(())
+    }
+
+    /// Commit exactly the supplied event from a claim's protected capacity.
+    /// Unlike `settle`, this never substitutes the fallback, which is required
+    /// after an irreversible external side effect has already committed.
+    pub(crate) fn settle_preferred_only(
+        &mut self,
+        claim: &mut EventClaim,
+        preferred: NewEvent,
+    ) -> Result<EventSeq, AppendError> {
+        self.validate_claim(claim)?;
+        let preferred = Session::prepare_event(preferred)?;
+        if preferred.retained_json_bytes > claim.reserved_retained_json_bytes {
+            return Err(AppendError::ClaimPayloadTooLarge {
+                reserved: claim.reserved_retained_json_bytes,
+                actual: preferred.retained_json_bytes,
+            });
+        }
+        self.session.validate_prepared(&preferred)?;
+        let other_events = self.reserved_events - 1;
+        let other_bytes = self.reserved_retained_json_bytes - claim.reserved_retained_json_bytes;
+        let seq = self
+            .session
+            .append_prepared(preferred, other_events, other_bytes)?
+            .seq();
+        claim.settled = true;
+        self.reserved_events = other_events;
+        self.reserved_retained_json_bytes = other_bytes;
+        Ok(seq)
     }
 
     fn validate_claim(&self, claim: &EventClaim) -> Result<(), AppendError> {

@@ -1,5 +1,6 @@
 //! Bounded, cancellable Agent Loop joining sessions, providers, and tools.
 
+mod approval;
 mod assembler;
 mod error;
 mod retry;
@@ -23,17 +24,24 @@ use crate::{
     },
     provider::{ModelProvider, ProviderRequest, RetryMode, StreamValidator},
     session::{
-        AppendError, ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
+        AppendError, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId,
+        ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
         LlmRetryStartedEvent, NewEvent, RequestContext, RequestHeaderReason, RetryId, RetryNumber,
         Session, SessionReservation, StepId, SurfaceIntent, ToolFailure, TurnEndCancelCause,
         TurnEndReason, TurnId,
     },
 };
 
+pub use approval::{
+    ApprovalFuture, ApprovalPrompt, ApprovalPromptError, ApprovalProvider, ApprovalProviderError,
+    ApprovalRequest, FileChangePolicy, MAX_APPROVAL_PREVIEW_BYTES, MAX_APPROVAL_REASON_BYTES,
+    NoApprovalProvider,
+};
 pub use error::{AgentBuildError, AgentLoopError, AgentRuntimeError};
 pub use tool::{
-    NoTools, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
-    ToolExecutorError,
+    MutationDeclineReason, NoTools, PreparedToolMutation, ToolCommitDisposition, ToolCommitFn,
+    ToolCommitOutcome, ToolDeclineFn, ToolExecutionFuture, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture,
 };
 
 use assembler::{AssembledAssistant, AssistantAssembler, without_tool_calls};
@@ -53,6 +61,8 @@ pub const MAX_AGENT_TOOL_DURATION: Duration = Duration::from_secs(5 * 60);
 pub const MAX_AGENT_TOOL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 pub const MAX_AGENT_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_TOOL_RESULT_BYTES: usize = 256 * 1024;
+/// Session-event capacity protected before an irreversible mutation starts.
+pub const MAX_AGENT_COMMITTED_TOOL_RESULT_EVENT_BYTES: usize = 512 * 1024;
 pub const MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AGENT_FIXED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
@@ -317,6 +327,8 @@ pub struct AgentLoopConfig {
     system: Option<String>,
     tools: Vec<ToolSchema>,
     limits: AgentLimits,
+    file_change_policy: FileChangePolicy,
+    approval_provider: Arc<dyn ApprovalProvider>,
 }
 
 impl std::fmt::Debug for AgentLoopConfig {
@@ -328,6 +340,8 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("system_bytes", &self.system.as_ref().map_or(0, String::len))
             .field("tool_count", &self.tools.len())
             .field("limits", &self.limits)
+            .field("file_change_policy", &self.file_change_policy)
+            .field("approval_provider_configured", &true)
             .finish()
     }
 }
@@ -340,6 +354,8 @@ impl AgentLoopConfig {
             system: None,
             tools: Vec::new(),
             limits: AgentLimits::default(),
+            file_change_policy: FileChangePolicy::Ask,
+            approval_provider: Arc::new(NoApprovalProvider),
         }
     }
 
@@ -375,6 +391,22 @@ impl AgentLoopConfig {
     pub fn with_limits(mut self, limits: AgentLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    #[must_use]
+    pub fn with_file_change_approval(
+        mut self,
+        policy: FileChangePolicy,
+        provider: Arc<dyn ApprovalProvider>,
+    ) -> Self {
+        self.file_change_policy = policy;
+        self.approval_provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn file_change_policy(&self) -> FileChangePolicy {
+        self.file_change_policy
     }
 
     #[must_use]
@@ -421,6 +453,7 @@ pub enum TurnProposal {
 pub enum AgentIdKind {
     Message,
     Retry,
+    Approval,
 }
 
 impl AgentIdKind {
@@ -429,6 +462,7 @@ impl AgentIdKind {
         match self {
             Self::Message => "message",
             Self::Retry => "retry",
+            Self::Approval => "approval",
         }
     }
 }
@@ -540,6 +574,9 @@ impl AgentLoop {
         runtime: Arc<dyn AgentRuntime>,
         config: AgentLoopConfig,
     ) -> Result<Self, AgentBuildError> {
+        if !session.state().pending_approvals().is_empty() {
+            return Err(AgentBuildError::UnresolvedApproval);
+        }
         if session.state().open_turn().is_some() {
             return Err(AgentBuildError::SessionNotIdle);
         }
@@ -631,6 +668,7 @@ impl AgentLoop {
         .await;
         if (result.is_err() && self.session.state().open_turn().is_some())
             || session_has_unresolved_tool_calls(&self.session)
+            || !self.session.state().pending_approvals().is_empty()
         {
             self.poisoned = true;
         }
@@ -1401,17 +1439,12 @@ async fn commit_tool_round(
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<StepOutcome, AgentLoopError> {
-    let first_seq = reservation
-        .session()
-        .next_seq()
-        .ok_or(AgentLoopError::Invariant("session sequence exhausted"))?;
     let mut result_ids = Vec::with_capacity(calls.len());
     let mut fallbacks = Vec::with_capacity(1 + calls.len() * 2);
     fallbacks.push(assistant);
-    for (index, call) in calls.iter().enumerate() {
-        let call_offset = 1_u64 + (index as u64) * 2;
-        let call_seq = EventSeq::new(first_seq.get() + call_offset)
-            .map_err(|_| AgentLoopError::Invariant("tool call sequence exhausted"))?;
+    let maximum_source_seq = EventSeq::new(crate::session::MAX_SAFE_INTEGER)
+        .map_err(|_| AgentLoopError::Invariant("maximum event sequence is invalid"))?;
+    for call in &calls {
         let result_id = next_id(driver.runtime, AgentIdKind::Message)?;
         fallbacks.push(NewEvent::log(EventKind::tool_call(
             turn,
@@ -1425,12 +1458,12 @@ async fn commit_tool_round(
             step,
             &result_id,
             call,
-            call_seq,
+            maximum_source_seq,
             "TOOL_OUTPUT_BUDGET_EXCEEDED",
             call.name.as_str(),
             "tool output could not fit safely in the session",
         )?);
-        result_ids.push((call_seq, result_id));
+        result_ids.push(result_id);
     }
     let mut claims = match reservation.claim_batch(fallbacks) {
         Ok(claims) => claims,
@@ -1442,12 +1475,12 @@ async fn commit_tool_round(
     let mut assistant_claim = claims.remove(0);
     reservation.settle_exact(&mut assistant_claim)?;
     let mut planned = Vec::with_capacity(calls.len());
-    for (call, (call_seq, result_message_id)) in calls.into_iter().zip(result_ids) {
+    for (call, result_message_id) in calls.into_iter().zip(result_ids) {
         let call_claim = claims.remove(0);
         let result_claim = claims.remove(0);
         planned.push(PlannedTool {
             call,
-            call_seq,
+            call_seq: maximum_source_seq,
             result_message_id,
             call_claim,
             result_claim,
@@ -1461,7 +1494,21 @@ async fn commit_tool_round(
     for index in 0..planned.len() {
         let (completed, remaining) = planned.split_at_mut(index + 1);
         let plan = &mut completed[index];
-        reservation.settle_exact(&mut plan.call_claim)?;
+        let actual_call_seq = reservation.settle_exact(&mut plan.call_claim)?;
+        plan.call_seq = actual_call_seq;
+        reservation.rebind_claim_fallback(
+            &mut plan.result_claim,
+            tool_error_event(
+                turn,
+                step,
+                &plan.result_message_id,
+                &plan.call,
+                actual_call_seq,
+                "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                plan.call.name.as_str(),
+                "tool output could not fit safely in the session",
+            )?,
+        )?;
         let result = if infrastructure_failure.is_some() || cancelled || cancellation.is_cancelled()
         {
             cancelled |= cancellation.is_cancelled();
@@ -1473,10 +1520,67 @@ async fn commit_tool_round(
             run_one_tool(driver, &plan.call, cancellation).await
         };
         match result {
-            ToolRun::Completed(result) => {
+            ToolRun::Completed {
+                result,
+                committed,
+                stop,
+            } => {
                 let requested_conclusion = result.concludes_turn();
-                let committed_preferred = settle_tool_result(reservation, driver, plan, result)?;
+                let committed_preferred =
+                    settle_tool_result(reservation, driver, plan, result, committed)?;
                 concludes_turn |= requested_conclusion && committed_preferred;
+                match stop {
+                    ToolStop::None => {}
+                    ToolStop::Cancelled => cancelled = true,
+                    ToolStop::TurnTimeout => {
+                        infrastructure_failure = Some(failure_reason(
+                            "AGENT_TURN_TIMEOUT",
+                            "the agent turn timed out",
+                        )?);
+                    }
+                }
+            }
+            ToolRun::Mutation(mutation) => {
+                let resolved =
+                    resolve_mutation(reservation, driver, plan, mutation, cancellation).await?;
+                match resolved {
+                    ToolRun::Completed {
+                        result,
+                        committed,
+                        stop,
+                    } => {
+                        let requested_conclusion = result.concludes_turn();
+                        let committed_preferred =
+                            settle_tool_result(reservation, driver, plan, result, committed)?;
+                        concludes_turn |= requested_conclusion && committed_preferred;
+                        match stop {
+                            ToolStop::None => {}
+                            ToolStop::Cancelled => cancelled = true,
+                            ToolStop::TurnTimeout => {
+                                infrastructure_failure = Some(failure_reason(
+                                    "AGENT_TURN_TIMEOUT",
+                                    "the agent turn timed out",
+                                )?);
+                            }
+                        }
+                    }
+                    ToolRun::Infrastructure => {
+                        reservation.release(&mut plan.result_claim)?;
+                        for later in remaining {
+                            reservation.release(&mut later.call_claim)?;
+                            reservation.release(&mut later.result_claim)?;
+                        }
+                        return Ok(StepOutcome::Error(failure_reason(
+                            "AGENT_TOOL_EXECUTOR",
+                            "the prepared file mutation failed without a definite outcome",
+                        )?));
+                    }
+                    _ => {
+                        return Err(AgentLoopError::Invariant(
+                            "mutation resolution returned an invalid tool state",
+                        ));
+                    }
+                }
             }
             ToolRun::ModelError { code, message } => {
                 if code == "ABORTED" {
@@ -1541,8 +1645,20 @@ async fn commit_tool_round(
     Ok(StepOutcome::Continue)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolStop {
+    None,
+    Cancelled,
+    TurnTimeout,
+}
+
 enum ToolRun {
-    Completed(ToolExecutionResult),
+    Completed {
+        result: ToolExecutionResult,
+        committed: bool,
+        stop: ToolStop,
+    },
+    Mutation(PreparedToolMutation),
     ModelError {
         code: &'static str,
         message: &'static str,
@@ -1600,7 +1716,7 @@ async fn run_one_tool(
         };
     }
     let future = match catch_unwind(AssertUnwindSafe(|| {
-        driver.tools.execute(request, child.clone())
+        driver.tools.prepare(request, child.clone())
     })) {
         Ok(future) => future,
         Err(_) => {
@@ -1626,7 +1742,12 @@ async fn run_one_tool(
             ToolRun::ModelError { code: "ABORTED", message: "tool was cancelled" }
         } else {
             match result {
-                Ok(Ok(result)) => ToolRun::Completed(result),
+                Ok(Ok(ToolPreparation::Complete(result))) => ToolRun::Completed {
+                    result,
+                    committed: false,
+                    stop: ToolStop::None,
+                },
+                Ok(Ok(ToolPreparation::Mutation(mutation))) => ToolRun::Mutation(mutation),
                 Ok(Err(_)) | Err(_) => {
                     child.cancel();
                     ToolRun::Infrastructure
@@ -1645,6 +1766,298 @@ async fn run_one_tool(
     // outcome (and no extension detail is retained).
     let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
     interrupted
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_mutation(
+    reservation: &mut SessionReservation<'_>,
+    driver: &Driver<'_>,
+    plan: &mut PlannedTool,
+    mutation: PreparedToolMutation,
+    cancellation: &CancellationToken,
+) -> Result<ToolRun, AgentLoopError> {
+    if driver.config.file_change_policy == FileChangePolicy::Deny {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::PolicyDenied,
+            ToolStop::None,
+        ));
+    }
+
+    // An irreversible change may start only after the session has protected a
+    // large enough slot for its truthful result. Near the session byte limit we
+    // fail before asking the user and before invoking the commit capability.
+    let maximum_result_bytes = mutation.maximum_result_event_bytes();
+    let configured_result_fits = maximum_result_bytes <= driver.config.limits.max_tool_result_bytes
+        && driver
+            .counters
+            .tool_result_bytes
+            .checked_add(maximum_result_bytes)
+            .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes);
+    if !configured_result_fits {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::OutputBudgetExceeded,
+            ToolStop::None,
+        ));
+    }
+    match reservation
+        .reserve_claim_retained_json_bytes(&mut plan.result_claim, maximum_result_bytes)
+    {
+        Ok(()) => {}
+        Err(error) if is_budget_error(&error) => {
+            return Ok(decline_mutation(
+                mutation,
+                MutationDeclineReason::OutputBudgetExceeded,
+                ToolStop::None,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let mutation = if driver.config.file_change_policy == FileChangePolicy::Ask {
+        let approval_id = match next_id(driver.runtime, AgentIdKind::Approval) {
+            Ok(id) => ApprovalRequestId::new(id),
+            Err(_) => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+        };
+        let request = ApprovalRequest::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            plan.call.id.clone(),
+            mutation.prompt(),
+        );
+        let asked = NewEvent::log(EventKind::approval_asked(ApprovalAskedEvent::new(
+            approval_id.clone(),
+            plan.call.name.clone(),
+            Some(plan.call.id.clone()),
+            mutation.prompt().reason().map(str::to_owned),
+        )?));
+        // `allowed-once` is the longest current wire spelling, so this fallback
+        // protects enough bytes for every exact decision we may later rebind.
+        let decision_fallback = NewEvent::log(EventKind::approval_decided(
+            ApprovalDecidedEvent::new(approval_id.clone(), ApprovalOutcome::AllowedOnce)?,
+        ));
+        let mut audit_claims = match reservation.claim_batch([asked, decision_fallback]) {
+            Ok(claims) => claims,
+            Err(error) if is_budget_error(&error) => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalUnavailable,
+                    ToolStop::None,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut asked_claim = audit_claims.remove(0);
+        let mut decided_claim = audit_claims.remove(0);
+        reservation.settle_exact(&mut asked_claim)?;
+
+        let (outcome, stop) = request_approval(driver, request, cancellation).await;
+        reservation.rebind_claim_fallback(
+            &mut decided_claim,
+            NewEvent::log(EventKind::approval_decided(ApprovalDecidedEvent::new(
+                approval_id,
+                outcome,
+            )?)),
+        )?;
+        reservation.settle_exact(&mut decided_claim)?;
+
+        match outcome {
+            ApprovalOutcome::AllowedOnce if stop == ToolStop::None => mutation,
+            ApprovalOutcome::AllowedOnce | ApprovalOutcome::Cancelled => {
+                return Ok(decline_mutation(
+                    mutation,
+                    if stop == ToolStop::Cancelled {
+                        MutationDeclineReason::AbortedBeforeDispatch
+                    } else {
+                        MutationDeclineReason::ApprovalCancelled
+                    },
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Rejected => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalRejected,
+                    stop,
+                ));
+            }
+            ApprovalOutcome::Unavailable => {
+                return Ok(decline_mutation(
+                    mutation,
+                    MutationDeclineReason::ApprovalUnavailable,
+                    stop,
+                ));
+            }
+        }
+    } else {
+        mutation
+    };
+
+    commit_mutation(driver, mutation, cancellation).await
+}
+
+fn decline_mutation(
+    mutation: PreparedToolMutation,
+    reason: MutationDeclineReason,
+    stop: ToolStop,
+) -> ToolRun {
+    match mutation.decline(reason) {
+        Ok(result) => ToolRun::Completed {
+            result,
+            committed: false,
+            stop,
+        },
+        Err(_) => ToolRun::Infrastructure,
+    }
+}
+
+async fn request_approval(
+    driver: &Driver<'_>,
+    request: ApprovalRequest,
+    cancellation: &CancellationToken,
+) -> (ApprovalOutcome, ToolStop) {
+    if cancellation.is_cancelled() {
+        return (ApprovalOutcome::Cancelled, ToolStop::Cancelled);
+    }
+    if Instant::now() >= driver.deadline {
+        return (ApprovalOutcome::Cancelled, ToolStop::TurnTimeout);
+    }
+    let child = cancellation.child_token();
+    let future = match catch_unwind(AssertUnwindSafe(|| {
+        driver
+            .config
+            .approval_provider
+            .request(request, child.clone())
+    })) {
+        Ok(future) => future,
+        Err(_) => {
+            child.cancel();
+            return (ApprovalOutcome::Unavailable, ToolStop::None);
+        }
+    };
+    let guarded = AssertUnwindSafe(future).catch_unwind();
+    tokio::pin!(guarded);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            child.cancel();
+            let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
+            (ApprovalOutcome::Cancelled, ToolStop::Cancelled)
+        }
+        _ = tokio::time::sleep_until(driver.deadline) => {
+            child.cancel();
+            let _ = tokio::time::timeout(MAX_AGENT_TOOL_SHUTDOWN_GRACE, &mut guarded).await;
+            (ApprovalOutcome::Cancelled, ToolStop::TurnTimeout)
+        }
+        result = &mut guarded => {
+            if cancellation.is_cancelled() {
+                child.cancel();
+                (ApprovalOutcome::Cancelled, ToolStop::Cancelled)
+            } else if Instant::now() >= driver.deadline {
+                child.cancel();
+                (ApprovalOutcome::Cancelled, ToolStop::TurnTimeout)
+            } else {
+                match result {
+                    Ok(Ok(outcome)) => (outcome, ToolStop::None),
+                    Ok(Err(_)) | Err(_) => {
+                        child.cancel();
+                        (ApprovalOutcome::Unavailable, ToolStop::None)
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn commit_mutation(
+    driver: &Driver<'_>,
+    mutation: PreparedToolMutation,
+    cancellation: &CancellationToken,
+) -> Result<ToolRun, AgentLoopError> {
+    if cancellation.is_cancelled() {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::AbortedBeforeDispatch,
+            ToolStop::Cancelled,
+        ));
+    }
+    if Instant::now() >= driver.deadline {
+        return Ok(decline_mutation(
+            mutation,
+            MutationDeclineReason::AbortedBeforeDispatch,
+            ToolStop::TurnTimeout,
+        ));
+    }
+
+    let child = cancellation.child_token();
+    let job_child = child.clone();
+    let mut job = tokio::task::spawn_blocking(move || {
+        catch_unwind(AssertUnwindSafe(|| mutation.commit(job_child)))
+    });
+    let mut stop = ToolStop::None;
+    let mut tool_timeout_seen = false;
+    let tool_timeout = tokio::time::sleep(driver.config.limits.tool_duration);
+    tokio::pin!(tool_timeout);
+    let joined = loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                child.cancel();
+                stop = ToolStop::Cancelled;
+                break (&mut job).await;
+            }
+            _ = tokio::time::sleep_until(driver.deadline) => {
+                child.cancel();
+                stop = ToolStop::TurnTimeout;
+                break (&mut job).await;
+            }
+            _ = &mut tool_timeout, if !tool_timeout_seen => {
+                child.cancel();
+                tool_timeout_seen = true;
+            }
+            result = &mut job => break result,
+        }
+    };
+    let outcome = match joined {
+        Ok(Ok(Ok(outcome))) => outcome,
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+            child.cancel();
+            return Ok(ToolRun::Infrastructure);
+        }
+    };
+    let (disposition, result) = outcome.into_parts();
+    let result = if tool_timeout_seen
+        && stop == ToolStop::None
+        && disposition == ToolCommitDisposition::NotCommitted
+    {
+        let (_, _, _, meta, _) = result.into_parts();
+        ToolExecutionResult::new(
+            vec![ContentBlock::text(
+                "Error: file mutation exceeded its configured timeout before publication",
+            )?],
+            true,
+            Some(ToolFailure {
+                name: "TimeoutError".to_owned(),
+                code: "TOOL_TIMEOUT".to_owned(),
+            }),
+            meta,
+            false,
+        )?
+    } else {
+        result
+    };
+    Ok(ToolRun::Completed {
+        result,
+        committed: disposition == ToolCommitDisposition::Committed,
+        stop,
+    })
 }
 
 fn session_has_unresolved_tool_calls(session: &Session) -> bool {
@@ -1687,6 +2100,7 @@ fn settle_tool_result(
     driver: &mut Driver<'_>,
     plan: &mut PlannedTool,
     result: ToolExecutionResult,
+    committed: bool,
 ) -> Result<bool, AgentLoopError> {
     let (content, is_error, error, meta, _concludes_turn) = result.into_parts();
     let component_bytes = content
@@ -1710,7 +2124,7 @@ fn settle_tool_result(
                 .checked_add(size)
                 .is_some_and(|total| total <= driver.config.limits.max_tool_results_per_turn_bytes)
     });
-    if !component_fits {
+    if !committed && !component_fits {
         reservation.settle_exact(&mut plan.result_claim)?;
         return Ok(false);
     }
@@ -1721,6 +2135,7 @@ fn settle_tool_result(
         is_error,
     ) {
         Ok(message) => message,
+        Err(error) if committed => return Err(error.into()),
         Err(_) => {
             reservation.settle_exact(&mut plan.result_claim)?;
             return Ok(false);
@@ -1738,11 +2153,17 @@ fn settle_tool_result(
     );
     let size = match Session::event_retained_json_bytes(&preferred) {
         Ok(size) => size,
+        Err(error) if committed => return Err(error.into()),
         Err(_) => {
             reservation.settle_exact(&mut plan.result_claim)?;
             return Ok(false);
         }
     };
+    if committed {
+        reservation.settle_preferred_only(&mut plan.result_claim, preferred)?;
+        driver.counters.tool_result_bytes = driver.counters.tool_result_bytes.saturating_add(size);
+        return Ok(true);
+    }
     let inside_limits = size <= driver.config.limits.max_tool_result_bytes
         && driver
             .counters

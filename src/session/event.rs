@@ -75,6 +75,10 @@ string_id!(
     /// Correlates all scheduled waits in one provider-policy retry chain.
     RetryId
 );
+string_id!(
+    /// Correlates one approval question with its durable decision.
+    ApprovalRequestId
+);
 
 /// Zero-based event position within one session.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1101,6 +1105,143 @@ impl LlmRetryStartedEvent {
     }
 }
 
+/// One-shot answer to a durable approval question.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalOutcome {
+    AllowedOnce,
+    Rejected,
+    Cancelled,
+    Unavailable,
+}
+
+/// Durable fact that the Agent asked one bounded approval question.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalAskedEvent {
+    id: ApprovalRequestId,
+    tool_name: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    call_id: Option<CallId>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    reason: Option<String>,
+}
+
+impl ApprovalAskedEvent {
+    pub fn new(
+        id: ApprovalRequestId,
+        tool_name: impl Into<String>,
+        call_id: Option<CallId>,
+        reason: Option<String>,
+    ) -> Result<Self, EventValidationError> {
+        let value = Self {
+            id,
+            tool_name: tool_name.into(),
+            call_id,
+            reason,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &ApprovalRequestId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    #[must_use]
+    pub fn call_id(&self) -> Option<&CallId> {
+        self.call_id.as_ref()
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    fn validate(&self) -> Result<(), EventValidationError> {
+        validate_approval_id(&self.id)?;
+        if self.tool_name.is_empty()
+            || self.tool_name.len() > 256
+            || self.tool_name.chars().any(char::is_control)
+        {
+            return Err(EventValidationError::InvalidApprovalEvent(
+                "toolName must be 1 to 256 non-control UTF-8 bytes",
+            ));
+        }
+        if self.call_id.as_ref().is_some_and(|call_id| {
+            call_id.is_empty()
+                || call_id.as_str().len() > 1_024
+                || call_id.as_str().chars().any(char::is_control)
+        }) {
+            return Err(EventValidationError::InvalidApprovalEvent(
+                "callId must be 1 to 1024 non-control UTF-8 bytes when present",
+            ));
+        }
+        if self.reason.as_ref().is_some_and(|reason| {
+            reason.len() > 4 * 1_024
+                || reason
+                    .chars()
+                    .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        }) {
+            return Err(EventValidationError::InvalidApprovalEvent(
+                "reason must be at most 4096 UTF-8 bytes without unsafe controls",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Durable answer paired with one preceding approval request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalDecidedEvent {
+    id: ApprovalRequestId,
+    outcome: ApprovalOutcome,
+}
+
+impl ApprovalDecidedEvent {
+    pub fn new(
+        id: ApprovalRequestId,
+        outcome: ApprovalOutcome,
+    ) -> Result<Self, EventValidationError> {
+        validate_approval_id(&id)?;
+        Ok(Self { id, outcome })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &ApprovalRequestId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> ApprovalOutcome {
+        self.outcome
+    }
+}
+
+fn validate_approval_id(id: &ApprovalRequestId) -> Result<(), EventValidationError> {
+    if id.is_empty() || id.as_str().len() > 1_024 || id.as_str().chars().any(char::is_control) {
+        return Err(EventValidationError::InvalidApprovalEvent(
+            "approval id must be 1 to 1024 non-control UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
 /// A known core event payload or a retained unknown ignorable payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventKind {
@@ -1162,6 +1303,12 @@ pub enum EventKind {
     },
     LlmRetryStarted {
         started: LlmRetryStartedEvent,
+    },
+    ApprovalAsked {
+        asked: ApprovalAskedEvent,
+    },
+    ApprovalDecided {
+        decided: ApprovalDecidedEvent,
     },
     EndSeed,
     /// An unknown envelope retained only because `ignorable: true` made it safe to skip.
@@ -1259,6 +1406,16 @@ impl EventKind {
         Self::LlmRetryStarted { started }
     }
 
+    #[must_use]
+    pub fn approval_asked(asked: ApprovalAskedEvent) -> Self {
+        Self::ApprovalAsked { asked }
+    }
+
+    #[must_use]
+    pub fn approval_decided(decided: ApprovalDecidedEvent) -> Self {
+        Self::ApprovalDecided { decided }
+    }
+
     /// Stable wire tag for this event.
     #[must_use]
     pub fn event_type(&self) -> &str {
@@ -1277,6 +1434,8 @@ impl EventKind {
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
             Self::LlmRetryStarted { .. } => "llm/retry-started",
+            Self::ApprovalAsked { .. } => "approval/asked",
+            Self::ApprovalDecided { .. } => "approval/decided",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { event_type, .. } => event_type,
         }
@@ -1321,6 +1480,8 @@ impl EventKind {
                     "retryId must not be empty",
                 ));
             }
+            Self::ApprovalAsked { asked } => asked.validate()?,
+            Self::ApprovalDecided { decided } => validate_approval_id(&decided.id)?,
             // These values can only be created through their bounded, validated
             // constructors, so append has no second placeholder validation pass.
             Self::AssistantChunk { .. } | Self::Unknown { .. } => {}

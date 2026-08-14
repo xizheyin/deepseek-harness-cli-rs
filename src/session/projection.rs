@@ -8,7 +8,8 @@ use crate::{
 };
 
 use super::{
-    EventKind, EventSeq, MAX_SOURCE_EVENT_SEQS, SessionEvent, StepId, SurfaceOp, TurnId,
+    ApprovalRequestId, EventKind, EventSeq, MAX_SOURCE_EVENT_SEQS, SessionEvent, StepId, SurfaceOp,
+    TurnId,
     codec::event_data_value,
     error::{EventValidationError, SurfaceError, TransitionError},
     event::TOOL_NOT_STARTED,
@@ -35,6 +36,7 @@ pub struct SessionState {
     open_step: Option<StepId>,
     next_turn: TurnId,
     pending_calls: Vec<CallId>,
+    pending_approvals: Vec<ApprovalRequestId>,
     surface_nodes: Vec<EventSeq>,
     request_header: Option<super::EpochHeader>,
     request_context: Option<super::RequestContext>,
@@ -65,6 +67,12 @@ impl SessionState {
         &self.pending_calls
     }
 
+    /// Approval questions that have no matching durable decision yet.
+    #[must_use]
+    pub fn pending_approvals(&self) -> &[ApprovalRequestId] {
+        &self.pending_approvals
+    }
+
     /// Event sequences on the current model-visible surface.
     #[must_use]
     pub fn surface_nodes(&self) -> &[EventSeq] {
@@ -91,6 +99,7 @@ pub(crate) struct Projection {
     surface_nodes: Vec<EventSeq>,
     request_header: Option<super::EpochHeader>,
     request_context: Option<super::RequestContext>,
+    pending_approvals: Vec<ApprovalRequestId>,
 }
 
 impl Projection {
@@ -101,6 +110,7 @@ impl Projection {
             surface_nodes: Vec::new(),
             request_header: None,
             request_context: None,
+            pending_approvals: Vec::new(),
         }
     }
 
@@ -133,6 +143,7 @@ impl Projection {
             open_step,
             next_turn: self.next_turn,
             pending_calls,
+            pending_approvals: self.pending_approvals.clone(),
             surface_nodes: self.surface_nodes.clone(),
             request_header: self.request_header.clone(),
             request_context: self.request_context.clone(),
@@ -203,6 +214,12 @@ impl Projection {
                 if let Boundary::Step { step, .. } = self.boundary {
                     return Err(TransitionError::TurnEndWhileStepOpen { turn: *turn, step });
                 }
+                if let Some(approval_id) = self.pending_approvals.first() {
+                    return Err(TransitionError::ApprovalStillPending {
+                        event_type: "turn/end",
+                        approval_id: approval_id.clone(),
+                    });
+                }
                 self.next_turn = turn
                     .successor()
                     .ok_or(TransitionError::IdentifierExhausted)?;
@@ -257,6 +274,12 @@ impl Projection {
             },
             EventKind::StepEnd { turn, step } => {
                 self.require_open_step("step/end", *turn, *step)?;
+                if let Some(approval_id) = self.pending_approvals.first() {
+                    return Err(TransitionError::ApprovalStillPending {
+                        event_type: "step/end",
+                        approval_id: approval_id.clone(),
+                    });
+                }
                 let next_step = step
                     .successor()
                     .ok_or(TransitionError::IdentifierExhausted)?;
@@ -337,6 +360,46 @@ impl Projection {
             }
             EventKind::LlmRetryStarted { started } => {
                 self.validate_retry_started(started, committed_events)?;
+            }
+            EventKind::ApprovalAsked { asked } => {
+                if self.open_turn().is_none() {
+                    return Err(TransitionError::EventOutsideTurn {
+                        event_type: event.kind.event_type_static(),
+                    });
+                }
+                if self.pending_approvals.contains(asked.id()) {
+                    return Err(TransitionError::ApprovalIdAlreadyPending {
+                        approval_id: asked.id().clone(),
+                    });
+                }
+                if committed_events.iter().any(|event| {
+                    matches!(
+                        event.kind(),
+                        EventKind::ApprovalAsked { asked: prior } if prior.id() == asked.id()
+                    )
+                }) {
+                    return Err(TransitionError::ApprovalIdAlreadyOwned {
+                        approval_id: asked.id().clone(),
+                    });
+                }
+                self.pending_approvals.push(asked.id().clone());
+            }
+            EventKind::ApprovalDecided { decided } => {
+                if self.open_turn().is_none() {
+                    return Err(TransitionError::EventOutsideTurn {
+                        event_type: event.kind.event_type_static(),
+                    });
+                }
+                let Some(index) = self
+                    .pending_approvals
+                    .iter()
+                    .position(|pending| pending == decided.id())
+                else {
+                    return Err(TransitionError::ApprovalDecisionWithoutRequest {
+                        approval_id: decided.id().clone(),
+                    });
+                };
+                self.pending_approvals.remove(index);
             }
             EventKind::TodoWrite { .. } => {
                 if self.open_turn().is_none() {
@@ -630,6 +693,8 @@ impl EventKind {
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
             Self::LlmRetryStarted { .. } => "llm/retry-started",
+            Self::ApprovalAsked { .. } => "approval/asked",
+            Self::ApprovalDecided { .. } => "approval/decided",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { .. } => "unknown",
         }

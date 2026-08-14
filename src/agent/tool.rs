@@ -8,11 +8,197 @@ use crate::{
     session::ToolFailure,
 };
 
-use super::MAX_AGENT_TOOL_RESULT_BYTES;
+use super::{MAX_AGENT_TOOL_RESULT_BYTES, approval::ApprovalPrompt};
 
 /// Future returned by one tool implementation without spawning detached work.
 pub type ToolExecutionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolExecutionResult, ToolExecutorError>> + Send + 'a>>;
+
+/// Future returned by the side-effect-free tool preparation stage.
+pub type ToolPreparationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ToolPreparation, ToolExecutorError>> + Send + 'a>>;
+
+/// Result of preparing one durable tool call.
+pub enum ToolPreparation {
+    Complete(ToolExecutionResult),
+    Mutation(PreparedToolMutation),
+}
+
+impl std::fmt::Debug for ToolPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete(result) => formatter.debug_tuple("Complete").field(result).finish(),
+            Self::Mutation(mutation) => formatter.debug_tuple("Mutation").field(mutation).finish(),
+        }
+    }
+}
+
+/// Why a prepared mutation was closed without starting its commit capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationDeclineReason {
+    PolicyDenied,
+    ApprovalRejected,
+    ApprovalCancelled,
+    ApprovalUnavailable,
+    AbortedBeforeDispatch,
+    Aborted,
+    OutputBudgetExceeded,
+}
+
+/// Whether a completed commit changed the target's durable logical state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCommitDisposition {
+    NotCommitted,
+    Committed,
+}
+
+/// Truthful outcome returned by the single-use blocking commit capability.
+pub struct ToolCommitOutcome {
+    disposition: ToolCommitDisposition,
+    result: ToolExecutionResult,
+}
+
+impl std::fmt::Debug for ToolCommitOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolCommitOutcome")
+            .field("disposition", &self.disposition)
+            .field("result", &self.result)
+            .finish()
+    }
+}
+
+impl ToolCommitOutcome {
+    pub fn committed(result: ToolExecutionResult) -> Result<Self, ToolExecutorError> {
+        if committed_marker(&result) != Some(true) {
+            return Err(ToolExecutorError::new(
+                "a committed mutation result must retain committed=true metadata",
+            ));
+        }
+        Ok(Self {
+            disposition: ToolCommitDisposition::Committed,
+            result,
+        })
+    }
+
+    pub fn not_committed(result: ToolExecutionResult) -> Result<Self, ToolExecutorError> {
+        if !result.is_error() || committed_marker(&result) != Some(false) {
+            return Err(ToolExecutorError::new(
+                "a non-committed mutation must return an error result with committed=false metadata",
+            ));
+        }
+        Ok(Self {
+            disposition: ToolCommitDisposition::NotCommitted,
+            result,
+        })
+    }
+
+    #[must_use]
+    pub fn disposition(&self) -> ToolCommitDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub fn result(&self) -> &ToolExecutionResult {
+        &self.result
+    }
+
+    pub(crate) fn into_parts(self) -> (ToolCommitDisposition, ToolExecutionResult) {
+        (self.disposition, self.result)
+    }
+}
+
+pub type ToolDeclineFn = Box<
+    dyn FnOnce(MutationDeclineReason) -> Result<ToolExecutionResult, ToolExecutorError>
+        + Send
+        + 'static,
+>;
+pub type ToolCommitFn = Box<
+    dyn FnOnce(CancellationToken) -> Result<ToolCommitOutcome, ToolExecutorError> + Send + 'static,
+>;
+
+/// Fully owned, single-use file mutation returned only after read-only preparation.
+pub struct PreparedToolMutation {
+    prompt: ApprovalPrompt,
+    maximum_result_event_bytes: usize,
+    decline: ToolDeclineFn,
+    commit: ToolCommitFn,
+}
+
+impl std::fmt::Debug for PreparedToolMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedToolMutation")
+            .field("prompt", &self.prompt)
+            .field(
+                "maximum_result_event_bytes",
+                &self.maximum_result_event_bytes,
+            )
+            .field("single_use_commit", &true)
+            .finish()
+    }
+}
+
+impl PreparedToolMutation {
+    pub fn new(
+        prompt: ApprovalPrompt,
+        maximum_result_event_bytes: usize,
+        decline: ToolDeclineFn,
+        commit: ToolCommitFn,
+    ) -> Result<Self, ToolExecutorError> {
+        if maximum_result_event_bytes == 0
+            || maximum_result_event_bytes > super::MAX_AGENT_COMMITTED_TOOL_RESULT_EVENT_BYTES
+        {
+            return Err(ToolExecutorError::new(
+                "prepared mutation result bound is outside the supported range",
+            ));
+        }
+        Ok(Self {
+            prompt,
+            maximum_result_event_bytes,
+            decline,
+            commit,
+        })
+    }
+
+    #[must_use]
+    pub fn prompt(&self) -> &ApprovalPrompt {
+        &self.prompt
+    }
+
+    #[must_use]
+    pub fn maximum_result_event_bytes(&self) -> usize {
+        self.maximum_result_event_bytes
+    }
+
+    pub(crate) fn decline(
+        self,
+        reason: MutationDeclineReason,
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        let result = (self.decline)(reason)?;
+        if !result.is_error() || committed_marker(&result) != Some(false) {
+            return Err(ToolExecutorError::new(
+                "a declined mutation must return an error result with committed=false metadata",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn commit(
+        self,
+        cancellation: CancellationToken,
+    ) -> Result<ToolCommitOutcome, ToolExecutorError> {
+        (self.commit)(cancellation)
+    }
+}
+
+fn committed_marker(result: &ToolExecutionResult) -> Option<bool> {
+    result
+        .meta()
+        .and_then(|meta| meta.as_value().as_object())
+        .and_then(|fields| fields.get("committed"))
+        .and_then(serde_json::Value::as_bool)
+}
 
 /// Validated invocation presented only after its durable `tool/call` commits.
 pub struct ToolExecutionRequest {
@@ -223,7 +409,7 @@ impl ToolExecutorError {
     }
 }
 
-/// Minimal Phase 3 tool seam; policy, approval, and real registries arrive later.
+/// Trusted in-process tool seam used by ordinary and approval-gated tools.
 pub trait ToolExecutor: Send + Sync {
     /// Build and promptly return a lazy future. Implementations must not perform
     /// the actual tool side effect synchronously before the future is polled. Each
@@ -239,6 +425,20 @@ pub trait ToolExecutor: Send + Sync {
         request: ToolExecutionRequest,
         cancellation: CancellationToken,
     ) -> ToolExecutionFuture<'_>;
+
+    /// Prepare one call without performing a mutation. This synchronous factory
+    /// must return promptly. A `Mutation` must contain the complete read-only
+    /// preview and defer every write to its single-use commit capability. Legacy
+    /// trusted tools use the default adapter and complete through their existing
+    /// lazy executor.
+    fn prepare(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolPreparationFuture<'_> {
+        let execution = self.execute(request, cancellation);
+        Box::pin(async move { execution.await.map(ToolPreparation::Complete) })
+    }
 }
 
 /// Default executor for a loop that exposes no executable tools.
