@@ -1,0 +1,2020 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a"
+  },
+  "evidence": {
+    "sourcePaths": [
+      "packages/core/session/src/index.ts",
+      "packages/core/session/src/types.ts",
+      "packages/core/session/src/surface.ts",
+      "packages/core/session/src/repair.ts",
+      "packages/core/session/src/chunk-rows.ts",
+      "packages/core/session/src/known-event-types.ts",
+      "packages/compaction/compaction/src/types.ts",
+      "packages/compaction/compaction/src/invariant.ts",
+      "packages/compaction/compaction-basic/src/index.ts",
+      "packages/compaction/compaction-basic/src/region.ts",
+      "packages/compaction/compaction-basic/src/summarizer.ts",
+      "packages/compaction/compaction-tool-result-pruner/src/config.ts",
+      "packages/compaction/compaction-tool-result-pruner/src/index.ts",
+      "packages/compaction/compaction-tool-result-pruner/src/invariant.ts",
+      "packages/compaction/compaction-tool-result-pruner/src/types.ts",
+      "packages/llm/token-meter/src/index.ts",
+      "packages/llm/token-meter/src/estimate.ts",
+      "packages/llm/token-meter/src/surface-fold.ts",
+      "packages/llm/token-meter/src/surface-projection.ts",
+      "packages/llm/token-meter/src/usage-projection.ts",
+      "packages/llm/token-meter/src/breakdown-projection.ts",
+      "packages/session/session-persistence/src/coordinator.ts",
+      "packages/session/session-persistence-jsonl/src/format.ts",
+      "packages/session/session-persistence-jsonl/src/index.ts"
+    ],
+    "testPaths": [
+      "packages/core/session/tests/session.spec.ts",
+      "packages/core/session/tests/repair.spec.ts",
+      "packages/core/session/tests/invariant.spec.ts",
+      "packages/core/session/tests/surface.spec.ts",
+      "packages/compaction/compaction/tests/invariant.spec.ts",
+      "packages/compaction/compaction-basic/tests/compaction-basic.spec.ts",
+      "packages/compaction/compaction-basic/tests/manual-compaction.spec.ts",
+      "packages/compaction/compaction-tool-result-pruner/tests/tool-result-pruner.spec.ts",
+      "packages/llm/token-meter/tests/context-breakdown-projection.spec.ts",
+      "packages/llm/token-meter/tests/token-meter.spec.ts",
+      "packages/llm/token-meter/tests/token-usage-projection.spec.ts",
+      "packages/session/session-persistence/tests/contract.ts",
+      "packages/session/session-persistence/tests/coordinator-contract.ts",
+      "packages/session/session-persistence-jsonl/tests/jsonl.spec.ts"
+    ],
+    "executionModes": {
+      "longReasoning": "runtime upstream Session append plus lossless chunk-row encode/decode",
+      "compaction": "runtime BasicCompactionEngine transaction with a fixed fake summarizer",
+      "toolResultPrunerContent": "runtime ToolResultPruner config resolution, Unicode code-point measurement, and content transforms",
+      "toolResultPrunerSession": "runtime ToolResultPruner surface replacement under the real Session invariant registry",
+      "toolResultPrunerFailure": "source-derived runtime replacement-rejection probe; the cited official test asserts the rejection but not the orphan marker separately",
+      "tokenSurfaceProjection": "runtime foldSurfaceProjection over the emitted adjacent shadow-price/replacement pair and orphan recovery boundary",
+      "repair": "runtime interruptedTurnClosers plus Session replay",
+      "resume": "runtime Session seed/end-seed construction and continued append",
+      "jsonl": "runtime JSONL SessionLogScanner/scanLog over exact bytes",
+      "unknownEvents": "runtime PersistenceCoordinator over a deterministic in-memory storage seam"
+    }
+  },
+  "deterministic": {
+    "fixedTimeMs": 1700800000000,
+    "randomIds": "compaction UUID and generated checkpoint message id normalized by exact value",
+    "repeatedGenerationExpectation": "byte-identical output"
+  },
+  "safety": {
+    "networkAccess": "none",
+    "credentialAccess": "none",
+    "realModelCalls": "none; compaction uses a fixed fake summarizer",
+    "filesystemWrites": "explicit output path only"
+  },
+  "scope": {
+    "summarySemanticFaithfulness": "not claimed; the fake summary fixes transaction and replay behavior only",
+    "toolResultPrunerFailureCoverage": "the orphan compaction/prune fact is a source-derived runtime probe, not a separately asserted official crash test",
+    "jsonlDurabilityMechanics": "not claimed by this compact oracle; cited official JSONL tests cover fsync, rollback, and frame repair",
+    "rustCompatibility": "not claimed; default Rust comparisons must consume this fixture separately"
+  },
+  "scenarios": {
+    "longReasoningAndCompaction": {
+      "input": {
+        "completedTurns": 3,
+        "reasoningChunksPerTurn": 1400,
+        "totalReasoningChunks": 4200
+      },
+      "beforeCompaction": {
+        "eventCount": 4221,
+        "nextSeq": 4221,
+        "assistantChunkCount": 4200,
+        "eventSha256": "ea2720e44840c513450f77198c48342be267bc9d11ff7a33341ea461d33a44b5",
+        "assistantChunkSha256": "0a45d1d90f5ac4bb9471b1bce10ebbad025d58dc77770e6367861a1cc2d90354",
+        "assistantSourceRanges": [
+          {
+            "assistantSeq": 1404,
+            "sourceEventSeqCount": 1400,
+            "firstSourceEventSeq": 4,
+            "lastSourceEventSeq": 1403,
+            "sourceEventSeqSha256": "17defc6f26a1c49573a4fa5f5dde0e6cf1acd07589c70d8847ea8344672ba94e",
+            "contiguous": true
+          },
+          {
+            "assistantSeq": 2810,
+            "sourceEventSeqCount": 1400,
+            "firstSourceEventSeq": 1410,
+            "lastSourceEventSeq": 2809,
+            "sourceEventSeqSha256": "4b384dc9f7e56a2e43d8108f502176e58b75a90dd1e913038778ad93c6fa40e4",
+            "contiguous": true
+          },
+          {
+            "assistantSeq": 4216,
+            "sourceEventSeqCount": 1400,
+            "firstSourceEventSeq": 2816,
+            "lastSourceEventSeq": 4215,
+            "sourceEventSeqSha256": "1013e5c6f5b7a58b5f2b5eb999f8221345256d18b5e0b3e9dc3e9d57734fe307",
+            "contiguous": true
+          }
+        ],
+        "typeRuns": [
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          },
+          {
+            "type": "step/start",
+            "count": 1
+          },
+          {
+            "type": "request/header",
+            "count": 1
+          },
+          {
+            "type": "assistant/chunk",
+            "count": 1400
+          },
+          {
+            "type": "assistant/message",
+            "count": 1
+          },
+          {
+            "type": "step/end",
+            "count": 1
+          },
+          {
+            "type": "turn/end",
+            "count": 1
+          },
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          },
+          {
+            "type": "step/start",
+            "count": 1
+          },
+          {
+            "type": "assistant/chunk",
+            "count": 1400
+          },
+          {
+            "type": "assistant/message",
+            "count": 1
+          },
+          {
+            "type": "step/end",
+            "count": 1
+          },
+          {
+            "type": "turn/end",
+            "count": 1
+          },
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          },
+          {
+            "type": "step/start",
+            "count": 1
+          },
+          {
+            "type": "assistant/chunk",
+            "count": 1400
+          },
+          {
+            "type": "assistant/message",
+            "count": 1
+          },
+          {
+            "type": "step/end",
+            "count": 1
+          },
+          {
+            "type": "turn/end",
+            "count": 1
+          },
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          }
+        ],
+        "surfaceNodes": [
+          1,
+          1404,
+          1408,
+          2810,
+          2814,
+          4216,
+          4220
+        ],
+        "tokenMeasurement": {
+          "logRevision": 4221,
+          "baseline": {
+            "kind": "estimated",
+            "tokens": 1728
+          },
+          "surfaceDeltaTokens": 22,
+          "totalTokens": 1750,
+          "surfaceTokens": 1738,
+          "nodes": [
+            {
+              "seq": 1,
+              "tokens": 108
+            },
+            {
+              "seq": 1404,
+              "tokens": 464
+            },
+            {
+              "seq": 1408,
+              "tokens": 108
+            },
+            {
+              "seq": 2810,
+              "tokens": 464
+            },
+            {
+              "seq": 2814,
+              "tokens": 108
+            },
+            {
+              "seq": 4216,
+              "tokens": 464
+            },
+            {
+              "seq": 4220,
+              "tokens": 22
+            }
+          ]
+        },
+        "modelMessages": [
+          {
+            "id": "message-user-1",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 398,
+                "sha256": "5d3d5185cbaf7a654ba9680c4ffe814cb207c31cb1de7c6779ae842dc1b5db5f",
+                "text": "turn 1 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-1",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "reasoning",
+                "chars": 1400,
+                "sha256": "79970398dd0b32545ec87f5592d5cef01e60a65f7cc1c5674353ff4edc36c03e",
+                "prefix": "bcdefghijklmnopqrstuvwxyzabcdefg",
+                "suffix": "rstuvwxyzabcdefghijklmnopqrstuvw"
+              },
+              {
+                "type": "text",
+                "chars": 408,
+                "sha256": "116bb65f3abc4dd952421869b95ff289b4a94e1cb1d6b9ede1fb7013ac102162",
+                "text": "answer 1: turn 1 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-user-2",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 398,
+                "sha256": "911cc517f80b66c1b52bdf05dd7d519c973d9b57de734c35bf0b373046ed6224",
+                "text": "turn 2 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-2",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "reasoning",
+                "chars": 1400,
+                "sha256": "0b33522d292bf67c22e60f66b02b85bd756d53d2b2eb2081e6165417befea5f8",
+                "prefix": "cdefghijklmnopqrstuvwxyzabcdefgh",
+                "suffix": "stuvwxyzabcdefghijklmnopqrstuvwx"
+              },
+              {
+                "type": "text",
+                "chars": 408,
+                "sha256": "8db193f7ea8289bbe0fd371cc5c34cdc0c32789d70430fd8796fee5d83775afa",
+                "text": "answer 2: turn 2 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-user-3",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 398,
+                "sha256": "2a1c681d8329d9de27a1fbbb24eb4f69e0094a6ae2c6b61b52bc3c47f423896d",
+                "text": "turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-3",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "reasoning",
+                "chars": 1400,
+                "sha256": "cc42502c2981fdb2c91111a5ce437991d8883f6210ff3aaa1a0fcd4f59ac2bfb",
+                "prefix": "defghijklmnopqrstuvwxyzabcdefghi",
+                "suffix": "tuvwxyzabcdefghijklmnopqrstuvwxy"
+              },
+              {
+                "type": "text",
+                "chars": 408,
+                "sha256": "e66e4fae899f45a516737fa3b0f60c6b66f28c5af0b0ca0eade7b1f33aed3244",
+                "text": "answer 3: turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-user-continue",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 56,
+                "sha256": "2c72dbdd1c674ebd9be0f59c85bd1626a1f5d72a44e166d1828908dc1f63a022",
+                "text": "Continue after compacting the old reasoning-heavy turns."
+              }
+            ]
+          }
+        ]
+      },
+      "packedStorage": {
+        "batching": "the complete pre-compaction log was supplied as one encoder batch; real write-behind batch boundaries may split runs",
+        "physicalRowCount": 24,
+        "logicalEventCount": 4221,
+        "reasoningChunkRows": 3,
+        "physicalTypeRuns": [
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          },
+          {
+            "type": "step/start",
+            "count": 1
+          },
+          {
+            "type": "request/header",
+            "count": 1
+          },
+          {
+            "type": "reasoning-chunks",
+            "count": 1
+          },
+          {
+            "type": "assistant/message",
+            "count": 1
+          },
+          {
+            "type": "step/end",
+            "count": 1
+          },
+          {
+            "type": "turn/end",
+            "count": 1
+          },
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          },
+          {
+            "type": "step/start",
+            "count": 1
+          },
+          {
+            "type": "reasoning-chunks",
+            "count": 1
+          },
+          {
+            "type": "assistant/message",
+            "count": 1
+          },
+          {
+            "type": "step/end",
+            "count": 1
+          },
+          {
+            "type": "turn/end",
+            "count": 1
+          },
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          },
+          {
+            "type": "step/start",
+            "count": 1
+          },
+          {
+            "type": "reasoning-chunks",
+            "count": 1
+          },
+          {
+            "type": "assistant/message",
+            "count": 1
+          },
+          {
+            "type": "step/end",
+            "count": 1
+          },
+          {
+            "type": "turn/end",
+            "count": 1
+          },
+          {
+            "type": "turn/start",
+            "count": 1
+          },
+          {
+            "type": "user/message",
+            "count": 1
+          }
+        ],
+        "decodedEventSha256": "ea2720e44840c513450f77198c48342be267bc9d11ff7a33341ea461d33a44b5"
+      },
+      "compaction": {
+        "result": {
+          "compactionId": "compaction-oracle-1",
+          "startSeq": 4221,
+          "summarySeq": 4222,
+          "summary": [
+            {
+              "type": "text",
+              "text": "## Primary Request and Intent\n- Continue the deterministic oracle task.\n\n## Current Work\n- Long reasoning history was preserved.\n\n## Next Step\n- Continue after the checkpoint."
+            }
+          ],
+          "shadowedRange": {
+            "start": 1,
+            "end": 2810
+          },
+          "shadowedSeqs": [
+            1,
+            1404,
+            1408,
+            2810
+          ],
+          "shadowedTokenCount": 1144,
+          "endSeq": 4224
+        },
+        "appendedEvents": [
+          {
+            "type": "compaction/start",
+            "seq": 4221,
+            "time": 1700800000000,
+            "data": {
+              "compactionId": "compaction-oracle-1",
+              "turn": 4
+            }
+          },
+          {
+            "type": "compaction/summary",
+            "seq": 4222,
+            "time": 1700800000000,
+            "data": {
+              "compactionId": "compaction-oracle-1",
+              "summary": [
+                {
+                  "type": "text",
+                  "text": "## Primary Request and Intent\n- Continue the deterministic oracle task.\n\n## Current Work\n- Long reasoning history was preserved.\n\n## Next Step\n- Continue after the checkpoint."
+                }
+              ],
+              "rawOutput": [
+                {
+                  "type": "reasoning",
+                  "text": "fixed private summary reasoning"
+                },
+                {
+                  "type": "text",
+                  "text": "fixed raw summary text"
+                }
+              ],
+              "shadowedRange": {
+                "start": 1,
+                "end": 2810
+              },
+              "shadowedSeqs": [
+                1,
+                1404,
+                1408,
+                2810
+              ],
+              "shadowedTokenCount": 1144,
+              "provider": "oracle-summary-provider",
+              "model": "oracle-summary-model",
+              "maxTokens": 256,
+              "usage": {
+                "inputTokens": 80,
+                "outputTokens": 40,
+                "reasoningTokens": 8
+              }
+            }
+          },
+          {
+            "type": "user/message",
+            "seq": 4223,
+            "time": 1700800000000,
+            "data": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>"
+                },
+                {
+                  "type": "text",
+                  "text": "## Primary Request and Intent\n- Continue the deterministic oracle task.\n\n## Current Work\n- Long reasoning history was preserved.\n\n## Next Step\n- Continue after the checkpoint."
+                },
+                {
+                  "type": "text",
+                  "text": "</compacted-summary>"
+                }
+              ],
+              "source": {
+                "kind": "plugin",
+                "plugin": "compact",
+                "compactionId": "compaction-oracle-1"
+              },
+              "role": "user",
+              "id": "message-compaction-checkpoint-1"
+            },
+            "sourceEventSeqs": [
+              4221,
+              4222,
+              1,
+              1404,
+              1408,
+              2810
+            ],
+            "surfaceOp": {
+              "op": "replace",
+              "start": 1,
+              "end": 2810
+            }
+          },
+          {
+            "type": "compaction/end",
+            "seq": 4224,
+            "time": 1700800000000,
+            "data": {
+              "compactionId": "compaction-oracle-1",
+              "turn": 4
+            }
+          }
+        ],
+        "eventCountAfter": 4225,
+        "eventCountDelta": 4,
+        "assistantChunkCountAfter": 4200,
+        "assistantChunkSha256After": "0a45d1d90f5ac4bb9471b1bce10ebbad025d58dc77770e6367861a1cc2d90354",
+        "surfaceNodesAfter": [
+          4223,
+          2814,
+          4216,
+          4220
+        ],
+        "tokenMeasurementAfter": {
+          "logRevision": 4225,
+          "baseline": {
+            "kind": "estimated",
+            "tokens": 1728
+          },
+          "surfaceDeltaTokens": -976,
+          "totalTokens": 752,
+          "surfaceTokens": 740,
+          "nodes": [
+            {
+              "seq": 4223,
+              "tokens": 146
+            },
+            {
+              "seq": 2814,
+              "tokens": 108
+            },
+            {
+              "seq": 4216,
+              "tokens": 464
+            },
+            {
+              "seq": 4220,
+              "tokens": 22
+            }
+          ]
+        },
+        "modelMessagesAfter": [
+          {
+            "id": "message-compaction-checkpoint-1",
+            "role": "user",
+            "source": {
+              "kind": "plugin",
+              "plugin": "compact",
+              "compactionId": "compaction-oracle-1"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 321,
+                "sha256": "27348a6b6c1246ea9f86d69f07de9fb7301f168e48166e1638c51f6c5cbbd802",
+                "text": "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>"
+              },
+              {
+                "type": "text",
+                "chars": 175,
+                "sha256": "d55bd0717915eda5a6fc1bc1d8bb49882b047c464002ce59c2c0e4b9f3f44d8e",
+                "text": "## Primary Request and Intent\n- Continue the deterministic oracle task.\n\n## Current Work\n- Long reasoning history was preserved.\n\n## Next Step\n- Continue after the checkpoint."
+              },
+              {
+                "type": "text",
+                "chars": 20,
+                "sha256": "4b73d05ca5bd5694ee97bbc4be484a7afa073c0384e0a886327745d78f3fce94",
+                "text": "</compacted-summary>"
+              }
+            ]
+          },
+          {
+            "id": "message-user-3",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 398,
+                "sha256": "2a1c681d8329d9de27a1fbbb24eb4f69e0094a6ae2c6b61b52bc3c47f423896d",
+                "text": "turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-3",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "reasoning",
+                "chars": 1400,
+                "sha256": "cc42502c2981fdb2c91111a5ce437991d8883f6210ff3aaa1a0fcd4f59ac2bfb",
+                "prefix": "defghijklmnopqrstuvwxyzabcdefghi",
+                "suffix": "tuvwxyzabcdefghijklmnopqrstuvwxy"
+              },
+              {
+                "type": "text",
+                "chars": 408,
+                "sha256": "e66e4fae899f45a516737fa3b0f60c6b66f28c5af0b0ca0eade7b1f33aed3244",
+                "text": "answer 3: turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-user-continue",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 56,
+                "sha256": "2c72dbdd1c674ebd9be0f59c85bd1626a1f5d72a44e166d1828908dc1f63a022",
+                "text": "Continue after compacting the old reasoning-heavy turns."
+              }
+            ]
+          }
+        ],
+        "summarizationInput": {
+          "system": "Phase 8 deterministic oracle.",
+          "messages": [
+            {
+              "id": "message-user-1",
+              "role": "user",
+              "source": {
+                "kind": "user"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "chars": 398,
+                  "sha256": "5d3d5185cbaf7a654ba9680c4ffe814cb207c31cb1de7c6779ae842dc1b5db5f",
+                  "text": "turn 1 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+                }
+              ]
+            },
+            {
+              "id": "message-assistant-1",
+              "role": "assistant",
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock-model"
+              },
+              "content": [
+                {
+                  "type": "reasoning",
+                  "chars": 1400,
+                  "sha256": "79970398dd0b32545ec87f5592d5cef01e60a65f7cc1c5674353ff4edc36c03e",
+                  "prefix": "bcdefghijklmnopqrstuvwxyzabcdefg",
+                  "suffix": "rstuvwxyzabcdefghijklmnopqrstuvw"
+                },
+                {
+                  "type": "text",
+                  "chars": 408,
+                  "sha256": "116bb65f3abc4dd952421869b95ff289b4a94e1cb1d6b9ede1fb7013ac102162",
+                  "text": "answer 1: turn 1 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+                }
+              ]
+            },
+            {
+              "id": "message-user-2",
+              "role": "user",
+              "source": {
+                "kind": "user"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "chars": 398,
+                  "sha256": "911cc517f80b66c1b52bdf05dd7d519c973d9b57de734c35bf0b373046ed6224",
+                  "text": "turn 2 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+                }
+              ]
+            },
+            {
+              "id": "message-assistant-2",
+              "role": "assistant",
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock-model"
+              },
+              "content": [
+                {
+                  "type": "reasoning",
+                  "chars": 1400,
+                  "sha256": "0b33522d292bf67c22e60f66b02b85bd756d53d2b2eb2081e6165417befea5f8",
+                  "prefix": "cdefghijklmnopqrstuvwxyzabcdefgh",
+                  "suffix": "stuvwxyzabcdefghijklmnopqrstuvwx"
+                },
+                {
+                  "type": "text",
+                  "chars": 408,
+                  "sha256": "8db193f7ea8289bbe0fd371cc5c34cdc0c32789d70430fd8796fee5d83775afa",
+                  "text": "answer 2: turn 2 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "continuation": {
+        "finalEventCount": 4230,
+        "nextSeq": 4230,
+        "eventsAfterCompaction": [
+          {
+            "seq": 4225,
+            "type": "step/start"
+          },
+          {
+            "seq": 4226,
+            "type": "assistant/chunk"
+          },
+          {
+            "seq": 4227,
+            "type": "assistant/message"
+          },
+          {
+            "seq": 4228,
+            "type": "step/end"
+          },
+          {
+            "seq": 4229,
+            "type": "turn/end"
+          }
+        ],
+        "finalSurfaceNodes": [
+          4223,
+          2814,
+          4216,
+          4220,
+          4227
+        ],
+        "finalModelMessages": [
+          {
+            "id": "message-compaction-checkpoint-1",
+            "role": "user",
+            "source": {
+              "kind": "plugin",
+              "plugin": "compact",
+              "compactionId": "compaction-oracle-1"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 321,
+                "sha256": "27348a6b6c1246ea9f86d69f07de9fb7301f168e48166e1638c51f6c5cbbd802",
+                "text": "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>"
+              },
+              {
+                "type": "text",
+                "chars": 175,
+                "sha256": "d55bd0717915eda5a6fc1bc1d8bb49882b047c464002ce59c2c0e4b9f3f44d8e",
+                "text": "## Primary Request and Intent\n- Continue the deterministic oracle task.\n\n## Current Work\n- Long reasoning history was preserved.\n\n## Next Step\n- Continue after the checkpoint."
+              },
+              {
+                "type": "text",
+                "chars": 20,
+                "sha256": "4b73d05ca5bd5694ee97bbc4be484a7afa073c0384e0a886327745d78f3fce94",
+                "text": "</compacted-summary>"
+              }
+            ]
+          },
+          {
+            "id": "message-user-3",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 398,
+                "sha256": "2a1c681d8329d9de27a1fbbb24eb4f69e0094a6ae2c6b61b52bc3c47f423896d",
+                "text": "turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-3",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "reasoning",
+                "chars": 1400,
+                "sha256": "cc42502c2981fdb2c91111a5ce437991d8883f6210ff3aaa1a0fcd4f59ac2bfb",
+                "prefix": "defghijklmnopqrstuvwxyzabcdefghi",
+                "suffix": "tuvwxyzabcdefghijklmnopqrstuvwxy"
+              },
+              {
+                "type": "text",
+                "chars": 408,
+                "sha256": "e66e4fae899f45a516737fa3b0f60c6b66f28c5af0b0ca0eade7b1f33aed3244",
+                "text": "answer 3: turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-user-continue",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 56,
+                "sha256": "2c72dbdd1c674ebd9be0f59c85bd1626a1f5d72a44e166d1828908dc1f63a022",
+                "text": "Continue after compacting the old reasoning-heavy turns."
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-continue",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 26,
+                "sha256": "5679f58c80f68f762fcdc7912a9f2d18d37290d66cca4b2366d6694fa1155f6a",
+                "text": "continued after compaction"
+              }
+            ]
+          }
+        ],
+        "replayFirstLiveSeq": 4230,
+        "replayModelMessages": [
+          {
+            "id": "message-compaction-checkpoint-1",
+            "role": "user",
+            "source": {
+              "kind": "plugin",
+              "plugin": "compact",
+              "compactionId": "compaction-oracle-1"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 321,
+                "sha256": "27348a6b6c1246ea9f86d69f07de9fb7301f168e48166e1638c51f6c5cbbd802",
+                "text": "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>"
+              },
+              {
+                "type": "text",
+                "chars": 175,
+                "sha256": "d55bd0717915eda5a6fc1bc1d8bb49882b047c464002ce59c2c0e4b9f3f44d8e",
+                "text": "## Primary Request and Intent\n- Continue the deterministic oracle task.\n\n## Current Work\n- Long reasoning history was preserved.\n\n## Next Step\n- Continue after the checkpoint."
+              },
+              {
+                "type": "text",
+                "chars": 20,
+                "sha256": "4b73d05ca5bd5694ee97bbc4be484a7afa073c0384e0a886327745d78f3fce94",
+                "text": "</compacted-summary>"
+              }
+            ]
+          },
+          {
+            "id": "message-user-3",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 398,
+                "sha256": "2a1c681d8329d9de27a1fbbb24eb4f69e0094a6ae2c6b61b52bc3c47f423896d",
+                "text": "turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-3",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "reasoning",
+                "chars": 1400,
+                "sha256": "cc42502c2981fdb2c91111a5ce437991d8883f6210ff3aaa1a0fcd4f59ac2bfb",
+                "prefix": "defghijklmnopqrstuvwxyzabcdefghi",
+                "suffix": "tuvwxyzabcdefghijklmnopqrstuvwxy"
+              },
+              {
+                "type": "text",
+                "chars": 408,
+                "sha256": "e66e4fae899f45a516737fa3b0f60c6b66f28c5af0b0ca0eade7b1f33aed3244",
+                "text": "answer 3: turn 3 history context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context context"
+              }
+            ]
+          },
+          {
+            "id": "message-user-continue",
+            "role": "user",
+            "source": {
+              "kind": "user"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 56,
+                "sha256": "2c72dbdd1c674ebd9be0f59c85bd1626a1f5d72a44e166d1828908dc1f63a022",
+                "text": "Continue after compacting the old reasoning-heavy turns."
+              }
+            ]
+          },
+          {
+            "id": "message-assistant-continue",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "text",
+                "chars": 26,
+                "sha256": "5679f58c80f68f762fcdc7912a9f2d18d37290d66cca4b2366d6694fa1155f6a",
+                "text": "continued after compaction"
+              }
+            ]
+          }
+        ]
+      },
+      "checks": {
+        "exceeded4096AndContinued": true,
+        "globallyContiguous": true,
+        "compactionAddedExactlyFourEvents": true,
+        "exactCompactionOrder": true,
+        "oldPrefixUnchanged": true,
+        "oldChunksPreserved": true,
+        "everyAssistantAnchorCitesItsWholeChunkRun": true,
+        "currentSurfaceShrank": true,
+        "currentTokenPressureShrank": true,
+        "packedRowsDecodeExactly": true,
+        "packedPhysicalRowsFewerThanLogicalEvents": true,
+        "replayDerivesSameMessages": true,
+        "continuedTurnClosed": true
+      }
+    },
+    "toolResultPruner": {
+      "configAndContent": {
+        "defaults": {
+          "thresholdChars": 8192,
+          "headChars": 4096,
+          "tailChars": 1024
+        },
+        "activeConfig": {
+          "thresholdChars": 50,
+          "headChars": 4,
+          "tailChars": 3
+        },
+        "marker": {
+          "text": "\n\n[... tool result middle pruned ...]\n\n",
+          "codePoints": 39
+        },
+        "defaultTriggeredOutputCodePoints": 5159,
+        "invalidConfig": {
+          "outputBudget": {
+            "name": "Error",
+            "message": "ToolResultPruneConfig: headChars + marker + tailChars (79) must be at most thresholdChars (50)"
+          },
+          "staleKey": {
+            "name": "Error",
+            "message": "ToolResultPruneConfig: unknown key \"threshold\" (allowed: thresholdChars, headChars, tailChars)"
+          }
+        },
+        "exactThreshold": {
+          "inputCodePoints": 50,
+          "output": null
+        },
+        "unicode": {
+          "inputCodePoints": 60,
+          "outputCodePoints": 46,
+          "output": [
+            {
+              "type": "text",
+              "chars": 46,
+              "sha256": "78127ed469a1882020beb4b2f03bc10a6ddbdcd28da463d0bbd8138fd8672d66",
+              "text": "😀😀😀😀\n\n[... tool result middle pruned ...]\n\n😀😀😀"
+            }
+          ]
+        },
+        "richBlocks": {
+          "inputTextCodePoints": 100,
+          "outputTextCodePoints": 46,
+          "output": [
+            {
+              "type": "text",
+              "chars": 43,
+              "sha256": "f5d3c3261d9aa9ed59cdeb884145370bdae48a6d9b43357c0a61fc3eaf52c695",
+              "text": "AAAA\n\n[... tool result middle pruned ...]\n\n"
+            },
+            {
+              "type": "reasoning",
+              "chars": 18,
+              "sha256": "f66936d0c8c4f451278a584bb54afb8f7b40a08385a5a5d2a93d16acb1b3e5cf",
+              "text": "private-rich-block"
+            },
+            {
+              "type": "tool-call",
+              "id": "call-pruner-nested",
+              "name": "nested",
+              "arguments": "{}"
+            },
+            {
+              "type": "text",
+              "chars": 3,
+              "sha256": "530d4d8f3409f8771a2e30e879cc2f59b898cfc78931c8657ef9d23f8b1c91a3",
+              "text": "CCC"
+            }
+          ]
+        }
+      },
+      "sessionPair": {
+        "before": {
+          "eventCount": 8,
+          "surfaceNodes": [
+            2,
+            4
+          ],
+          "tokenMeasurement": {
+            "logRevision": 8,
+            "baseline": {
+              "kind": "estimated",
+              "tokens": 10
+            },
+            "surfaceDeltaTokens": 37,
+            "totalTokens": 47,
+            "surfaceTokens": 47,
+            "nodes": [
+              {
+                "seq": 2,
+                "tokens": 10
+              },
+              {
+                "seq": 4,
+                "tokens": 37
+              }
+            ]
+          },
+          "modelMessages": [
+            {
+              "id": "message-assistant-pruner-success",
+              "role": "assistant",
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock-model"
+              },
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-pruner-success",
+                  "name": "bash",
+                  "arguments": "{}"
+                }
+              ]
+            },
+            {
+              "id": "message-tool-result-pruner-success",
+              "role": "user",
+              "source": {
+                "kind": "tool",
+                "callId": "call-pruner-success"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-pruner-success",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                    }
+                  ],
+                  "isError": true
+                }
+              ]
+            }
+          ],
+          "originalEvent": {
+            "type": "tool/result",
+            "seq": 4,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "id": "message-tool-result-pruner-success",
+                "role": "user",
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-pruner-success"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-pruner-success",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      }
+                    ],
+                    "isError": true
+                  }
+                ]
+              },
+              "isError": true,
+              "error": {
+                "name": "ExitError",
+                "code": "EXIT_1"
+              },
+              "meta": {
+                "diff": [
+                  "a",
+                  "b"
+                ]
+              },
+              "futureField": {
+                "nested": true
+              }
+            },
+            "surfaceOp": "append"
+          }
+        },
+        "result": {
+          "pruned": [
+            {
+              "originalSeq": 4,
+              "replacementSeq": 9,
+              "callId": "call-pruner-success",
+              "charsBefore": 100,
+              "charsAfter": 46
+            }
+          ],
+          "charsRemoved": 54
+        },
+        "appendedEvents": [
+          {
+            "type": "compaction/prune",
+            "seq": 8,
+            "time": 1700800000000,
+            "data": {
+              "shadowedRange": {
+                "start": 4,
+                "end": 4
+              },
+              "shadowedSeqs": [
+                4
+              ],
+              "shadowedTokenCount": 37
+            }
+          },
+          {
+            "type": "tool/result",
+            "seq": 9,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "id": "message-tool-result-pruner-success",
+                "role": "user",
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-pruner-success"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-pruner-success",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "xxxx\n\n[... tool result middle pruned ...]\n\nxxx"
+                      }
+                    ],
+                    "isError": true
+                  }
+                ]
+              },
+              "isError": true,
+              "error": {
+                "name": "ExitError",
+                "code": "EXIT_1"
+              },
+              "meta": {
+                "diff": [
+                  "a",
+                  "b"
+                ]
+              },
+              "futureField": {
+                "nested": true
+              }
+            },
+            "sourceEventSeqs": [
+              4
+            ],
+            "surfaceOp": {
+              "op": "replace",
+              "start": 4,
+              "end": 4
+            }
+          }
+        ],
+        "after": {
+          "eventCount": 10,
+          "surfaceNodes": [
+            2,
+            9
+          ],
+          "replaceGeneration": 1,
+          "tokenMeasurement": {
+            "logRevision": 10,
+            "baseline": {
+              "kind": "estimated",
+              "tokens": 10
+            },
+            "surfaceDeltaTokens": 24,
+            "totalTokens": 34,
+            "surfaceTokens": 34,
+            "nodes": [
+              {
+                "seq": 2,
+                "tokens": 10
+              },
+              {
+                "seq": 9,
+                "tokens": 24
+              }
+            ]
+          },
+          "modelMessages": [
+            {
+              "id": "message-assistant-pruner-success",
+              "role": "assistant",
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock-model"
+              },
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-pruner-success",
+                  "name": "bash",
+                  "arguments": "{}"
+                }
+              ]
+            },
+            {
+              "id": "message-tool-result-pruner-success",
+              "role": "user",
+              "source": {
+                "kind": "tool",
+                "callId": "call-pruner-success"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-pruner-success",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "xxxx\n\n[... tool result middle pruned ...]\n\nxxx"
+                    }
+                  ],
+                  "isError": true
+                }
+              ]
+            }
+          ],
+          "originalEvent": {
+            "type": "tool/result",
+            "seq": 4,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "id": "message-tool-result-pruner-success",
+                "role": "user",
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-pruner-success"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-pruner-success",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      }
+                    ],
+                    "isError": true
+                  }
+                ]
+              },
+              "isError": true,
+              "error": {
+                "name": "ExitError",
+                "code": "EXIT_1"
+              },
+              "meta": {
+                "diff": [
+                  "a",
+                  "b"
+                ]
+              },
+              "futureField": {
+                "nested": true
+              }
+            },
+            "surfaceOp": "append"
+          }
+        },
+        "tokenSurfaceProjection": {
+          "armed": {
+            "deltaTokens": 0,
+            "claim": {
+              "start": 4,
+              "end": 4,
+              "tokens": 37
+            }
+          },
+          "consumed": {
+            "deltaTokens": -13
+          },
+          "expectedReplacementDelta": -13
+        },
+        "replay": {
+          "firstLiveSeq": 10,
+          "surfaceNodes": [
+            2,
+            9
+          ],
+          "modelMessages": [
+            {
+              "id": "message-assistant-pruner-success",
+              "role": "assistant",
+              "source": {
+                "kind": "model",
+                "provider": "mock",
+                "model": "mock-model"
+              },
+              "content": [
+                {
+                  "type": "tool-call",
+                  "id": "call-pruner-success",
+                  "name": "bash",
+                  "arguments": "{}"
+                }
+              ]
+            },
+            {
+              "id": "message-tool-result-pruner-success",
+              "role": "user",
+              "source": {
+                "kind": "tool",
+                "callId": "call-pruner-success"
+              },
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "call-pruner-success",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "xxxx\n\n[... tool result middle pruned ...]\n\nxxx"
+                    }
+                  ],
+                  "isError": true
+                }
+              ]
+            }
+          ]
+        },
+        "secondPass": {
+          "pruned": [],
+          "charsRemoved": 0
+        }
+      },
+      "sourceDerivedReplacementFailure": {
+        "classification": "source-derived-runtime-probe",
+        "officialTestPath": "packages/compaction/compaction-tool-result-pruner/tests/tool-result-pruner.spec.ts",
+        "officialTestScope": "the official test asserts rejection outside an open turn but does not separately assert the already-appended orphan compaction/prune marker",
+        "officialTestSeparatelyAssertsOrphanMarker": false,
+        "error": {
+          "name": "InvariantError",
+          "message": "invariant violated by \"@deepseek-ai/dsh-session\": tool/result surface replacement appended outside any open turn"
+        },
+        "eventCountBefore": 7,
+        "appendedEvents": [
+          {
+            "type": "compaction/prune",
+            "seq": 7,
+            "time": 1700800000000,
+            "data": {
+              "shadowedRange": {
+                "start": 4,
+                "end": 4
+              },
+              "shadowedSeqs": [
+                4
+              ],
+              "shadowedTokenCount": 37
+            }
+          }
+        ],
+        "surfaceNodesBefore": [
+          2,
+          4
+        ],
+        "surfaceNodesAfter": [
+          2,
+          4
+        ],
+        "replaceGenerationAfter": 0,
+        "syntheticRepairClosers": [],
+        "replay": {
+          "firstLiveSeq": 8,
+          "finalEvent": {
+            "type": "session/end-seed",
+            "seq": 8,
+            "time": 1700800000000,
+            "data": {}
+          },
+          "surfaceNodes": [
+            2,
+            4
+          ]
+        },
+        "tokenSurfaceProjection": {
+          "armedByOrphan": {
+            "deltaTokens": 0,
+            "claim": {
+              "start": 4,
+              "end": 4,
+              "tokens": 37
+            }
+          },
+          "expiredByRecoveryBoundary": {
+            "deltaTokens": 0
+          }
+        }
+      },
+      "checks": {
+        "defaultsExact": true,
+        "configsAreFrozen": true,
+        "markerHasThirtyNineCodePoints": true,
+        "defaultReplacementHas5159TextCodePoints": true,
+        "invalidBudgetRejected": true,
+        "staleConfigRejected": true,
+        "exactThresholdIsNoOp": true,
+        "unicodeCountsCodePoints": true,
+        "unicodeHeadMarkerTailExact": true,
+        "richBlocksPreserveRelativeOrder": true,
+        "pairIsAdjacentAndOrdered": true,
+        "resultCitesExactPair": true,
+        "shadowPriceCitesOriginal": true,
+        "replacementCitesOriginal": true,
+        "replacementChangesOnlyContent": true,
+        "originalFullEventRetained": true,
+        "surfaceReplacedSingleNode": true,
+        "tokenSurfaceShrank": true,
+        "adjacentShadowPriceProjectionConsumed": true,
+        "replayDerivesSamePrunedMessages": true,
+        "secondPassIsNoOp": true,
+        "replacementFailureIsExplicit": true,
+        "failedReplacementLeavesOnlyOrphanMarker": true,
+        "orphanDoesNotChangeSurface": true,
+        "balancedOrphanGetsNoSyntheticRepair": true,
+        "replayKeepsOriginalAndExpiresClaim": true
+      }
+    },
+    "interruptedToolRepair": {
+      "openTail": {
+        "originalEventTypes": [
+          "turn/start",
+          "step/start",
+          "assistant/message",
+          "tool/call"
+        ],
+        "durableCallSeq": 3,
+        "syntheticClosers": [
+          {
+            "type": "tool/result",
+            "seq": 4,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "id": "interrupted-tool-result-call-not-started-4",
+                "role": "user",
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-not-started"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-not-started",
+                    "isError": true,
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed."
+                      }
+                    ]
+                  }
+                ]
+              },
+              "error": {
+                "name": "ToolNotStartedError",
+                "code": "TOOL_NOT_STARTED"
+              }
+            },
+            "surfaceOp": "append"
+          },
+          {
+            "type": "tool/result",
+            "seq": 5,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "step": 1,
+              "message": {
+                "id": "interrupted-tool-result-call-outcome-unknown-5",
+                "role": "user",
+                "source": {
+                  "kind": "tool",
+                  "callId": "call-outcome-unknown"
+                },
+                "content": [
+                  {
+                    "type": "tool-result",
+                    "toolCallId": "call-outcome-unknown",
+                    "isError": true,
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly."
+                      }
+                    ]
+                  }
+                ]
+              },
+              "error": {
+                "name": "ToolOutcomeUnknownError",
+                "code": "TOOL_OUTCOME_UNKNOWN"
+              }
+            },
+            "surfaceOp": "append",
+            "sourceEventSeqs": [
+              3
+            ]
+          },
+          {
+            "type": "step/end",
+            "seq": 6,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "step": 1
+            }
+          },
+          {
+            "type": "turn/end",
+            "seq": 7,
+            "time": 1700800000000,
+            "data": {
+              "turn": 1,
+              "reason": {
+                "kind": "interrupted"
+              }
+            }
+          }
+        ],
+        "repairedEventTypes": [
+          "turn/start",
+          "step/start",
+          "assistant/message",
+          "tool/call",
+          "tool/result",
+          "tool/result",
+          "step/end",
+          "turn/end"
+        ],
+        "replayAddsEndSeedAtSeq": 8,
+        "replayMessages": [
+          {
+            "id": "message-assistant-repair",
+            "role": "assistant",
+            "source": {
+              "kind": "model",
+              "provider": "mock",
+              "model": "mock-model"
+            },
+            "content": [
+              {
+                "type": "tool-call",
+                "id": "call-not-started",
+                "name": "read",
+                "arguments": "{\"path\":\"a\"}"
+              },
+              {
+                "type": "tool-call",
+                "id": "call-outcome-unknown",
+                "name": "bash",
+                "arguments": "{\"command\":\"touch x\"}"
+              }
+            ]
+          },
+          {
+            "id": "interrupted-tool-result-call-not-started-4",
+            "role": "user",
+            "source": {
+              "kind": "tool",
+              "callId": "call-not-started"
+            },
+            "content": [
+              {
+                "type": "tool-result",
+                "toolCallId": "call-not-started",
+                "isError": true,
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed."
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "interrupted-tool-result-call-outcome-unknown-5",
+            "role": "user",
+            "source": {
+              "kind": "tool",
+              "callId": "call-outcome-unknown"
+            },
+            "content": [
+              {
+                "type": "tool-result",
+                "toolCallId": "call-outcome-unknown",
+                "isError": true,
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "The tool call was interrupted after it was recorded, but no result was durably recorded. Its outcome is unknown. Decide whether to retry from the tool semantics: retry only if the operation is read-only or idempotent; if it may have side effects, first verify external state or ask the user. Do not retry blindly."
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "balancedClosedDangling": {
+        "eventTypes": [
+          "turn/start",
+          "step/start",
+          "assistant/message",
+          "tool/call",
+          "step/end",
+          "turn/end"
+        ],
+        "syntheticClosers": []
+      },
+      "checks": {
+        "twoResultsBeforeBoundaries": true,
+        "resultOrderMatchesAssistantBlocks": true,
+        "riskCodesDiffer": true,
+        "onlyStartedCallCitesIntent": true,
+        "closerSeqsContiguous": true,
+        "closerTimesReuseLastRealTime": true,
+        "repairedTranscriptReplayable": true,
+        "balancedClosedDanglingGetsNoRepair": true
+      }
+    },
+    "resumeEndSeed": {
+      "storedSeed": [
+        {
+          "seq": 0,
+          "type": "turn/start"
+        },
+        {
+          "seq": 1,
+          "type": "user/message"
+        },
+        {
+          "seq": 2,
+          "type": "turn/end"
+        }
+      ],
+      "firstResume": {
+        "firstLiveSeq": 3,
+        "events": [
+          {
+            "seq": 0,
+            "type": "turn/start"
+          },
+          {
+            "seq": 1,
+            "type": "user/message"
+          },
+          {
+            "seq": 2,
+            "type": "turn/end"
+          },
+          {
+            "seq": 3,
+            "type": "session/end-seed"
+          }
+        ]
+      },
+      "untouchedReopen": {
+        "firstLiveSeq": 4,
+        "events": [
+          {
+            "seq": 0,
+            "type": "turn/start"
+          },
+          {
+            "seq": 1,
+            "type": "user/message"
+          },
+          {
+            "seq": 2,
+            "type": "turn/end"
+          },
+          {
+            "seq": 3,
+            "type": "session/end-seed"
+          }
+        ]
+      },
+      "afterContinuation": [
+        {
+          "seq": 0,
+          "type": "turn/start"
+        },
+        {
+          "seq": 1,
+          "type": "user/message"
+        },
+        {
+          "seq": 2,
+          "type": "turn/end"
+        },
+        {
+          "seq": 3,
+          "type": "session/end-seed"
+        },
+        {
+          "seq": 4,
+          "type": "turn/start"
+        },
+        {
+          "seq": 5,
+          "type": "turn/end"
+        }
+      ],
+      "checks": {
+        "firstResumeAddsOneMarker": true,
+        "markerSeqEqualsStoredLength": true,
+        "untouchedReopenDoesNotAddMarker": true,
+        "nextAppendContinuesSeq": true,
+        "messagesPreserved": true
+      }
+    },
+    "jsonlAndFormatCompatibility": {
+      "scanner": {
+        "headerLine": {
+          "type": "session",
+          "version": 0,
+          "id": "phase8-jsonl-scan",
+          "createdAt": 1700800000000,
+          "delegationDepth": 0
+        },
+        "tornFinalRecord": {
+          "inputBytes": 267,
+          "committedBytes": 171,
+          "preservedSeqs": [
+            0
+          ]
+        },
+        "uncommittedGap": {
+          "committedBytes": 171,
+          "preservedSeqs": [
+            0
+          ]
+        },
+        "committedGap": {
+          "name": "Error",
+          "message": "corrupt session log: seq gap in committed region at line 2 (expected 1, got 2)"
+        },
+        "corruptTail": {
+          "committedBytes": 171,
+          "preservedSeqs": [
+            0
+          ]
+        },
+        "committedCorruption": {
+          "name": "Error",
+          "message": "corrupt session log: unparsable committed event at line 2"
+        },
+        "versionRefusals": {
+          "newer": {
+            "name": "SessionFormatUnsupportedError",
+            "message": "session \"phase8-jsonl-scan\" uses log format v99, but this harness reads only v0: the log was written by a newer harness — upgrade the harness to open it"
+          },
+          "older": {
+            "name": "SessionFormatUnsupportedError",
+            "message": "session \"phase8-jsonl-scan\" uses log format v-1, older than the supported v0, and this build ships no upgrade path for it"
+          }
+        },
+        "checks": {
+          "tornFinalRecordIgnored": true,
+          "committedBytesStopBeforeTornRecord": true,
+          "uncommittedGapPreservesPrefix": true,
+          "committedGapRejected": true,
+          "corruptTailPreservesPrefix": true,
+          "committedCorruptionRejected": true,
+          "newerVersionIsFormatRefusal": true,
+          "olderVersionIsFormatRefusal": true
+        }
+      },
+      "unknownEvents": {
+        "required": {
+          "outcome": "REFUSED",
+          "error": {
+            "name": "SessionFormatUnsupportedError",
+            "message": "session \"phase8-unknown-required\" contains event type \"future/event\" (seq 2) unknown to this harness and not marked ignorable; refusing to interpret the log — it was likely written by a newer harness (raw log: /oracle/phase8-unknown-required/session.jsonl)"
+          }
+        },
+        "ignorable": {
+          "outcome": "LOADED",
+          "eventTypes": [
+            "turn/start",
+            "turn/end",
+            "future/event"
+          ],
+          "preservedUnknownEnvelope": {
+            "type": "future/event",
+            "seq": 2,
+            "time": 1700800000000,
+            "data": {
+              "payload": 1
+            },
+            "ignorable": true
+          }
+        }
+      },
+      "checks": {
+        "unknownRequiredRefused": true,
+        "unknownIgnorablePreserved": true
+      }
+    }
+  }
+}

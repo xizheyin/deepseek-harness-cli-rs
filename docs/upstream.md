@@ -894,6 +894,134 @@ upstream tree was clean before and after. It made no network or real model call,
 read no credentials, and wrote only the requested output files and a fresh
 platform temporary directory.
 
+## Phase 8: persistence, recovery, resume, and compaction
+
+Phase 8 research was performed against the same clean pinned checkout. The
+following core files establish that complete history and current model context
+are different things:
+
+- `packages/core/session/src/{index,types,surface,invariant,repair,known-event-types,chunk-rows}.ts`:
+  append-only logical events, model-visible surface replacement, interrupted
+  turn repair, required/ignorable event vocabulary, and lossless packing of
+  adjacent physical chunk rows;
+- `packages/core/session/tests/{session,surface,invariant,repair}.spec.ts`:
+  continuous sequences, replacement without deletion, synthetic tool-result
+  ordering, and seed-boundary behavior;
+- `packages/core/agent-loop/src/{agent,tool-calls}.ts` and
+  `packages/core/agent-loop/tests/resume.spec.ts`: resumed request-header reason,
+  call-before-side-effect ordering, and continuation from a persisted prefix;
+- `packages/llm/token-meter/src/{index,estimate,surface-fold,surface-projection,usage-projection,breakdown-projection}.ts`:
+  pressure is derived from the current request header and current surface, and a
+  replacement subtracts the price of shadowed nodes without deleting history.
+
+The persistence implementation and contract evidence are:
+
+- `packages/session/session-persistence/src/{coordinator,write-behind,index}.ts`:
+  ordered append, durable cursors, flush ownership, suffix reads, format
+  refusal, legacy normalization, torn-tail adoption, and cold repair;
+- `packages/session/session-persistence/tests/{contract,coordinator-contract,persistence}.ts`:
+  creation, append, recovery, repair, unknown/legacy events, read-from, resume,
+  and failure behavior;
+- `packages/session/session-persistence-jsonl/src/{format,index}.ts`:
+  one tagged header, safe path components, plaintext/Zstandard artifacts,
+  append/fsync/rollback, bounded prefix scanning, and frame repair;
+- `packages/session/session-persistence-jsonl/tests/{jsonl,zstd}.spec.ts`:
+  lazy creation, exact logical replay, chunk-row packing, incomplete final
+  records/frames, corruption classification, rollback, and never-rewrite facts;
+- `packages/session/session-checkpoint-policy/src/index.ts` and its tests:
+  model-visible facts are flushed before dispatch, `tool/call` is flushed before
+  side effects, and a completed response/result prefix is flushed before the
+  next step.
+
+At this revision the core `Session` appends with `seq = log.length` and has no
+4,096-event or 16 MiB lifetime ceiling. A read-only local probe appended 5,000
+`assistant/chunk` events and then another event successfully with continuous
+sequences. This is a direct contrast with the current Rust Phase 1 in-memory
+limit and is the basis of the Phase 8 long-reasoning regression; it is not a
+claim that upstream memory or disk use is unlimited in every host composition.
+
+The scanner behavior is deliberately conservative. A final record without LF
+is ignored. A complete bad record or sequence gap preserves the earlier valid
+prefix, but later evidence of a committed `turn/end` makes damage inside that
+committed region a hard corruption error. Cold inspection is read-only; cold
+load truncates only a recoverable suffix, synchronizes it, appends deterministic
+repair events, and does not repeat repair on reload. The repair order for an
+open step is model-call order: `TOOL_NOT_STARTED` for an assistant call without
+a durable `tool/call`, `TOOL_OUTCOME_UNKNOWN` for a durable call without a
+result, then `step/end` and interrupted `turn/end`. It never executes a tool.
+
+The context-compaction implementation and tests inspected are:
+
+- `packages/compaction/compaction/src/{types,invariant,index}.ts` and
+  `packages/compaction/compaction/tests/{compaction,invariant}.spec.ts`:
+  the durable start/summary/end bracket, ownership, source relations, and stale
+  bracket behavior across `session/end-seed`;
+- `packages/compaction/compaction-basic/src/{config,index,region,summarizer}.ts`:
+  80% pressure, 16% retained tail, 8,192-token summary default, balanced range
+  selection, summary framing, shrink validation, and overflow recovery;
+- `packages/compaction/compaction-basic/tests/{compaction-basic,compaction-loop-repro,manual-compaction}.spec.ts`:
+  automatic/manual transactions, errors, cancellation, changed surfaces,
+  orphan prefixes, tool-pair boundaries, retries, and durability;
+- `packages/compaction/compaction-tool-result-pruner/src/{config,index}.ts` and
+  `packages/compaction/compaction-tool-result-pruner/tests/tool-result-pruner.spec.ts`:
+  model-free tool-result replacement and its adjacent shadow-price event.
+
+A successful basic compaction appends `compaction/start`, a log-only
+`compaction/summary`, an immediately adjacent replacement `user/message`, and
+`compaction/end`. The replacement changes only the derived surface. Old events,
+including every raw assistant chunk, remain in the log, so successful
+compaction increases the logical event count by four while reducing the next
+model request. Start-only, start+summary, and start+summary+replacement crash
+prefixes remain distinguishable and recoverable.
+
+The default tool-result pruner runs only after ordinary pressure is reached, or
+unconditionally before context-overflow range selection. It counts Unicode code
+points only across text blocks. A result strictly over the default 8,192-point
+threshold keeps a global 4,096-point head, the exact 39-point middle marker, and
+a 1,024-point tail while preserving non-text blocks. It then appends adjacent
+`compaction/prune` and replacement `tool/result` events. The replacement keeps
+the original IDs/error/meta and cites the original singleton sequence; the full
+original remains in history. The pair is sequential rather than transactional,
+so a rejected second append can leave a known log-only prune marker with the
+surface unchanged. These facts come from the cited source, focused tests, and a
+read-only fixed-commit failure probe; the official suite does not itself contain
+a crash snapshot for that marker-only prefix.
+
+The Phase 8 oracle is generated by
+`scripts/generate-upstream-phase8-fixtures.ts`, checked by
+`scripts/typecheck-upstream-phase8-fixtures.mjs`, and stored as
+`tests/fixtures/session/upstream_phase8_oracle.json`. It executes the real
+upstream Session, basic compactor, tool-result pruner, token projection, repair,
+seed construction, and bounded JSONL scanner. It deliberately does not claim
+that this compact fixture itself executes cold-load truncation/fsync/rollback;
+those facts remain supported by the cited official tests and must receive Rust
+failure-path tests.
+
+The checkpoint was generated twice from the clean pinned checkout; both outputs
+were byte-identical and matched the committed fixture. The checker, generator,
+and fixture SHA-256 values are:
+
+- checker: `8d331cceaeea192a28166660b7dbf0636452d8d64b31bbbd5676b3553f2fd68b`;
+- generator: `7f56661f2898e4ed94327bdd79659a423f05c1e7ccea1cd7e60f8870417206f8`;
+- fixture: `a1b505e769175e5f78d3ab7a15972e488ed504661bc16f8d17cf9253654ed96c`.
+
+The focused official run passed 12 files and 519 tests. In addition to the
+surface-delta suite, the two direct token-meter suites lock output-inclusive
+usage and the max-of-usage-and-heuristic anchor:
+
+```console
+node /path/to/ds-harness-rs/scripts/typecheck-upstream-phase8-fixtures.mjs /path/to/deepseek-harness-upstream
+cd /path/to/deepseek-harness-upstream
+pnpm exec tsx /path/to/ds-harness-rs/scripts/generate-upstream-phase8-fixtures.ts /tmp/phase8-a.json
+pnpm exec tsx /path/to/ds-harness-rs/scripts/generate-upstream-phase8-fixtures.ts /tmp/phase8-b.json
+cmp -s /tmp/phase8-a.json /tmp/phase8-b.json
+cmp -s /tmp/phase8-a.json /path/to/ds-harness-rs/tests/fixtures/session/upstream_phase8_oracle.json
+pnpm exec vitest run packages/core/session/tests/session.spec.ts packages/core/session/tests/repair.spec.ts packages/core/session/tests/invariant.spec.ts packages/core/session/tests/surface.spec.ts packages/compaction/compaction/tests/invariant.spec.ts packages/compaction/compaction-basic/tests/compaction-basic.spec.ts packages/compaction/compaction-basic/tests/manual-compaction.spec.ts packages/compaction/compaction-tool-result-pruner/tests/tool-result-pruner.spec.ts packages/llm/token-meter/tests/context-breakdown-projection.spec.ts packages/llm/token-meter/tests/token-meter.spec.ts packages/llm/token-meter/tests/token-usage-projection.spec.ts packages/session/session-persistence-jsonl/tests/jsonl.spec.ts --configLoader runner
+```
+
+Until Rust comparators and production paths exist, the compatibility table must
+not promote the Phase 8 rows.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
