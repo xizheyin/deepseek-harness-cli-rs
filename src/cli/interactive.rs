@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::AgentLoop,
-    session::{CommittedUiReceiver, EventKind, TurnEndReason, TurnId},
+    session::{CommittedUiReceiver, StoreError, TurnEndReason, TurnId},
 };
 
 use super::{
@@ -21,8 +21,10 @@ use super::{
         MAX_INTERACTIVE_PROMPT_BYTES, classify_idle_record,
     },
     live::{InteractivePresenter, LiveFrame, LiveLifecycle, LiveRenderer, PendingLiveFrame},
+    shutdown,
     signal::{DriverMode, SignalLatch, SignalStreams, UiSignal, self_suspend},
-    terminal::{AsyncTerminal, OpenTerminal, TERMINAL_READ_BYTES, TerminalError},
+    storage_failure,
+    terminal::{AsyncTerminal, TERMINAL_READ_BYTES, TerminalError},
 };
 
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
@@ -35,6 +37,8 @@ pub(super) enum InteractiveError {
     TerminalUnsupported,
     #[error("CLI_AGENT_UNAVAILABLE")]
     Agent,
+    #[error(transparent)]
+    Storage(StoreError),
     #[error("CLI_OUTPUT_FAILED")]
     Output,
 }
@@ -59,7 +63,7 @@ enum StopIntent {
     Interrupt,
     Eof,
     Suspend,
-    Exit(u8),
+    Exit(UiSignal),
     Failure(InteractiveError),
 }
 
@@ -76,148 +80,195 @@ enum AfterFrame {
 enum TurnDisposition {
     Continue,
     Exit(u8),
+    Signal(UiSignal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveExit {
+    Ordinary(u8),
+    Signal(UiSignal),
 }
 
 pub(super) async fn run(
     assembly: InteractiveAssembly,
-    open_terminal: OpenTerminal,
+    terminal: AsyncTerminal,
     signals: &mut SignalStreams,
 ) -> Result<u8, InteractiveError> {
     let InteractiveAssembly {
         mut agent,
         mut events,
         mut approvals,
-        challenges,
+        mut joins,
+        session_id,
+        resumed,
     } = assembly;
-    let terminal = open_terminal.register()?;
-    let mut joins = ApprovalJoin::new(challenges)?;
     let mut live = LiveRenderer::new();
     let mut presenter = InteractivePresenter::new();
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
     let mut scratch = [0_u8; TERMINAL_READ_BYTES];
 
-    let banner = LiveFrame::startup_banner().map_err(|_| InteractiveError::Output)?;
-    if let Some(signal) = write_frame(banner, &mut presenter, &terminal, signals).await? {
-        if let Some(code) = handle_idle_signal(signal, &terminal, signals).await? {
-            return Ok(code);
-        }
-    }
-
-    loop {
-        terminal.revalidate()?;
-        terminal.flush_input()?;
-        parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
-        let prompt = LiveFrame::idle_prompt().map_err(|_| InteractiveError::Output)?;
-        if let Some(signal) = write_frame(prompt, &mut presenter, &terminal, signals).await? {
-            match handle_idle_signal(signal, &terminal, signals).await? {
-                Some(code) => return Ok(code),
-                None => continue,
+    let result: Result<InteractiveExit, InteractiveError> = async {
+        let banner = LiveFrame::startup_banner(&session_id, resumed)
+            .map_err(|_| InteractiveError::Output)?;
+        if let Some(signal) = write_frame(banner, &mut presenter, &terminal, signals).await? {
+            if let Some(signal) = handle_idle_signal(signal, &terminal, signals).await? {
+                return Ok(InteractiveExit::Signal(signal));
             }
         }
-        terminal.revalidate()?;
 
-        let input = loop {
-            tokio::select! {
-                biased;
-                signal = signals.next() => break IdleEvent::Signal(signal),
-                read = terminal.read_once(&mut scratch) => {
-                    let count = read.map_err(|_| InteractiveError::TerminalUnavailable)?;
-                    if count == 0 {
-                        break IdleEvent::Eof;
-                    }
-                    let mut first = None;
-                    parser.feed(&scratch[..count], count < TERMINAL_READ_BYTES, |event| {
-                        if first.is_none() {
-                            first = Some(event);
-                        }
-                    });
-                    if let Some(event) = first {
-                        break IdleEvent::Record(event);
-                    }
-                }
-            }
-        };
-
-        // A signal may become ready after `select!` polled its stream but
-        // before the terminal read completed. Sample again before treating
-        // EOF or a record as success, and coalesce all ready signal classes.
-        let mut latch = SignalLatch::default();
-        if let IdleEvent::Signal(signal) = input {
-            latch.observe(DriverMode::Interactive, signal);
-        }
-        tokio::task::yield_now().await;
-        signals.drain_ready(DriverMode::Interactive, &mut latch);
-        let input = match latch.observed() {
-            Some(signal) => IdleEvent::Signal(signal),
-            None => input,
-        };
-
-        match input {
-            IdleEvent::Signal(signal) => {
-                presenter.discard_partly_written_frame();
+        loop {
+            terminal.revalidate()?;
+            terminal.flush_input()?;
+            parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+            let prompt = LiveFrame::idle_prompt().map_err(|_| InteractiveError::Output)?;
+            if let Some(signal) = write_frame(prompt, &mut presenter, &terminal, signals).await? {
                 match handle_idle_signal(signal, &terminal, signals).await? {
-                    Some(code) => return Ok(code),
+                    Some(signal) => return Ok(InteractiveExit::Signal(signal)),
                     None => continue,
                 }
             }
-            IdleEvent::Eof => return Ok(0),
-            IdleEvent::Record(InputRecordEvent::TooLarge) => {
-                write_notice(
-                    "[input exceeds 1000 bytes]\n",
-                    &mut presenter,
-                    &terminal,
-                    signals,
-                )
-                .await?;
-            }
-            IdleEvent::Record(InputRecordEvent::InvalidUtf8) => {
-                write_notice(
-                    "[input is not valid UTF-8]\n",
-                    &mut presenter,
-                    &terminal,
-                    signals,
-                )
-                .await?;
-            }
-            IdleEvent::Record(InputRecordEvent::Record {
-                text,
-                terminated_by_lf,
-            }) => match classify_idle_record(&text, terminated_by_lf) {
-                IdleInput::Redraw => {}
-                IdleInput::Help => {
-                    let help = LiveFrame::help().map_err(|_| InteractiveError::Output)?;
-                    if let Some(signal) =
-                        write_frame(help, &mut presenter, &terminal, signals).await?
-                    {
-                        if let Some(code) = handle_idle_signal(signal, &terminal, signals).await? {
-                            return Ok(code);
+            terminal.revalidate()?;
+
+            let input = loop {
+                tokio::select! {
+                    biased;
+                    signal = signals.next() => break IdleEvent::Signal(signal),
+                    read = terminal.read_once(&mut scratch) => {
+                        let count = read.map_err(|_| InteractiveError::TerminalUnavailable)?;
+                        if count == 0 {
+                            break IdleEvent::Eof;
+                        }
+                        let mut first = None;
+                        parser.feed(&scratch[..count], count < TERMINAL_READ_BYTES, |event| {
+                            if first.is_none() {
+                                first = Some(event);
+                            }
+                        });
+                        if let Some(event) = first {
+                            break IdleEvent::Record(event);
                         }
                     }
                 }
-                IdleInput::Exit => return Ok(0),
-                IdleInput::Submit(prompt) => {
-                    parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
-                    match run_turn(ActiveTurn {
-                        agent: &mut agent,
-                        events: &mut events,
-                        approvals: &mut approvals,
-                        joins: &mut joins,
-                        live: &mut live,
-                        presenter: &mut presenter,
-                        terminal: &terminal,
-                        signals,
-                        parser: &mut parser,
-                        scratch: &mut scratch,
-                        prompt,
-                    })
-                    .await?
-                    {
-                        TurnDisposition::Continue => {}
-                        TurnDisposition::Exit(code) => return Ok(code),
+            };
+
+            // A signal may become ready after `select!` polled its stream but
+            // before the terminal read completed. Sample again before treating
+            // EOF or a record as success, and coalesce all ready signal classes.
+            let mut latch = SignalLatch::default();
+            if let IdleEvent::Signal(signal) = input {
+                latch.observe(DriverMode::Interactive, signal);
+            }
+            tokio::task::yield_now().await;
+            signals.drain_ready(DriverMode::Interactive, &mut latch);
+            let input = match latch.observed() {
+                Some(signal) => IdleEvent::Signal(signal),
+                None => input,
+            };
+
+            match input {
+                IdleEvent::Signal(signal) => {
+                    presenter.discard_partly_written_frame();
+                    match handle_idle_signal(signal, &terminal, signals).await? {
+                        Some(signal) => return Ok(InteractiveExit::Signal(signal)),
+                        None => continue,
                     }
                 }
-            },
+                IdleEvent::Eof => return Ok(InteractiveExit::Ordinary(0)),
+                IdleEvent::Record(InputRecordEvent::TooLarge) => {
+                    if let Some(signal) = write_notice(
+                        "[input exceeds 1000 bytes]\n",
+                        &mut presenter,
+                        &terminal,
+                        signals,
+                    )
+                    .await?
+                    {
+                        return Ok(InteractiveExit::Signal(signal));
+                    }
+                }
+                IdleEvent::Record(InputRecordEvent::InvalidUtf8) => {
+                    if let Some(signal) = write_notice(
+                        "[input is not valid UTF-8]\n",
+                        &mut presenter,
+                        &terminal,
+                        signals,
+                    )
+                    .await?
+                    {
+                        return Ok(InteractiveExit::Signal(signal));
+                    }
+                }
+                IdleEvent::Record(InputRecordEvent::Record {
+                    text,
+                    terminated_by_lf,
+                }) => match classify_idle_record(&text, terminated_by_lf) {
+                    IdleInput::Redraw => {}
+                    IdleInput::Help => {
+                        let help = LiveFrame::help().map_err(|_| InteractiveError::Output)?;
+                        if let Some(signal) =
+                            write_frame(help, &mut presenter, &terminal, signals).await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Exit => return Ok(InteractiveExit::Ordinary(0)),
+                    IdleInput::Submit(prompt) => {
+                        parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                        match run_turn(ActiveTurn {
+                            agent: &mut agent,
+                            events: &mut events,
+                            approvals: &mut approvals,
+                            joins: &mut joins,
+                            live: &mut live,
+                            presenter: &mut presenter,
+                            terminal: &terminal,
+                            signals,
+                            parser: &mut parser,
+                            scratch: &mut scratch,
+                            prompt,
+                        })
+                        .await?
+                        {
+                            TurnDisposition::Continue => {}
+                            TurnDisposition::Exit(code) => {
+                                return Ok(InteractiveExit::Ordinary(code));
+                            }
+                            TurnDisposition::Signal(signal) => {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                },
+            }
         }
+    }
+    .await;
+    let initial_signal = result.as_ref().ok().and_then(|exit| match exit {
+        InteractiveExit::Signal(signal) => Some(*signal),
+        InteractiveExit::Ordinary(_) => None,
+    });
+    let (shutdown, signal) =
+        shutdown::agent_with_signals(&mut agent, DriverMode::Interactive, signals, initial_signal)
+            .await;
+    if let Some(signal) = signal {
+        if let Some(code) = finish_signal_after_shutdown(signal, &terminal, signals).await? {
+            return Ok(code);
+        }
+    }
+    match (result, shutdown) {
+        (Err(InteractiveError::Agent), Err(error)) => Err(InteractiveError::Storage(
+            storage_failure::from_shutdown(&error),
+        )),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(InteractiveError::Storage(storage_failure::from_shutdown(
+            &error,
+        ))),
+        (Ok(InteractiveExit::Ordinary(exit)), Ok(())) => Ok(exit),
+        (Ok(InteractiveExit::Signal(_)), Ok(())) => Err(InteractiveError::Agent),
     }
 }
 
@@ -480,11 +531,16 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
     };
     match &result {
         Ok(outcome) if outcome.turn() == turn => {
-            if !has_matching_turn_end(active.agent, start_seq, turn, outcome.reason()) {
+            if outcome.turn_end_seq().get() < start_seq.get() {
                 observe_failure(&mut stop, InteractiveError::Agent);
             }
         }
-        Ok(_) | Err(_) => observe_failure(&mut stop, InteractiveError::Agent),
+        Ok(_) => observe_failure(&mut stop, InteractiveError::Agent),
+        Err(error) => observe_failure(
+            &mut stop,
+            storage_failure::from_agent(error)
+                .map_or(InteractiveError::Agent, InteractiveError::Storage),
+        ),
     }
 
     if stop.is_none() {
@@ -966,43 +1022,63 @@ async fn write_notice(
     presenter: &mut InteractivePresenter,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
-) -> Result<(), InteractiveError> {
+) -> Result<Option<UiSignal>, InteractiveError> {
     let frame = LiveFrame::notice(notice).map_err(|_| InteractiveError::Output)?;
     if let Some(signal) = write_frame(frame, presenter, terminal, signals).await? {
-        if let Some(code) = handle_idle_signal(signal, terminal, signals).await? {
-            std::process::exit(code.into());
+        if let Some(signal) = handle_idle_signal(signal, terminal, signals).await? {
+            return Ok(Some(signal));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn handle_idle_signal(
     signal: UiSignal,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
-) -> Result<Option<u8>, InteractiveError> {
+) -> Result<Option<UiSignal>, InteractiveError> {
     match signal {
         UiSignal::Interrupt => {
             terminal.flush_input()?;
             Ok(None)
         }
-        UiSignal::Suspend => suspend_and_resume(terminal, signals).await,
-        UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate => Ok(signal.exit_code()),
+        UiSignal::Suspend => Ok(suspend_and_resume(terminal, signals).await?),
+        UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate => Ok(Some(signal)),
     }
 }
 
-async fn suspend_and_resume(
+async fn finish_signal_after_shutdown(
+    signal: UiSignal,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
 ) -> Result<Option<u8>, InteractiveError> {
+    match signal {
+        UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate => {
+            signal.exit_code().map(Some).ok_or(InteractiveError::Agent)
+        }
+        UiSignal::Suspend => match suspend_and_resume(terminal, signals).await? {
+            Some(terminating) => terminating
+                .exit_code()
+                .map(Some)
+                .ok_or(InteractiveError::Agent),
+            None => Ok(None),
+        },
+        UiSignal::Interrupt => Ok(None),
+    }
+}
+
+pub(super) async fn suspend_and_resume(
+    terminal: &AsyncTerminal,
+    signals: &mut SignalStreams,
+) -> Result<Option<UiSignal>, TerminalError> {
     loop {
-        self_suspend().map_err(|_| InteractiveError::TerminalUnsupported)?;
+        self_suspend().map_err(|_| TerminalError::Unsupported)?;
         let mut latch = SignalLatch::default();
         signals.drain_ready(DriverMode::Interactive, &mut latch);
         if let Some(signal @ (UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate)) =
             latch.observed()
         {
-            return signal.exit_code().map(Some).ok_or(InteractiveError::Agent);
+            return Ok(Some(signal));
         }
         if terminal.is_foreground()? {
             terminal.revalidate()?;
@@ -1033,10 +1109,10 @@ async fn finish_turn_disposition(
         }
         Some(StopIntent::Eof) => Ok(TurnDisposition::Exit(0)),
         Some(StopIntent::Suspend) => match suspend_and_resume(terminal, signals).await? {
-            Some(code) => Ok(TurnDisposition::Exit(code)),
+            Some(signal) => Ok(TurnDisposition::Signal(signal)),
             None => Ok(TurnDisposition::Continue),
         },
-        Some(StopIntent::Exit(code)) => Ok(TurnDisposition::Exit(code)),
+        Some(StopIntent::Exit(signal)) => Ok(TurnDisposition::Signal(signal)),
         Some(StopIntent::Failure(error)) => Err(error),
     }
 }
@@ -1049,13 +1125,12 @@ async fn finish_signal_after_cleanup(
     match signal {
         UiSignal::Interrupt => Ok(TurnDisposition::Continue),
         UiSignal::Suspend => match suspend_and_resume(terminal, signals).await? {
-            Some(code) => Ok(TurnDisposition::Exit(code)),
+            Some(signal) => Ok(TurnDisposition::Signal(signal)),
             None => Ok(TurnDisposition::Continue),
         },
-        UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate => signal
-            .exit_code()
-            .map(TurnDisposition::Exit)
-            .ok_or(InteractiveError::Agent),
+        UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate => {
+            Ok(TurnDisposition::Signal(signal))
+        }
     }
 }
 
@@ -1063,9 +1138,7 @@ fn observe_signal(stop: &mut Option<StopIntent>, signal: UiSignal) {
     match signal {
         UiSignal::Hangup | UiSignal::Quit | UiSignal::Terminate => {
             if !matches!(stop, Some(StopIntent::Exit(_))) {
-                if let Some(code) = signal.exit_code() {
-                    *stop = Some(StopIntent::Exit(code));
-                }
+                *stop = Some(StopIntent::Exit(signal));
             }
         }
         UiSignal::Suspend => {
@@ -1119,22 +1192,6 @@ fn discard_ready_updates(events: &mut CommittedUiReceiver) -> usize {
     skipped
 }
 
-fn has_matching_turn_end(
-    agent: &AgentLoop,
-    start_seq: crate::session::EventSeq,
-    expected_turn: TurnId,
-    expected_reason: &crate::session::TurnEndReason,
-) -> bool {
-    agent.session().events().iter().any(|event| {
-        event.seq().get() >= start_seq.get()
-            && matches!(
-                event.kind(),
-                EventKind::TurnEnd { turn, reason }
-                    if *turn == expected_turn && reason == expected_reason
-            )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1167,9 +1224,9 @@ mod tests {
     fn terminating_signals_override_local_stops_but_not_each_other() {
         let mut stop = Some(StopIntent::Interrupt);
         observe_signal(&mut stop, UiSignal::Terminate);
-        assert_eq!(stop, Some(StopIntent::Exit(143)));
+        assert_eq!(stop, Some(StopIntent::Exit(UiSignal::Terminate)));
         observe_signal(&mut stop, UiSignal::Hangup);
-        assert_eq!(stop, Some(StopIntent::Exit(143)));
+        assert_eq!(stop, Some(StopIntent::Exit(UiSignal::Terminate)));
     }
 
     #[test]
@@ -1179,7 +1236,7 @@ mod tests {
         observe_signal(&mut stop, UiSignal::Interrupt);
         assert_eq!(stop, Some(StopIntent::Failure(InteractiveError::Output)));
         observe_signal(&mut stop, UiSignal::Quit);
-        assert_eq!(stop, Some(StopIntent::Exit(131)));
+        assert_eq!(stop, Some(StopIntent::Exit(UiSignal::Quit)));
     }
 
     #[test]

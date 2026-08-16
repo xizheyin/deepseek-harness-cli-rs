@@ -18,9 +18,9 @@ use deepseek_harness_cli::{
         ToolExecutor, ToolExecutorError, TurnProposal,
     },
     model::{
-        ContentBlock, ContentBlockType, FinishReason, LlmCallConfig, LlmCallConfigAdapterDefaults,
-        LlmFailure, Message, MessageSource, ModelError, PositiveFiniteNumber, StreamChunk,
-        TokenUsage, ToolSchema,
+        ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, LlmCallConfig,
+        LlmCallConfigAdapterDefaults, LlmFailure, Message, MessageSource, ModelError,
+        PositiveFiniteNumber, StreamChunk, TokenUsage, ToolSchema,
     },
     provider::{
         ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
@@ -985,6 +985,17 @@ async fn text_completion_is_logged_before_a_balanced_turn_closes() {
     assert_eq!(outcome.reason(), &TurnEndReason::Completed);
     assert_eq!(outcome.steps(), 1);
     assert_eq!(outcome.attempts(), 1);
+    assert_eq!(
+        outcome.turn_end_seq(),
+        agent.session().events().last().unwrap().seq()
+    );
+    let final_message = outcome
+        .final_message()
+        .expect("the committed text answer is carried by the outcome");
+    assert!(matches!(
+        final_message.content(),
+        [block] if matches!(block.kind(), ContentBlockKind::Text { text } if text == "hello")
+    ));
     assert_eq!(agent.session().state().open_turn(), None);
     assert_eq!(provider.requests()[0], vec![user("hi")]);
     assert_eq!(agent.session().messages().len(), 2);
@@ -1102,6 +1113,12 @@ async fn one_tool_result_becomes_the_next_steps_model_context() {
         .unwrap();
 
     assert_eq!(outcome.steps(), 2);
+    assert!(outcome.final_message().is_some_and(|message| {
+        message
+            .content()
+            .iter()
+            .any(|block| matches!(block.kind(), ContentBlockKind::Text { text } if text == "four"))
+    }));
     assert_eq!(tools.calls.lock().unwrap().as_slice(), ["calculator"]);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);

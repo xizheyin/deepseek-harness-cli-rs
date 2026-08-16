@@ -173,52 +173,116 @@ fn append_chunk(target: &mut Vec<u8>, chunk: &str) -> Result<(), ScriptOutputErr
 #[error("CLI_OUTPUT_FAILED")]
 pub(super) struct ScriptOutputError;
 
+pub(super) struct OwnedScriptOutput {
+    receiver: Option<oneshot::Receiver<Result<(), ScriptOutputError>>>,
+    worker: Option<thread::JoinHandle<()>>,
+    deadline: Instant,
+}
+
+pub(super) enum OwnedOutputEvent {
+    Complete(Result<(), ScriptOutputError>),
+    Signal(UiSignal),
+    Deadline,
+}
+
+impl OwnedScriptOutput {
+    pub(super) fn start_stderr(bytes: Vec<u8>) -> Result<Self, ScriptOutputError> {
+        Self::start(ScriptOutputFrames {
+            stdout: Vec::new(),
+            stderr: bytes,
+        })
+    }
+
+    fn start(frames: ScriptOutputFrames) -> Result<Self, ScriptOutputError> {
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        let stdout = rustix::io::dup(stdout.as_fd()).map_err(|_| ScriptOutputError)?;
+        let stderr = rustix::io::dup(stderr.as_fd()).map_err(|_| ScriptOutputError)?;
+        let (sender, receiver) = oneshot::channel();
+        let worker = thread::Builder::new()
+            .name("dsh-final-output".to_owned())
+            .spawn(move || {
+                let result = write_all(&stdout, &frames.stdout)
+                    .and_then(|()| write_all(&stderr, &frames.stderr));
+                let _ = sender.send(result);
+            })
+            .map_err(|_| ScriptOutputError)?;
+        Ok(Self {
+            receiver: Some(receiver),
+            worker: Some(worker),
+            deadline: Instant::now() + FINAL_OUTPUT_DEADLINE,
+        })
+    }
+
+    /// Poll the owned writer without surrendering its JoinHandle. A caller
+    /// handling a recovery warning can therefore close the prepared Session
+    /// before a signal/deadline is allowed to terminate the process.
+    pub(super) async fn wait_event(
+        &mut self,
+        mode: DriverMode,
+        signals: &mut SignalStreams,
+    ) -> OwnedOutputEvent {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return OwnedOutputEvent::Complete(Err(ScriptOutputError));
+        };
+        let event = tokio::select! {
+            biased;
+            signal = signals.next() => OwnedOutputEvent::Signal(signal),
+            () = tokio::time::sleep_until(self.deadline) => OwnedOutputEvent::Deadline,
+            result = receiver => {
+                let result = result.unwrap_or(Err(ScriptOutputError));
+                self.receiver.take();
+                let joined = self
+                    .worker
+                    .take()
+                    .is_some_and(|worker| worker.join().is_ok());
+                if joined {
+                    OwnedOutputEvent::Complete(result)
+                } else {
+                    OwnedOutputEvent::Complete(Err(ScriptOutputError))
+                }
+            }
+        };
+        if matches!(event, OwnedOutputEvent::Complete(_)) {
+            tokio::task::yield_now().await;
+            let mut latch = SignalLatch::default();
+            signals.drain_ready(mode, &mut latch);
+            if let Some(signal) = latch.observed() {
+                return OwnedOutputEvent::Signal(signal);
+            }
+        }
+        event
+    }
+
+    pub(super) fn exit_after_cleanup(self, code: u8) -> ! {
+        // Keep a possibly kernel-blocked writer owned until process teardown.
+        // Recovery callers invoke this only after their journal owner has been
+        // explicitly cancelled, joined, and dropped.
+        let _owned_writer = self;
+        std::process::exit(code.into())
+    }
+}
+
 pub(super) async fn write_final_output_or_exit(
     frames: ScriptOutputFrames,
     signals: &mut SignalStreams,
 ) -> Result<(), ScriptOutputError> {
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    let stdout = rustix::io::dup(stdout.as_fd()).map_err(|_| ScriptOutputError)?;
-    let stderr = rustix::io::dup(stderr.as_fd()).map_err(|_| ScriptOutputError)?;
-    let (sender, receiver) = oneshot::channel();
-    let worker = thread::Builder::new()
-        .name("dsh-final-output".to_owned())
-        .spawn(move || {
-            let result = write_all(&stdout, &frames.stdout)
-                .and_then(|()| write_all(&stderr, &frames.stderr));
-            let _ = sender.send(result);
-        })
-        .map_err(|_| ScriptOutputError)?;
-    let deadline = Instant::now() + FINAL_OUTPUT_DEADLINE;
-    tokio::pin!(receiver);
-    tokio::select! {
-        biased;
-        signal = signals.next() => exit_for_output_signal(signal, signals, worker),
-        () = tokio::time::sleep_until(deadline) => exit_with_owned_writer(worker, 1),
-        result = &mut receiver => {
-            worker.join().map_err(|_| ScriptOutputError)?;
-            let result = result.map_err(|_| ScriptOutputError)?;
-            tokio::task::yield_now().await;
-            let mut latch = SignalLatch::default();
-            signals.drain_ready(DriverMode::Script, &mut latch);
-            if let Some(signal) = latch.observed() {
-                exit_after_completed_io_signal(signal, signals);
-            }
-            result?;
-            Ok(())
-        }
+    let mut output = OwnedScriptOutput::start(frames)?;
+    match output.wait_event(DriverMode::Script, signals).await {
+        OwnedOutputEvent::Complete(result) => result,
+        OwnedOutputEvent::Signal(signal) => exit_for_output_signal(signal, signals, output),
+        OwnedOutputEvent::Deadline => output.exit_after_cleanup(1),
     }
 }
 
 fn exit_for_output_signal(
     signal: UiSignal,
     signals: &mut SignalStreams,
-    owned_worker: thread::JoinHandle<()>,
+    output: OwnedScriptOutput,
 ) -> ! {
     if signal == UiSignal::Suspend {
         if self_suspend().is_err() {
-            exit_with_owned_writer(owned_worker, 1);
+            output.exit_after_cleanup(1);
         }
         let mut latch = SignalLatch::default();
         latch.observe(DriverMode::Script, signal);
@@ -227,16 +291,9 @@ fn exit_for_output_signal(
             .observed()
             .and_then(UiSignal::exit_code)
             .unwrap_or(148);
-        exit_with_owned_writer(owned_worker, code);
+        output.exit_after_cleanup(code);
     }
-    exit_with_owned_writer(owned_worker, signal.exit_code().unwrap_or(1));
-}
-
-fn exit_with_owned_writer(_owned_worker: thread::JoinHandle<()>, code: u8) -> ! {
-    // `process::exit` is intentional here: a kernel-stuck final writer cannot
-    // be cancelled or joined, and returning would silently detach it while the
-    // product continued. All Agent/tool state has already settled.
-    std::process::exit(code.into())
+    output.exit_after_cleanup(signal.exit_code().unwrap_or(1));
 }
 
 fn write_all(fd: &impl AsFd, mut bytes: &[u8]) -> Result<(), ScriptOutputError> {

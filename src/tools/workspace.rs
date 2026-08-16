@@ -10,16 +10,13 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 
+use cap_std::fs::{Dir, OpenOptions};
 #[cfg(unix)]
 use cap_std::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
-use crate::entropy::EntropySource;
+use crate::{entropy::EntropySource, workspace_authority::WorkspaceAuthority};
 
 use super::{
     MAX_DIRECTORY_DEPTH, MAX_READ_CHUNK_BYTES, MAX_TRAVERSAL_PATH_BYTES,
@@ -31,9 +28,7 @@ const DIRECTORY_BATCH_ENTRIES: usize = 256;
 
 #[derive(Clone)]
 pub(crate) struct Workspace {
-    root: Arc<Dir>,
-    display_root: Arc<PathBuf>,
-    startup_root: Arc<PathBuf>,
+    authority: WorkspaceAuthority,
     mutation_lock: Arc<Mutex<()>>,
     entropy: EntropySource,
 }
@@ -620,82 +615,25 @@ pub(crate) struct ToolExecutorCommitError;
 
 impl Workspace {
     pub(crate) fn open(path: &Path) -> Result<Self, ToolRegistryBuildError> {
-        let startup_root = std::path::absolute(path).map_err(|source| {
+        let authority = WorkspaceAuthority::open(path).map_err(|source| {
             ToolRegistryBuildError::InvalidWorkspace {
                 path: path.to_owned(),
                 source,
             }
         })?;
-        // Opening the capability is the authorization linearization point.  Do
-        // this before resolving a display path so a rename between a pathname
-        // check and the open cannot silently grant authority to a replacement.
-        let root = Dir::open_ambient_dir(path, ambient_authority()).map_err(|source| {
-            ToolRegistryBuildError::InvalidWorkspace {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-        let opened_metadata =
-            root.dir_metadata()
-                .map_err(|source| ToolRegistryBuildError::InvalidWorkspace {
-                    path: path.to_owned(),
-                    source,
-                })?;
-        if !opened_metadata.is_dir() {
-            return Err(ToolRegistryBuildError::InvalidWorkspace {
-                path: path.to_owned(),
-                source: io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "workspace is not a directory",
-                ),
-            });
-        }
+        Ok(Self::from_authority(authority))
+    }
 
-        let display_root = std::fs::canonicalize(path).map_err(|source| {
-            ToolRegistryBuildError::InvalidWorkspace {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-        let expected_metadata = std::fs::metadata(&display_root).map_err(|source| {
-            ToolRegistryBuildError::InvalidWorkspace {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-        if !expected_metadata.is_dir() {
-            return Err(ToolRegistryBuildError::InvalidWorkspace {
-                path: path.to_owned(),
-                source: io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    "workspace is not a directory",
-                ),
-            });
-        }
-        #[cfg(unix)]
-        {
-            if std::os::unix::fs::MetadataExt::dev(&expected_metadata)
-                != cap_std::fs::MetadataExt::dev(&opened_metadata)
-                || std::os::unix::fs::MetadataExt::ino(&expected_metadata)
-                    != cap_std::fs::MetadataExt::ino(&opened_metadata)
-            {
-                return Err(ToolRegistryBuildError::InvalidWorkspace {
-                    path: path.to_owned(),
-                    source: io::Error::other("workspace changed while it was being opened"),
-                });
-            }
-        }
-        Ok(Self {
-            root: Arc::new(root),
-            display_root: Arc::new(display_root),
-            startup_root: Arc::new(startup_root),
+    pub(crate) fn from_authority(authority: WorkspaceAuthority) -> Self {
+        Self {
+            authority,
             mutation_lock: Arc::new(Mutex::new(())),
             entropy: EntropySource::system(),
-        })
+        }
     }
 
     pub(crate) fn display_root(&self) -> &Path {
-        self.display_root.as_ref()
+        self.authority.canonical_path()
     }
 
     #[cfg(unix)]
@@ -707,7 +645,7 @@ impl Workspace {
         cancellation: &CancellationToken,
     ) -> ToolCallResult<PreparedWorkspaceMutation> {
         check_cancel(cancellation)?;
-        let root = Arc::clone(&self.root);
+        let root = Arc::clone(self.authority.root());
         let mutation_lock = Arc::clone(&self.mutation_lock);
         let entropy = self.entropy;
         let token = cancellation.clone();
@@ -795,8 +733,8 @@ impl Workspace {
         let relative = if supplied.is_absolute() {
             let normalized = normalize_absolute(supplied)?;
             normalized
-                .strip_prefix(self.display_root.as_ref())
-                .or_else(|_| normalized.strip_prefix(self.startup_root.as_ref()))
+                .strip_prefix(self.authority.canonical_path())
+                .or_else(|_| normalized.strip_prefix(self.authority.startup_path()))
                 .map_err(|_| ToolCallError::workspace_denied())?
                 .to_owned()
         } else {
@@ -842,9 +780,12 @@ impl Workspace {
         if cancellation.is_cancelled() {
             return Err(ToolCallError::aborted());
         }
-        let directory =
-            open_shell_directory_no_follow(&self.root, &path.relative, Some(cancellation))
-                .map_err(|error| map_shell_workdir_open_error(&error, cancellation, false))?;
+        let directory = open_shell_directory_no_follow(
+            self.authority.root(),
+            &path.relative,
+            Some(cancellation),
+        )
+        .map_err(|error| map_shell_workdir_open_error(&error, cancellation, false))?;
         let metadata = directory
             .dir_metadata()
             .map_err(|error| map_shell_workdir_open_error(&error, cancellation, false))?;
@@ -852,7 +793,7 @@ impl Workspace {
             return Err(ToolCallError::aborted());
         }
         Ok(PreparedShellWorkdir {
-            root: Arc::clone(&self.root),
+            root: Arc::clone(self.authority.root()),
             directory,
             relative: path.relative,
             display: path.display,
@@ -867,7 +808,7 @@ impl Workspace {
         cancellation: &CancellationToken,
     ) -> ToolCallResult<EntryKind> {
         check_cancel(cancellation)?;
-        let root = Arc::clone(&self.root);
+        let root = Arc::clone(self.authority.root());
         let relative = path.relative.clone();
         let display = path.display.clone();
         let result = task::spawn_blocking(move || {
@@ -900,7 +841,7 @@ impl Workspace {
         cancellation: &CancellationToken,
     ) -> ToolCallResult<Vec<WorkspaceEntry>> {
         check_cancel(cancellation)?;
-        let root = Arc::clone(&self.root);
+        let root = Arc::clone(self.authority.root());
         let relative = path.relative.clone();
         let display = path.display.clone();
         let cursor = task::spawn_blocking(move || {
@@ -1065,7 +1006,7 @@ impl Workspace {
         cancellation: &CancellationToken,
     ) -> ToolCallResult<ReadFile> {
         check_cancel(cancellation)?;
-        let root = Arc::clone(&self.root);
+        let root = Arc::clone(self.authority.root());
         let relative = path.relative.clone();
         let display = path.display.clone();
         let opened = task::spawn_blocking(move || {

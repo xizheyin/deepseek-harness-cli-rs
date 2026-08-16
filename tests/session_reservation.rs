@@ -58,8 +58,11 @@ fn a_claim_protects_the_last_event_slot_until_it_is_settled() {
         reservation.append(NewEvent::log(EventKind::EndSeed)),
         Err(AppendError::ReservedEventLimit { reserved: 1, .. })
     ));
-    let seq = reservation.settle_exact(&mut turn_end).unwrap();
-    assert_eq!(usize::try_from(seq.get()).unwrap(), MAX_SESSION_EVENTS - 1);
+    let receipt = reservation.settle_exact(&mut turn_end).unwrap();
+    assert_eq!(
+        usize::try_from(receipt.seq().get()).unwrap(),
+        MAX_SESSION_EVENTS - 1
+    );
     assert_eq!(reservation.session().events().len(), MAX_SESSION_EVENTS);
     assert_eq!(reservation.session().state().open_turn(), None);
 }
@@ -121,10 +124,12 @@ fn settlement_falls_back_when_the_preferred_payload_would_invade_other_claims() 
         }],
     });
 
-    assert_eq!(
-        reservation.settle(&mut first, preferred).unwrap(),
-        ClaimedAppend::Fallback(reservation.session().events().last().unwrap().seq())
-    );
+    let settlement = reservation.settle(&mut first, preferred).unwrap();
+    let expected = reservation.session().events().last().unwrap().seq();
+    assert!(matches!(
+        settlement,
+        ClaimedAppend::Fallback(receipt) if receipt.seq() == expected
+    ));
     reservation.settle_exact(&mut second).unwrap();
     assert!(matches!(
         reservation.session().events().last().unwrap().kind(),

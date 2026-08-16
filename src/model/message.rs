@@ -1,5 +1,7 @@
 //! Messages, content blocks, and merge-extensible provenance.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
@@ -411,14 +413,37 @@ impl<'de> Deserialize<'de> for MessageSource {
 }
 
 /// One immutable message shared by delivery, durable history, and model requests.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Cloning a message is intentionally shallow. Phase 8 needs the same bounded
+/// payload to be owned by the active Session surface, a provider request, and a
+/// turn outcome without allocating another complete JSON tree for every owner.
+#[derive(Clone)]
 pub struct Message {
+    inner: Arc<MessageInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MessageInner {
     id: MessageId,
     role: MessageRole,
     content: Vec<ContentBlock>,
     source: MessageSource,
     raw: JsonValue,
 }
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+impl PartialEq for Message {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl Eq for Message {}
 
 impl Message {
     /// Construct and validate a message with an explicit role and source.
@@ -445,13 +470,7 @@ impl Message {
             "source": source,
         });
         let raw = JsonValue::new(value)?;
-        Ok(Self {
-            id,
-            role,
-            content,
-            source,
-            raw,
-        })
+        Ok(Self::from_parts(id, role, content, source, raw))
     }
 
     /// Construct a direct or injected user-role message.
@@ -534,53 +553,71 @@ impl Message {
                 .cloned()
                 .ok_or_else(|| shape("message", "missing source"))?,
         )?;
-        Ok(Self {
-            id: MessageId::new(id),
+        Ok(Self::from_parts(
+            MessageId::new(id),
             role,
             content,
             source,
             raw,
-        })
+        ))
+    }
+
+    fn from_parts(
+        id: MessageId,
+        role: MessageRole,
+        content: Vec<ContentBlock>,
+        source: MessageSource,
+        raw: JsonValue,
+    ) -> Self {
+        Self {
+            inner: Arc::new(MessageInner {
+                id,
+                role,
+                content,
+                source,
+                raw,
+            }),
+        }
     }
 
     /// Stable message identity.
     #[must_use]
     pub fn id(&self) -> &MessageId {
-        &self.id
+        &self.inner.id
     }
 
     /// Provider-neutral role.
     #[must_use]
     pub fn role(&self) -> MessageRole {
-        self.role
+        self.inner.role
     }
 
     /// Ordered model-facing content.
     #[must_use]
     pub fn content(&self) -> &[ContentBlock] {
-        &self.content
+        &self.inner.content
     }
 
     /// Producer identity and provenance.
     #[must_use]
     pub fn source(&self) -> &MessageSource {
-        &self.source
+        &self.inner.source
     }
 
     /// Exact bounded JSON, including plugin-added fields.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
     }
 
     pub(crate) fn validate_tool_result(&self) -> Result<&CallId, ModelError> {
-        if self.role != MessageRole::User {
+        if self.inner.role != MessageRole::User {
             return Err(ModelError::InvalidToolResult);
         }
-        let MessageSourceKind::Tool { call_id } = self.source.kind() else {
+        let MessageSourceKind::Tool { call_id } = self.inner.source.kind() else {
             return Err(ModelError::InvalidToolResult);
         };
-        let [block] = self.content.as_slice() else {
+        let [block] = self.inner.content.as_slice() else {
             return Err(ModelError::InvalidToolResult);
         };
         let ContentBlockKind::ToolResult { tool_call_id, .. } = block.kind() else {
@@ -594,7 +631,7 @@ impl Message {
 
     pub(crate) fn tool_result_is_error(&self) -> bool {
         matches!(
-            self.content.as_slice(),
+            self.inner.content.as_slice(),
             [block]
                 if matches!(
                     block.kind(),
@@ -604,7 +641,7 @@ impl Message {
     }
 
     pub(crate) fn validate_user_event(&self) -> Result<(), ModelError> {
-        if self.role != MessageRole::User {
+        if self.inner.role != MessageRole::User {
             return Err(ModelError::WrongMessageShape { expected: "user" });
         }
         Ok(())
@@ -613,13 +650,13 @@ impl Message {
     pub(crate) fn validate_assistant_event(&self) -> Result<(), ModelError> {
         let MessageSourceKind::Model {
             provider, model, ..
-        } = self.source.kind()
+        } = self.inner.source.kind()
         else {
             return Err(ModelError::WrongMessageShape {
                 expected: "assistant/model",
             });
         };
-        if self.role != MessageRole::Assistant {
+        if self.inner.role != MessageRole::Assistant {
             return Err(ModelError::WrongMessageShape {
                 expected: "assistant/model",
             });
@@ -639,7 +676,7 @@ impl Serialize for Message {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -786,4 +823,29 @@ fn parse_message_source(value: &Value) -> Result<MessageSourceKind, ModelError> 
         }
         _ => MessageSourceKind::Other { kind: tag },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{ContentBlock, Message, MessageSource};
+
+    #[test]
+    fn message_clone_shares_one_immutable_payload() {
+        let message = Message::user(
+            "message-1",
+            vec![ContentBlock::text("x".repeat(1024)).unwrap()],
+            MessageSource::user().unwrap(),
+        )
+        .unwrap();
+        let cloned = message.clone();
+
+        assert!(Arc::ptr_eq(&message.inner, &cloned.inner));
+        assert_eq!(message, cloned);
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            serde_json::to_value(&cloned).unwrap()
+        );
+    }
 }

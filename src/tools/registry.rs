@@ -9,6 +9,7 @@ use crate::{
         ToolExecutorError,
     },
     model::{ContentBlock, JsonValue, ToolSchema},
+    workspace_authority::WorkspaceAuthority,
 };
 
 use super::{
@@ -158,7 +159,20 @@ impl std::fmt::Debug for LocalToolRegistry {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LocalToolRegistry {
     pub fn open(workspace: impl AsRef<Path>) -> Result<Self, ToolRegistryBuildError> {
-        let workspace = Arc::new(Workspace::open(workspace.as_ref())?);
+        let path = workspace.as_ref();
+        let authority = WorkspaceAuthority::open(path).map_err(|source| {
+            ToolRegistryBuildError::InvalidWorkspace {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+        Self::from_authority(authority)
+    }
+
+    pub(crate) fn from_authority(
+        authority: WorkspaceAuthority,
+    ) -> Result<Self, ToolRegistryBuildError> {
+        let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
         let runner = Arc::new(
             ProcessRunner::open()

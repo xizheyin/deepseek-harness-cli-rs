@@ -933,6 +933,31 @@ The persistence implementation and contract evidence are:
   side effects, and a completed response/result prefix is flushed before the
   next step.
 
+The lightweight listing seam was also checked directly. The abstract metadata
+API is in `packages/session/session-persistence/src/index.ts:223-240`; the JSONL
+implementation in
+`packages/session/session-persistence-jsonl/src/index.ts:446-509,705-770`
+reads only the first complete line in 8 KiB chunks, skips empty/half-written or
+non-header artifacts, and does not load the event body. Root absence versus
+other I/O errors is fixed by `index.ts:850-873`, header-only parsing by
+`format.ts:396-413`, and the user-facing stable order by
+`packages/workspace/workspace/src/index.ts:82-83`. The focused fixed-commit run
+was:
+
+```console
+cd /Users/xizheyin/workspace/deepseek-harness-upstream
+pnpm exec vitest run --configLoader runner --config vitest.config.ts \
+  packages/session/session-persistence-jsonl/tests/jsonl.spec.ts \
+  -t 'list'
+```
+
+Vitest 4.1.8 reported one file passed, 12 tests passed, and 139 skipped in
+562 ms. The checkout was at the pinned commit and clean before and after. This
+supports header-only discovery, not an official `dsh --list-sessions` command:
+the Rust CLI surface, flat canonical filenames, 64 KiB header ceiling,
+128/256-entry bounds, no-follow permission checks, workspace-identity filter,
+and escaped TSV output are documented Rust product/security differences.
+
 At this revision the core `Session` appends with `seq = log.length` and has no
 4,096-event or 16 MiB lifetime ceiling. A read-only local probe appended 5,000
 `assistant/chunk` events and then another event successfully with continuous

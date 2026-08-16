@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicI64, Ordering},
 };
 
-use crate::model::{ContentBlock, Message, StreamChunk};
+use crate::model::{ContentBlock, Message, MessageSource, StreamChunk};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::{
@@ -125,20 +125,50 @@ fn committed_events_arrive_once_in_sequence_after_claim_settlement() {
 }
 
 #[test]
+fn append_receipt_owns_the_committed_surface_message_after_later_appends() {
+    let mut session = session("owned-append-receipt");
+    session
+        .append(NewEvent::log(EventKind::turn_start(turn(1))))
+        .unwrap();
+    let message = Message::user(
+        "user-1",
+        vec![ContentBlock::text("hello").unwrap()],
+        MessageSource::user().unwrap(),
+    )
+    .unwrap();
+    let receipt = session
+        .append(NewEvent::surface(
+            EventKind::user_message(message.clone()),
+            SurfaceIntent::append(),
+        ))
+        .unwrap();
+
+    session.append(NewEvent::log(EventKind::EndSeed)).unwrap();
+
+    assert_eq!(receipt.seq(), EventSeq::new(1).unwrap());
+    assert_eq!(receipt.time(), UnixMillis::new(1_002).unwrap());
+    assert_eq!(receipt.event_type(), "user/message");
+    assert!(!receipt.observer_faulted());
+    assert_eq!(receipt.committed_message(), Some(&message));
+}
+
+#[test]
 fn observer_full_faults_only_after_the_session_commit() {
     let mut session = session("full-observer");
     let mut receiver = session.attach_ui_observer_for_test(1).unwrap();
 
-    session
+    let first = session
         .append(NewEvent::log(EventKind::turn_start(turn(1))))
         .unwrap();
-    session
+    let second = session
         .append(NewEvent::log(EventKind::step_start(turn(1), step(1))))
         .unwrap();
 
     assert_eq!(session.events().len(), 2);
     assert_eq!(session.next_seq(), Some(EventSeq::new(2).unwrap()));
     assert_eq!(session.state().open_step(), Some(step(1)));
+    assert!(!first.observer_faulted());
+    assert!(second.observer_faulted());
     assert!(receiver.is_producer_faulted());
     assert_eq!(receiver.try_recv().unwrap().seq, EventSeq::new(0).unwrap());
     assert!(matches!(
@@ -167,20 +197,22 @@ fn injected_projection_failure_faults_only_after_commit() {
     let mut receiver = session.attach_ui_observer().unwrap();
     receiver.fail_next_projection_for_test();
 
-    session
+    let receipt = session
         .append(NewEvent::log(EventKind::turn_start(turn(1))))
         .unwrap();
 
     assert_eq!(session.events().len(), 1);
     assert_eq!(session.state().open_turn(), Some(turn(1)));
+    assert!(receipt.observer_faulted());
     assert!(receiver.is_producer_faulted());
     assert!(matches!(
         receiver.try_recv(),
         Err(TryRecvError::Disconnected)
     ));
-    session
+    let later = session
         .append(NewEvent::log(EventKind::step_start(turn(1), step(1))))
         .unwrap();
+    assert!(later.observer_faulted());
     assert_eq!(session.events().len(), 2);
     assert!(matches!(
         receiver.try_recv(),
@@ -195,11 +227,12 @@ fn closed_receiver_detaches_without_faulting_or_rolling_back() {
     let fault = receiver.fault_handle_for_test();
     drop(receiver);
 
-    session
+    let receipt = session
         .append(NewEvent::log(EventKind::turn_start(turn(1))))
         .unwrap();
 
     assert_eq!(session.events().len(), 1);
+    assert!(!receipt.observer_faulted());
     assert!(!fault.load(Ordering::SeqCst));
     assert!(matches!(
         session.attach_ui_observer(),
@@ -226,25 +259,33 @@ fn fresh_capacity_theorem_holds_without_a_consumer() {
 
 #[test]
 fn source_bitmap_maps_word_edges_and_has_a_fixed_allocation() {
-    let sources = [0_u64, 63, 64, 4_095]
+    let sources = [50_000_u64, 50_063, 50_064, 54_095]
         .into_iter()
         .map(|value| EventSeq::new(value).unwrap())
         .collect::<Vec<_>>();
     let bitmap = SourceSeqBitmap::from_sources(&sources).unwrap();
 
+    assert_eq!(bitmap.base_for_test(), EventSeq::new(50_000).unwrap());
     assert_eq!(bitmap.word_len_for_test(), 64);
     assert!(bitmap.word_capacity_for_test() <= 128);
     assert!(bitmap.allocated_bytes_for_test() <= 1_024);
     for source in sources {
         assert!(bitmap.contains(source));
     }
-    assert!(!bitmap.contains(EventSeq::new(62).unwrap()));
+    assert!(!bitmap.contains(EventSeq::new(50_062).unwrap()));
+    assert!(!bitmap.contains(EventSeq::new(49_999).unwrap()));
     assert_eq!(4_096 * 1_024, 4 * 1_024 * 1_024);
 }
 
 #[test]
-fn source_bitmap_rejects_out_of_domain_and_capacity_policy_overflow() {
-    assert!(SourceSeqBitmap::from_sources(&[EventSeq::new(4_096).unwrap()]).is_err());
+fn source_bitmap_rejects_a_span_larger_than_one_provider_attempt() {
+    assert!(
+        SourceSeqBitmap::from_sources(&[
+            EventSeq::new(50_000).unwrap(),
+            EventSeq::new(54_096).unwrap(),
+        ])
+        .is_err()
+    );
     assert!(SourceSeqBitmap::capacity_is_acceptable_for_test(128));
     assert!(!SourceSeqBitmap::capacity_is_acceptable_for_test(129));
     let mut overallocated = Vec::with_capacity(129);

@@ -17,11 +17,14 @@ DeepSeek Harness 核心能力的 Rust CLI 实现项目。
 - 通过 `--prompt` 或管道输入运行一次脚本化请求。脚本模式会安全拒绝文件写入和
   Shell，不会停下来等待人工审批。
 
-终端界面故意保持为朴素的逐行文本，不使用全屏、ANSI 颜色或 raw mode。当前会话只在
-内存中：退出后不能恢复，持久化、恢复和上下文压缩属于 Phase 8。一个会话最多保留
-4,096 个事件和 16 MiB 数据；达到上限后 `dsh` 会安全退出，不会继续提供无法记录的
-新提示。获批的 Shell 是当前用户权限下的原生程序，不是安全沙箱；它可以访问工作区外
-资源，因此只应批准你理解的命令。当前 macOS 终端路径已完成本地验收；Ubuntu 24.04
+终端界面故意保持为朴素的逐行文本，不使用全屏、ANSI 颜色或 raw mode。新的 CLI 会话
+现在会写入私有、有上限、只追加的 JSONL 日志；`--list-sessions` 无需 API Key，也不会
+读取对话正文，只显示经过清理的会话头信息。`--resume` 可以安全打开同一会话：它会先
+校验完整历史和工作区身份，在发现可修复的中断尾部时先显示计划，再以只追加事件关闭
+未决状态；损坏或不支持的历史会在任何模型请求前失败。上下文压缩仍在 Phase 8 中实现。
+旧的 4,096 事件内存生命周期上限不再限制这条持久化 CLI 路径。获批的 Shell 是当前用户
+权限下的原生程序，不是安全沙箱；它可以访问工作区外资源，因此只应批准你理解的命令。
+当前 macOS 终端路径已完成本地验收；Ubuntu 24.04
 也已通过同一固定提交的远程 CI 验收。其他 Linux 发行版、Windows 和其他系统尚未声明
 支持。
 
@@ -41,6 +44,22 @@ cargo run --locked -- --workspace .
 ```console
 cargo run --locked -- --workspace . --prompt '概括这个项目的目录结构'
 printf '读取 README.md 并概括当前限制\n' | cargo run --locked -- --workspace .
+```
+
+只列出已经持久化的会话头（会话 ID、Unix 毫秒创建时间和安全转义的工作区路径）：
+
+```console
+cargo run --locked -- --list-sessions
+cargo run --locked -- --list-sessions --workspace .
+```
+
+从列表复制一个规范的会话 ID 后继续对话；不传 `--workspace` 时使用日志中已经验证过的
+原工作区，不传 `--model` 时沿用最近一次记录的模型：
+
+```console
+cargo run --locked -- --resume session-550e8400-e29b-41d4-a716-446655440000
+cargo run --locked -- --resume session-550e8400-e29b-41d4-a716-446655440000 \
+  --prompt '继续上一项工作'
 ```
 
 API Key 只从进程环境按请求读取，不会有意写入会话或终端输出。不要把真实密钥放进

@@ -4,6 +4,7 @@ mod support;
 
 use std::{
     io::Write,
+    process::Command,
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
@@ -16,7 +17,7 @@ use support::{
         SplitSseServer, StalledSseServer,
     },
     process_state,
-    pty::{DisabledTerminalMode, JobControlHarness, PtyHarness},
+    pty::{DisabledTerminalMode, JobControlHarness, PtyHarness, TestSessionRoot},
 };
 
 static WORKSPACE_NUMBER: AtomicUsize = AtomicUsize::new(0);
@@ -63,6 +64,30 @@ fn repeated_text_sse_with_width(delta_count: usize, text_bytes: usize) -> String
         body.push_str(&delta);
     }
     body.push_str(ending);
+    body
+}
+
+fn reasoning_sse(delta_count: usize, final_text: &str) -> String {
+    let reasoning_delta =
+        concat!("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"r\"}}]}\n\n",);
+    let final_text = serde_json::to_string(final_text).expect("test answer should encode");
+    let ending = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{final_text}}}}}]}}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+         data: [DONE]\n\n"
+    );
+    let mut body = String::new();
+    body.try_reserve(
+        reasoning_delta
+            .len()
+            .saturating_mul(delta_count)
+            .saturating_add(ending.len()),
+    )
+    .expect("bounded reasoning response should allocate");
+    for _ in 0..delta_count {
+        body.push_str(reasoning_delta);
+    }
+    body.push_str(&ending);
     body
 }
 
@@ -237,7 +262,7 @@ fn interactive_help_quit_and_idle_ctrl_d_are_real_terminal_commands() {
     let workspace = TestWorkspace::new();
     let mut quit = PtyHarness::spawn(&server.base_url, &workspace.0);
 
-    quit.expect(b"[dsh interactive; session is in memory]");
+    quit.expect(b"dsh | interactive; new session ");
     quit.expect(b"dsh > ");
     quit.write(b"/help\r");
     quit.expect(b"[commands]");
@@ -587,10 +612,124 @@ fn interactive_dsh_keeps_committed_history_across_two_turns() {
 }
 
 #[test]
-fn real_event_ceiling_renders_the_terminal_failure_once_and_does_not_offer_a_dead_prompt() {
-    // The first ordinary turn leaves only a small amount of Session capacity.
-    // The second stream then reaches the real 4,096-event ceiling while the
-    // Agent still retains enough reserved room to close step/turn honestly.
+fn interactive_resume_reuses_the_stored_context_and_reaches_a_new_prompt() {
+    let server = SequenceSseServer::start(vec![
+        text_sse("seeded answer"),
+        text_sse("answer after interactive resume"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let caller_workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let seeded = Command::new(env!("CARGO_BIN_EXE_dsh"))
+        .args([
+            "--prompt",
+            "seed this durable session",
+            "--model",
+            "deepseek-chat",
+            "--workspace",
+            workspace.0.to_str().unwrap(),
+            "--no-color",
+        ])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &server.base_url)
+        .env("DEEPSEEK_API_KEY", "test-key-for-loopback-only")
+        .env("DSH_SESSION_ROOT", session_root.path())
+        .env("HOME", &workspace.0)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("seed script should run");
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    assert_eq!(seeded.stdout, b"seeded answer\n");
+
+    let entries = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let filename = entries[0].file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+
+    let mut dsh = PtyHarness::spawn_resume(
+        &server.base_url,
+        &caller_workspace.0,
+        session_root,
+        &session_id,
+    );
+    dsh.expect(format!("dsh | interactive; resumed session {session_id}").as_bytes());
+    dsh.expect(b"dsh > ");
+    dsh.write(b"continue interactively\r");
+    dsh.expect(b"assistant | answer after interactive resume");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("\"content\":\"seed this durable session\""));
+    assert!(requests[1].contains("\"content\":\"seeded answer\""));
+    assert!(requests[1].contains("\"content\":\"continue interactively\""));
+}
+
+#[test]
+fn long_reasoning_across_three_turns_continues_past_the_old_event_ceiling() {
+    let server = SequenceSseServer::start(vec![
+        reasoning_sse(1_400, "first long answer"),
+        reasoning_sse(1_400, "second long answer"),
+        reasoning_sse(1_400, "third long answer"),
+        text_sse("answer after the old ceiling"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_rolling(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    for (index, (turn, answer)) in [
+        (
+            b"first long task".as_slice(),
+            b"assistant | first long answer".as_slice(),
+        ),
+        (
+            b"second long task".as_slice(),
+            b"assistant | second long answer".as_slice(),
+        ),
+        (
+            b"third long task".as_slice(),
+            b"assistant | third long answer".as_slice(),
+        ),
+        (
+            b"continue after long reasoning".as_slice(),
+            b"assistant | answer after the old ceiling".as_slice(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        dsh.write(turn);
+        dsh.write(b"\r");
+        dsh.expect(answer);
+        dsh.expect_occurrences(b"dsh > ", index + 2);
+    }
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2].contains("first long answer"));
+    assert!(requests[2].contains("second long answer"));
+    assert!(
+        !transcript
+            .windows(b"AGENT_EVENT_BUDGET".len())
+            .any(|window| window == b"AGENT_EVENT_BUDGET")
+    );
+}
+
+#[test]
+fn durable_session_continues_after_crossing_the_old_real_event_ceiling() {
     let server = SequenceSseServer::start(vec![repeated_text_sse(3_975), repeated_text_sse(120)]);
     let workspace = TestWorkspace::new();
     let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
@@ -601,67 +740,49 @@ fn real_event_ceiling_renders_the_terminal_failure_once_and_does_not_offer_a_dea
     dsh.expect_occurrences(b"dsh > ", 2);
 
     dsh.write(b"reach the remaining event ceiling\r");
-    dsh.expect(b"[turn error]");
-    dsh.expect(b"AGENT_EVENT_BUDGET");
-    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(10));
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    let (status, transcript) = dsh.exit_cleanly();
     let requests = server.finish();
 
-    assert_eq!(status.code(), Some(1));
+    assert!(status.success());
     assert_eq!(requests.len(), 2);
     assert_eq!(
         transcript
             .windows(b"AGENT_EVENT_BUDGET".len())
             .filter(|window| *window == b"AGENT_EVENT_BUDGET")
             .count(),
-        1
-    );
-    assert_eq!(
-        transcript
-            .windows(b"dsh > ".len())
-            .filter(|window| *window == b"dsh > ")
-            .count(),
-        2
+        0
     );
 }
 
 #[test]
-fn real_retained_json_ceiling_renders_once_and_exits_without_a_dead_prompt() {
-    // Twenty tool calls are far below the 4,096-event ceiling. Their bounded
-    // arguments are invalid for `read`: they enter durable Agent facts, while
-    // the UI omits the bodies and the tool performs no filesystem read.
+fn durable_session_continues_after_crossing_the_old_retained_json_ceiling() {
     let server = SequenceSseServer::start(vec![
         many_invalid_read_calls_sse("large-call-a", 16, 220_000),
         many_invalid_read_calls_sse("large-call-b", 4, 220_000),
+        text_sse("answer after the old retained limit"),
     ]);
     let workspace = TestWorkspace::new();
     let mut dsh = PtyHarness::spawn_rolling(&server.base_url, &workspace.0);
 
     dsh.expect(b"dsh > ");
     dsh.write(b"cross the retained session byte ceiling with hidden arguments\r");
-    dsh.expect(b"[turn error]");
-    dsh.expect(b"AGENT_EVENT_BUDGET");
-    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(10));
+    dsh.expect(b"assistant | answer after the old retained limit");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
     let requests = server.finish();
 
-    assert_eq!(status.code(), Some(1));
-    assert_eq!(requests.len(), 2);
+    assert!(status.success());
+    assert_eq!(requests.len(), 3);
     assert!(requests[1].contains("large-call-a-15"));
     assert_eq!(
         transcript
             .windows(b"AGENT_EVENT_BUDGET".len())
             .filter(|window| *window == b"AGENT_EVENT_BUDGET")
             .count(),
-        1
-    );
-    let error = transcript
-        .windows(b"AGENT_EVENT_BUDGET".len())
-        .rposition(|window| window == b"AGENT_EVENT_BUDGET")
-        .expect("terminal error should remain in the rolling tail");
-    assert!(
-        !transcript[error..]
-            .windows(b"dsh > ".len())
-            .any(|window| window == b"dsh > "),
-        "an exhausted in-memory Session must not offer another prompt"
+        0
     );
 }
 

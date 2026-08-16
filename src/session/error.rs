@@ -137,6 +137,52 @@ pub enum TransitionError {
         event_type: &'static str,
         approval_id: super::ApprovalRequestId,
     },
+    #[error("durable tool call {call_id} has an invalid id or tool name")]
+    InvalidDurableToolCallIdentity { call_id: CallId },
+    #[error("a durable step may declare at most {maximum} tool calls")]
+    TooManyDurableToolCalls { maximum: usize },
+    #[error("durable assistant messages cannot declare call id {call_id} twice in one step")]
+    DuplicateDurableToolCall { call_id: CallId },
+    #[error("durable tool/call {call_id} has no next assistant declaration")]
+    DurableToolCallWithoutDeclaration { call_id: CallId },
+    #[error("durable tool/call {actual} does not match the next declaration {expected}")]
+    DurableToolCallMismatch { expected: CallId, actual: CallId },
+    #[error("durable approval/asked must name its tool call")]
+    DurableApprovalWithoutCall,
+    #[error("durable approval references unavailable call {call_id}")]
+    DurableApprovalCallMismatch { call_id: CallId },
+    #[error("durable approval tool {actual:?} does not match declared tool {expected:?}")]
+    DurableApprovalToolMismatch { expected: String, actual: String },
+    #[error("durable call {call_id} cannot ask for approval more than once")]
+    DurableApprovalRepeated { call_id: CallId },
+    #[error("durable state permits only one pending approval; {pending} is still pending")]
+    MultipleDurableApprovals { pending: super::ApprovalRequestId },
+    #[error("durable approval decision {approval_id} is not owned by an unresolved call")]
+    DurableApprovalDecisionMismatch {
+        approval_id: super::ApprovalRequestId,
+    },
+    #[error("durable tool/result does not match declared call {call_id}")]
+    DurableToolResultMismatch { call_id: CallId },
+    #[error("durable tool/result repeats the result for call {call_id}")]
+    DuplicateDurableToolResult { call_id: CallId },
+    #[error("durable tool/result for call {call_id} arrived before its approval decision")]
+    DurableToolResultBeforeDecision { call_id: CallId },
+    #[error("durable tool/result for call {call_id} cites the wrong intent source")]
+    DurableToolResultWrongSource { call_id: CallId },
+    #[error("durable tool/result for call {call_id} has no intent and is not a canonical repair")]
+    DurableToolResultWithoutIntent { call_id: CallId },
+    #[error("{event_type} can be appended only by the owned recovery lifecycle")]
+    DurableRecoveryEventNotAllowed { event_type: &'static str },
+    #[error("durable result for call {call_id} does not match approval decision {approval_id}")]
+    DurableApprovalResultMismatch {
+        approval_id: super::ApprovalRequestId,
+        call_id: CallId,
+    },
+    #[error("{event_type} cannot close while durable call {call_id} has no result")]
+    DurableCallStillPending {
+        event_type: &'static str,
+        call_id: CallId,
+    },
     #[error("turn or step number has no representable successor")]
     IdentifierExhausted,
 }
@@ -208,8 +254,24 @@ pub enum EventValidationError {
 }
 
 /// A live append failed before changing committed session state.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AppendError {
+    #[error("a deferred durable session must be materialized before appending")]
+    NeedsMaterialization,
+    #[error("an active durable session requires the asynchronous append path")]
+    DurableAsyncRequired,
+    #[error("the durable session is poisoned")]
+    DurablePoisoned,
+    #[error("the durable session writer could not settle the event")]
+    DurableWriter,
+    #[error("the event cannot fit one durable journal record")]
+    DurableRecord,
+    #[error("the previous durable append must be settled before another event starts")]
+    NeedsAppendSettle,
+    #[error("the durable session reached its ordinary limit of {maximum} logical events")]
+    DurableEventLimit { maximum: u64 },
+    #[error("the durable session reached its ordinary limit of {maximum} journal bytes")]
+    DurableByteLimit { maximum: u64 },
     #[error(transparent)]
     Clock(#[from] ClockError),
     #[error(transparent)]
@@ -234,6 +296,8 @@ pub enum AppendError {
         "event claim protects {reserved} compact JSON bytes, but the rebound payload needs {actual}"
     )]
     ClaimPayloadTooLarge { reserved: usize, actual: usize },
+    #[error("event claim protects {reserved} durable row bytes, but the event needs {actual}")]
+    ClaimRowTooLarge { reserved: u64, actual: u64 },
     #[error("could not reserve memory for the next session event")]
     Capacity,
 }
@@ -250,6 +314,8 @@ pub struct ReplayError {
 /// JSON syntax, wire-shape, or unknown-event failure.
 #[derive(Debug, Error)]
 pub enum CodecError {
+    #[error("durable session history must be read through the journal reader")]
+    DurableSnapshotUnavailable,
     #[error("invalid session JSON: {0}")]
     Syntax(#[from] serde_json::Error),
     #[error("session snapshot is {actual} bytes; maximum is {maximum} bytes")]

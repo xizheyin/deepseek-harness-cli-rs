@@ -92,8 +92,18 @@ impl LiveFrame {
         Self::trusted("dsh > ")
     }
 
-    pub(super) fn startup_banner() -> Result<Self, LiveRenderError> {
-        Self::trusted("[dsh interactive; session is in memory]\n")
+    pub(super) fn startup_banner(session_id: &str, resumed: bool) -> Result<Self, LiveRenderError> {
+        let state = if resumed { "resumed" } else { "new" };
+        let mut text = String::new();
+        text.try_reserve_exact(96).map_err(|_| LiveRenderError)?;
+        writeln!(&mut text, "interactive; {state} session {session_id}")
+            .map_err(|_| LiveRenderError)?;
+        let mut parts = try_parts(1)?;
+        parts.push(LivePart::Untrusted {
+            role: DSH_ROLE,
+            text,
+        });
+        Ok(Self { parts })
     }
 
     pub(super) fn help() -> Result<Self, LiveRenderError> {
@@ -868,16 +878,23 @@ mod tests {
     }
 
     #[test]
-    fn startup_banner_is_a_fixed_trusted_frame() {
+    fn startup_banner_names_the_session_and_lifecycle_safely() {
         let mut output = String::new();
         let mut presenter = InteractivePresenter::new();
         presenter
-            .render(&LiveFrame::startup_banner().unwrap(), |chunk| {
-                output.push_str(chunk);
-                Ok::<_, std::convert::Infallible>(())
-            })
+            .render(
+                &LiveFrame::startup_banner("session-550e8400-e29b-41d4-a716-446655440000", true)
+                    .unwrap(),
+                |chunk| {
+                    output.push_str(chunk);
+                    Ok::<_, std::convert::Infallible>(())
+                },
+            )
             .unwrap();
-        assert_eq!(output, "[dsh interactive; session is in memory]\n");
+        assert_eq!(
+            output,
+            "dsh | interactive; resumed session session-550e8400-e29b-41d4-a716-446655440000\n"
+        );
     }
 
     #[test]

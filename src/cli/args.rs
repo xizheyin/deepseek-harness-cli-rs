@@ -2,37 +2,37 @@ use std::ffi::OsString;
 
 use thiserror::Error;
 
+use crate::session::SessionId;
+
 pub(super) const MAX_ARGV_ENTRIES: usize = 16;
 pub(super) const MAX_ARGV_AGGREGATE_BYTES: usize = 1024 * 1024 + 8 * 1024;
 pub(super) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_WORKSPACE_BYTES: usize = 4_096;
 pub(super) const MAX_MODEL_BYTES: usize = 256;
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+pub(super) const MAX_SESSION_ID_BYTES: usize = 44;
+pub(super) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ParseAction {
     Help,
     Version,
+    ListSessions(ListSessionsOptions),
     Run(CliOptions),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct CliOptions {
-    pub(super) prompt: Option<String>,
-    pub(super) model: String,
+pub(super) struct ListSessionsOptions {
     pub(super) workspace: Option<String>,
     pub(super) no_color: bool,
 }
 
-impl Default for CliOptions {
-    fn default() -> Self {
-        Self {
-            prompt: None,
-            model: DEFAULT_MODEL.to_owned(),
-            workspace: None,
-            no_color: false,
-        }
-    }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct CliOptions {
+    pub(super) prompt: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) workspace: Option<String>,
+    pub(super) resume: Option<SessionId>,
+    pub(super) no_color: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -45,6 +45,8 @@ pub(super) enum ParseError {
     NonUnicode,
     #[error("help and version options must be used alone")]
     HelpOrVersionMustStandAlone,
+    #[error("--list-sessions permits only --workspace and --no-color")]
+    InvalidListSessionsOptions,
     #[error("invalid short option or option cluster")]
     InvalidShortOption,
     #[error("option {option} was supplied more than once")]
@@ -61,6 +63,8 @@ pub(super) enum ParseError {
     EmptyValue { option: &'static str },
     #[error("option {option} exceeds its size limit")]
     ValueTooLarge { option: &'static str },
+    #[error("--resume requires one canonical lower-case session UUID v4")]
+    InvalidSessionId,
 }
 
 pub(super) fn parse_args_os(
@@ -85,7 +89,9 @@ pub(super) fn parse_args_os(
     let mut prompt_seen = false;
     let mut model_seen = false;
     let mut workspace_seen = false;
+    let mut resume_seen = false;
     let mut no_color_seen = false;
+    let mut list_sessions_seen = false;
     let mut index = 0_usize;
     while index < arguments.len() {
         let argument = arguments[index].as_str();
@@ -102,11 +108,17 @@ pub(super) fn parse_args_os(
             index += 1;
             continue;
         }
+        if argument == "--list-sessions" {
+            mark_once(&mut list_sessions_seen, "--list-sessions")?;
+            index += 1;
+            continue;
+        }
 
         let long_value = [
             ("--prompt", "--prompt"),
             ("--model", "--model"),
             ("--workspace", "--workspace"),
+            ("--resume", "--resume"),
         ]
         .into_iter()
         .find_map(|(prefix, option)| {
@@ -123,6 +135,7 @@ pub(super) fn parse_args_os(
                 &mut prompt_seen,
                 &mut model_seen,
                 &mut workspace_seen,
+                &mut resume_seen,
             )?;
             index += 1;
             continue;
@@ -132,6 +145,7 @@ pub(super) fn parse_args_os(
             "--prompt" | "-p" => Some("--prompt"),
             "--model" | "-m" => Some("--model"),
             "--workspace" | "-w" => Some("--workspace"),
+            "--resume" => Some("--resume"),
             _ => None,
         };
         if let Some(option) = option {
@@ -145,6 +159,7 @@ pub(super) fn parse_args_os(
                 &mut prompt_seen,
                 &mut model_seen,
                 &mut workspace_seen,
+                &mut resume_seen,
             )?;
             index += 2;
             continue;
@@ -157,6 +172,15 @@ pub(super) fn parse_args_os(
             return Err(ParseError::InvalidShortOption);
         }
         return Err(ParseError::PositionalArgument);
+    }
+    if list_sessions_seen {
+        if prompt_seen || model_seen || resume_seen {
+            return Err(ParseError::InvalidListSessionsOptions);
+        }
+        return Ok(ParseAction::ListSessions(ListSessionsOptions {
+            workspace: options.workspace,
+            no_color: options.no_color,
+        }));
     }
     Ok(ParseAction::Run(options))
 }
@@ -197,11 +221,13 @@ fn set_value(
     prompt_seen: &mut bool,
     model_seen: &mut bool,
     workspace_seen: &mut bool,
+    resume_seen: &mut bool,
 ) -> Result<(), ParseError> {
     let (seen, maximum) = match option {
         "--prompt" => (&mut *prompt_seen, MAX_PROMPT_BYTES),
         "--model" => (&mut *model_seen, MAX_MODEL_BYTES),
         "--workspace" => (&mut *workspace_seen, MAX_WORKSPACE_BYTES),
+        "--resume" => (&mut *resume_seen, MAX_SESSION_ID_BYTES),
         _ => return Err(ParseError::UnknownOption),
     };
     mark_once(seen, option)?;
@@ -213,11 +239,26 @@ fn set_value(
     }
     match option {
         "--prompt" => options.prompt = Some(value.to_owned()),
-        "--model" => options.model = value.to_owned(),
+        "--model" => options.model = Some(value.to_owned()),
         "--workspace" => options.workspace = Some(value.to_owned()),
+        "--resume" => options.resume = Some(parse_session_id(value)?),
         _ => return Err(ParseError::UnknownOption),
     }
     Ok(())
+}
+
+fn parse_session_id(value: &str) -> Result<SessionId, ParseError> {
+    let suffix = value
+        .strip_prefix("session-")
+        .ok_or(ParseError::InvalidSessionId)?;
+    let parsed = uuid::Uuid::parse_str(suffix).map_err(|_| ParseError::InvalidSessionId)?;
+    if parsed.get_variant() != uuid::Variant::RFC4122
+        || parsed.get_version() != Some(uuid::Version::Random)
+        || suffix != parsed.hyphenated().to_string()
+    {
+        return Err(ParseError::InvalidSessionId);
+    }
+    Ok(SessionId::new(value))
 }
 
 #[cfg(test)]
@@ -229,7 +270,8 @@ mod tests {
 
     use super::{
         MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES, MAX_PROMPT_BYTES,
-        MAX_WORKSPACE_BYTES, ParseAction, ParseError, admit_args_os, parse_args_os,
+        MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError, admit_args_os,
+        parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -283,7 +325,7 @@ mod tests {
             panic!("expected run options");
         };
         assert_eq!(options.prompt.as_deref(), Some("hello"));
-        assert_eq!(options.model, "model-a");
+        assert_eq!(options.model.as_deref(), Some("model-a"));
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
         assert!(options.no_color);
     }
@@ -295,7 +337,7 @@ mod tests {
             panic!("expected run options");
         };
         assert_eq!(options.prompt.as_deref(), Some("--model"));
-        assert_eq!(options.model, "chosen");
+        assert_eq!(options.model.as_deref(), Some("chosen"));
         assert_eq!(options.workspace.as_deref(), Some("/tmp"));
 
         for value in ["-ptext", "-mmodel", "-w/tmp", "-pn"] {
@@ -312,6 +354,11 @@ mod tests {
             &["-p", "one", "--prompt=two"][..],
             &["-m", "one", "--model=two"][..],
             &["-w", "/one", "--workspace=/two"][..],
+            &[
+                "--resume",
+                "session-550e8400-e29b-41d4-a716-446655440000",
+                "--resume=session-550e8400-e29b-41d4-a716-446655440001",
+            ][..],
             &["--no-color", "--no-color"][..],
         ] {
             assert!(matches!(
@@ -323,7 +370,15 @@ mod tests {
 
     #[test]
     fn missing_unknown_and_positional_arguments_are_rejected() {
-        for option in ["--prompt", "--model", "--workspace", "-p", "-m", "-w"] {
+        for option in [
+            "--prompt",
+            "--model",
+            "--workspace",
+            "--resume",
+            "-p",
+            "-m",
+            "-w",
+        ] {
             assert!(matches!(
                 parse_args_os(os(&[option])),
                 Err(ParseError::MissingValue { .. })
@@ -362,6 +417,7 @@ mod tests {
             &["--prompt", " \t\n"][..],
             &["--model="][..],
             &["--workspace="][..],
+            &["--resume="][..],
         ] {
             assert!(matches!(
                 parse_args_os(os(values)),
@@ -389,6 +445,10 @@ mod tests {
         assert!(matches!(
             parse_args_os(os(&["--model", &over_multibyte])),
             Err(ParseError::ValueTooLarge { .. })
+        ));
+        assert!(matches!(
+            parse_args_os(os(&["--resume", &"x".repeat(MAX_SESSION_ID_BYTES + 1)])),
+            Err(ParseError::ValueTooLarge { option: "--resume" })
         ));
     }
 
@@ -435,8 +495,76 @@ mod tests {
             panic!("expected run options");
         };
         assert_eq!(options.prompt, None);
-        assert_eq!(options.model, "deepseek-v4-flash");
+        assert_eq!(options.model, None);
         assert_eq!(options.workspace, None);
+        assert_eq!(options.resume, None);
         assert!(!options.no_color);
+    }
+
+    #[test]
+    fn session_listing_has_a_closed_option_surface() {
+        let action = parse_args_os(os(&[
+            "--list-sessions",
+            "--workspace=/tmp/work",
+            "--no-color",
+        ]))
+        .unwrap();
+        let ParseAction::ListSessions(options) = action else {
+            panic!("expected list-sessions options");
+        };
+        assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
+        assert!(options.no_color);
+
+        for values in [
+            &["--list-sessions", "--prompt", "hello"][..],
+            &["--list-sessions", "--model", "deepseek-chat"][..],
+            &[
+                "--list-sessions",
+                "--resume",
+                "session-550e8400-e29b-41d4-a716-446655440000",
+            ][..],
+            &["--list-sessions", "--list-sessions"][..],
+        ] {
+            assert!(parse_args_os(os(values)).is_err());
+        }
+    }
+
+    #[test]
+    fn resume_accepts_only_one_canonical_lower_case_uuid_v4() {
+        let canonical = "session-550e8400-e29b-41d4-a716-446655440000";
+        let action = parse_args_os(os(&[
+            "--resume",
+            canonical,
+            "--prompt",
+            "continue",
+            "--model",
+            "deepseek-chat",
+            "--workspace=/tmp/work",
+        ]))
+        .unwrap();
+        let ParseAction::Run(options) = action else {
+            panic!("expected run options");
+        };
+        assert_eq!(
+            options.resume.as_ref().map(|id| id.as_str()),
+            Some(canonical)
+        );
+        assert_eq!(options.prompt.as_deref(), Some("continue"));
+        assert_eq!(options.model.as_deref(), Some("deepseek-chat"));
+
+        for invalid in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "session-session-550e8400-e29b-41d4-a716-446655440000",
+            "session-550E8400-E29B-41D4-A716-446655440000",
+            "session-550e8400-e29b-11d4-a716-446655440000",
+            "session-550e8400-e29b-41d4-c716-446655440000",
+            "session-../550e8400-e29b-41d4-a716-446655440000",
+            "session-550e8400-e29b-41d4-a716/446655440000",
+            "session-550e8400-e29b-41d4-a716-446655440000.jsonl",
+            "session-550e8400-e29b-41d4-a716-446655440000\0",
+            "session-not-a-uuid",
+        ] {
+            assert!(parse_args_os(os(&["--resume", invalid])).is_err());
+        }
     }
 }

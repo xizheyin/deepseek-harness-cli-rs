@@ -1,7 +1,6 @@
 //! Provider-neutral model call boundary.
 
 mod retry;
-mod stream;
 
 pub mod deepseek;
 
@@ -19,11 +18,11 @@ use crate::{
     session::SessionId,
 };
 
+pub use crate::model::{MAX_PROVIDER_STREAM_CHUNKS, StreamProtocolError, StreamValidator};
 pub use retry::{
     MAX_RETRY_DELAY_MILLIS, MAX_RETRYABLE_CODE_BYTES, MAX_RETRYABLE_CODES, RetryBackoff, RetryMode,
     RetryPolicy, RetryPolicyError,
 };
-pub use stream::{MAX_PROVIDER_STREAM_CHUNKS, StreamProtocolError, StreamValidator};
 
 /// Maximum messages admitted into one provider call.
 pub const MAX_PROVIDER_MESSAGES: usize = 4_096;

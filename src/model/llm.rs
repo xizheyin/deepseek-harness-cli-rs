@@ -1,5 +1,7 @@
 //! Provider call configuration, failures, usage, and stream chunks.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
@@ -592,13 +594,32 @@ impl<'de> Deserialize<'de> for StreamChunk {
 }
 
 /// JSON-schema description of a tool sent to a model.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ToolSchema {
+    inner: Arc<ToolSchemaInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ToolSchemaInner {
     name: String,
     description: String,
     parameters: JsonValue,
     raw: JsonValue,
 }
+
+impl std::fmt::Debug for ToolSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+impl PartialEq for ToolSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl Eq for ToolSchema {}
 
 impl ToolSchema {
     /// Construct one bounded JSON-schema tool declaration.
@@ -617,36 +638,31 @@ impl ToolSchema {
             "description": description,
             "parameters": parameters,
         }))?;
-        Ok(Self {
-            name,
-            description,
-            parameters,
-            raw,
-        })
+        Ok(Self::from_parts(name, description, parameters, raw))
     }
 
     /// Tool name sent to the model.
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        &self.inner.name
     }
 
     /// Human-readable tool description sent to the model.
     #[must_use]
     pub fn description(&self) -> &str {
-        &self.description
+        &self.inner.description
     }
 
     /// JSON Schema object for the tool arguments.
     #[must_use]
     pub fn parameters(&self) -> &JsonValue {
-        &self.parameters
+        &self.inner.parameters
     }
 
     /// Complete validated schema JSON, including extension fields.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
     }
 
     fn from_value(value: Value) -> Result<Self, ModelError> {
@@ -663,12 +679,23 @@ impl ToolSchema {
         if !parameters.as_value().is_object() {
             return Err(shape("tool schema", "parameters must be an object"));
         }
-        Ok(Self {
-            name,
-            description,
-            parameters,
-            raw,
-        })
+        Ok(Self::from_parts(name, description, parameters, raw))
+    }
+
+    fn from_parts(
+        name: String,
+        description: String,
+        parameters: JsonValue,
+        raw: JsonValue,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ToolSchemaInner {
+                name,
+                description,
+                parameters,
+                raw,
+            }),
+        }
     }
 }
 
@@ -677,7 +704,7 @@ impl Serialize for ToolSchema {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -691,8 +718,13 @@ impl<'de> Deserialize<'de> for ToolSchema {
 }
 
 /// Provider-neutral call configuration recorded in a request header.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct LlmCallConfig {
+    inner: Arc<LlmCallConfigInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LlmCallConfigInner {
     provider: String,
     model: String,
     reasoning_effort: Option<ReasoningEffortId>,
@@ -701,6 +733,20 @@ pub struct LlmCallConfig {
     stop: Option<Vec<String>>,
     raw: JsonValue,
 }
+
+impl std::fmt::Debug for LlmCallConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(formatter)
+    }
+}
+
+impl PartialEq for LlmCallConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl Eq for LlmCallConfig {}
 
 impl LlmCallConfig {
     /// Construct the required provider/model route.
@@ -746,69 +792,69 @@ impl LlmCallConfig {
             value["stop"] = serde_json::to_value(stop)
                 .map_err(|error| shape("call config", error.to_string()))?;
         }
-        Ok(Self {
+        Ok(Self::from_parsed_parts(
             provider,
             model,
             reasoning_effort,
             temperature,
             max_tokens,
             stop,
-            raw: JsonValue::new(value)?,
-        })
+            JsonValue::new(value)?,
+        ))
     }
 
     /// Registered provider route.
     #[must_use]
     pub fn provider(&self) -> &str {
-        &self.provider
+        &self.inner.provider
     }
 
     /// Provider-owned model identifier.
     #[must_use]
     pub fn model(&self) -> &str {
-        &self.model
+        &self.inner.model
     }
 
     /// Adapter-owned reasoning effort, when selected.
     #[must_use]
     pub fn reasoning_effort(&self) -> Option<&ReasoningEffortId> {
-        self.reasoning_effort.as_ref()
+        self.inner.reasoning_effort.as_ref()
     }
 
     /// Maximum output tokens, when selected.
     #[must_use]
     pub fn max_tokens(&self) -> Option<NonNegativeSafeInteger> {
-        self.max_tokens
+        self.inner.max_tokens
     }
 
     /// Sampling temperature, when explicitly configured.
     #[must_use]
     pub fn temperature(&self) -> Option<FiniteNumber> {
-        self.temperature
+        self.inner.temperature
     }
 
     /// Ordered stop strings, when explicitly configured.
     #[must_use]
     pub fn stop(&self) -> Option<&[String]> {
-        self.stop.as_deref()
+        self.inner.stop.as_deref()
     }
 
     /// Complete validated config JSON, including extension fields.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
     }
 
     /// Upstream field-wise equality used to decide whether a new request
     /// header represents a real config change. Extension JSON is ignored.
     #[must_use]
     pub fn equivalent_to(&self, other: &Self) -> bool {
-        self.provider == other.provider
-            && self.model == other.model
-            && self.reasoning_effort == other.reasoning_effort
-            && self.temperature == other.temperature
-            && self.max_tokens == other.max_tokens
-            && self.stop == other.stop
+        self.inner.provider == other.inner.provider
+            && self.inner.model == other.inner.model
+            && self.inner.reasoning_effort == other.inner.reasoning_effort
+            && self.inner.temperature == other.inner.temperature
+            && self.inner.max_tokens == other.inner.max_tokens
+            && self.inner.stop == other.inner.stop
     }
 
     /// Preserve extension fields while materializing provider-owned defaults.
@@ -817,7 +863,7 @@ impl LlmCallConfig {
         reasoning_effort: ReasoningEffortId,
         max_tokens: NonNegativeSafeInteger,
     ) -> Result<Self, ModelError> {
-        let mut value = self.raw.as_value().clone();
+        let mut value = self.inner.raw.as_value().clone();
         let fields = value
             .as_object_mut()
             .ok_or_else(|| shape("call config", "must be a JSON object"))?;
@@ -834,7 +880,7 @@ impl LlmCallConfig {
         &self,
         defaults: &LlmCallConfigAdapterDefaults,
     ) -> Result<Self, ModelError> {
-        let mut value = self.raw.as_value().clone();
+        let mut value = self.inner.raw.as_value().clone();
         let fields = value
             .as_object_mut()
             .ok_or_else(|| shape("call config", "must be a JSON object"))?;
@@ -855,10 +901,10 @@ impl LlmCallConfig {
         let Some(effort) = effort else {
             return Ok(self.clone());
         };
-        if self.reasoning_effort.is_some() {
+        if self.inner.reasoning_effort.is_some() {
             return Ok(self.clone());
         }
-        let mut value = self.raw.as_value().clone();
+        let mut value = self.inner.raw.as_value().clone();
         value
             .as_object_mut()
             .ok_or_else(|| shape("call config", "must be a JSON object"))?
@@ -870,13 +916,14 @@ impl LlmCallConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ModelError> {
-        if self.provider.is_empty() {
+        if self.inner.provider.is_empty() {
             return Err(ModelError::EmptyProvider);
         }
-        if self.model.is_empty() {
+        if self.inner.model.is_empty() {
             return Err(ModelError::EmptyModel);
         }
         if self
+            .inner
             .reasoning_effort
             .as_ref()
             .is_some_and(ReasoningEffortId::is_empty)
@@ -898,16 +945,37 @@ impl LlmCallConfig {
         let temperature = optional_typed(fields, "temperature", "call config")?;
         let max_tokens = optional_typed(fields, "maxTokens", "call config")?;
         let stop = optional_typed(fields, "stop", "call config")?;
-        let mut config = Self::from_parts(
+        Ok(Self::from_parsed_parts(
             provider,
             model,
             reasoning_effort,
             temperature,
             max_tokens,
             stop,
-        )?;
-        config.raw = raw;
-        Ok(config)
+            raw,
+        ))
+    }
+
+    fn from_parsed_parts(
+        provider: String,
+        model: String,
+        reasoning_effort: Option<ReasoningEffortId>,
+        temperature: Option<FiniteNumber>,
+        max_tokens: Option<NonNegativeSafeInteger>,
+        stop: Option<Vec<String>>,
+        raw: JsonValue,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LlmCallConfigInner {
+                provider,
+                model,
+                reasoning_effort,
+                temperature,
+                max_tokens,
+                stop,
+                raw,
+            }),
+        }
     }
 }
 
@@ -916,7 +984,7 @@ impl Serialize for LlmCallConfig {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -945,4 +1013,39 @@ pub struct LlmCallConfigAdapterDefaults {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_tokens: Option<TrueMarker>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{JsonValue, LlmCallConfig, ToolSchema};
+
+    #[test]
+    fn provider_request_prefix_values_clone_shallowly() {
+        let schema = ToolSchema::new(
+            "read",
+            "read one file",
+            JsonValue::new(json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let schema_clone = schema.clone();
+        assert!(Arc::ptr_eq(&schema.inner, &schema_clone.inner));
+        assert_eq!(schema, schema_clone);
+
+        let config = LlmCallConfig::new("mock", "mock-model").unwrap();
+        let config_clone = config.clone();
+        assert!(Arc::ptr_eq(&config.inner, &config_clone.inner));
+        assert_eq!(config, config_clone);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&config_clone).unwrap()
+        );
+    }
 }

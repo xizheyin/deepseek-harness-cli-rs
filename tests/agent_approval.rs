@@ -1031,7 +1031,7 @@ async fn cancellation_while_asking_discards_a_late_allow_and_never_commits() {
     assert!(agent.session().events().iter().any(|event| matches!(
         event.kind(),
         EventKind::ToolResult { error: Some(error), .. }
-            if error.code == "ABORTED_BEFORE_DISPATCH"
+            if error.code == "APPROVAL_CANCELLED"
     )));
 }
 

@@ -9,11 +9,16 @@ mod identity;
 mod input;
 mod interactive;
 mod live;
+mod recovery_warning;
 mod render;
 mod script;
 mod script_driver;
 mod script_io;
+mod session_list;
+mod session_resume;
+mod shutdown;
 mod signal;
+mod storage_failure;
 mod terminal;
 
 pub use entry::entry;

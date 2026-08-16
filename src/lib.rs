@@ -4,6 +4,7 @@
 
 mod entropy;
 mod json_value;
+mod workspace_authority;
 
 pub mod agent;
 pub mod cli;

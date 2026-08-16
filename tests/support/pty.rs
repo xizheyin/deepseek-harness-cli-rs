@@ -84,6 +84,7 @@ pub struct PtyHarness {
     reader: Option<thread::JoinHandle<()>>,
     transcript: Arc<(Mutex<TranscriptState>, Condvar)>,
     reader_control: ReaderControl,
+    _session_root: TestSessionRoot,
 }
 
 pub struct ObservedPtyReader {
@@ -108,15 +109,36 @@ pub struct JobControlHarness {
     dsh_pgid: Option<Pid>,
     approved_pgid: Option<Pid>,
     approved_guard: Option<Pid>,
+    _session_root: TestSessionRoot,
+}
+
+pub struct TestSessionRoot(PathBuf);
+
+impl TestSessionRoot {
+    pub fn new() -> Self {
+        let parent = std::fs::canonicalize(std::env::temp_dir())
+            .expect("test temp directory should canonicalize without symlinks");
+        Self(parent.join(format!("dsh-pty-sessions-{}", uuid::Uuid::new_v4())))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestSessionRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl PtyHarness {
     pub fn spawn(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, None)
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None)
     }
 
     pub fn spawn_rolling(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, true, None)
+        Self::spawn_with_transcript_mode(base_url, workspace, true, None, None, None)
     }
 
     pub fn spawn_with_disabled_terminal_mode(
@@ -124,7 +146,23 @@ impl PtyHarness {
         workspace: &Path,
         mode: DisabledTerminalMode,
     ) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, Some(mode))
+        Self::spawn_with_transcript_mode(base_url, workspace, false, Some(mode), None, None)
+    }
+
+    pub fn spawn_resume(
+        base_url: &str,
+        caller_workspace: &Path,
+        session_root: TestSessionRoot,
+        session_id: &str,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            caller_workspace,
+            false,
+            None,
+            Some(session_root),
+            Some(session_id),
+        )
     }
 
     fn spawn_with_transcript_mode(
@@ -132,6 +170,8 @@ impl PtyHarness {
         workspace: &Path,
         rolling: bool,
         disabled_mode: Option<DisabledTerminalMode>,
+        session_root: Option<TestSessionRoot>,
+        resume_id: Option<&str>,
     ) -> Self {
         let (master, slave) = open_test_pty();
         let mut termios =
@@ -217,8 +257,12 @@ impl PtyHarness {
         let reader = thread::spawn(move || {
             read_controlled_transcript(File::from(reader_fd), &reader_state, &reader_commands)
         });
-        let child = blocking::Command::new(env!("CARGO_BIN_EXE_dsh"))
-            .args([
+        let session_root = session_root.unwrap_or_else(TestSessionRoot::new);
+        let command = blocking::Command::new(env!("CARGO_BIN_EXE_dsh"));
+        let command = if let Some(session_id) = resume_id {
+            command.args(["--resume", session_id, "--no-color"])
+        } else {
+            command.args([
                 "--model",
                 "deepseek-chat",
                 "--workspace",
@@ -227,9 +271,13 @@ impl PtyHarness {
                     .expect("test workspace path should be Unicode"),
                 "--no-color",
             ])
+        };
+        let child = command
+            .current_dir(workspace)
             .env_clear()
             .env("DEEPSEEK_BASE_URL", base_url)
             .env("DEEPSEEK_API_KEY", TEST_API_KEY)
+            .env("DSH_SESSION_ROOT", session_root.path())
             .env("HOME", workspace)
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
@@ -242,6 +290,7 @@ impl PtyHarness {
             reader: Some(reader),
             transcript,
             reader_control,
+            _session_root: session_root,
         }
     }
 
@@ -498,6 +547,7 @@ impl JobControlHarness {
         let transcript = Arc::new((Mutex::new(TranscriptState::default()), Condvar::new()));
         let reader_state = Arc::clone(&transcript);
         let reader = thread::spawn(move || read_transcript(File::from(reader_fd), &reader_state));
+        let session_root = TestSessionRoot::new();
         let shell = blocking::Command::new("/bin/bash")
             .args(["--noprofile", "--norc", "-i"])
             .current_dir(workspace)
@@ -510,6 +560,7 @@ impl JobControlHarness {
             .env("DSH_TEST_WORKSPACE", workspace)
             .env("DEEPSEEK_BASE_URL", base_url)
             .env("DEEPSEEK_API_KEY", TEST_API_KEY)
+            .env("DSH_SESSION_ROOT", session_root.path())
             .env("HOME", workspace)
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
@@ -529,6 +580,7 @@ impl JobControlHarness {
             dsh_pgid: None,
             approved_pgid: None,
             approved_guard: None,
+            _session_root: session_root,
         }
     }
 

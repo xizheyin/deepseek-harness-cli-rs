@@ -94,7 +94,6 @@ impl Serialize for SessionEvent {
     where
         S: serde::Serializer,
     {
-        let data = event_data_value(self).map_err(serde::ser::Error::custom)?;
         let mut map = serializer.serialize_map(Some(
             4 + usize::from(self.source_event_seqs.is_some())
                 + usize::from(self.surface_op.is_some())
@@ -103,7 +102,7 @@ impl Serialize for SessionEvent {
         map.serialize_entry("type", self.kind.event_type())?;
         map.serialize_entry("seq", &self.seq)?;
         map.serialize_entry("time", &self.time)?;
-        map.serialize_entry("data", &data)?;
+        map.serialize_entry("data", self.original_data.as_value())?;
         if let Some(sources) = &self.source_event_seqs {
             map.serialize_entry("sourceEventSeqs", sources)?;
         }
@@ -117,7 +116,7 @@ impl Serialize for SessionEvent {
     }
 }
 
-fn decode_event(value: Value, index: usize) -> Result<SessionEvent, CodecError> {
+pub(crate) fn decode_event(value: Value, index: usize) -> Result<SessionEvent, CodecError> {
     let Value::Object(mut fields) = value else {
         return Err(envelope_error(index, "event must be a JSON object"));
     };

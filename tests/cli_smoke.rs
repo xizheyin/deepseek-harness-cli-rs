@@ -381,6 +381,9 @@ fn run_script(base_url: &str, workspace: &std::path::Path, prompt: &str) -> Outp
 
 fn script_command(base_url: &str, workspace: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    let session_root = std::fs::canonicalize(workspace)
+        .expect("test workspace should canonicalize")
+        .join(".dsh-test-sessions");
     command
         .args(["--model", "deepseek-chat", "--workspace"])
         .arg(workspace)
@@ -388,6 +391,7 @@ fn script_command(base_url: &str, workspace: &std::path::Path) -> Command {
         .env_clear()
         .env("DEEPSEEK_BASE_URL", base_url)
         .env("DEEPSEEK_API_KEY", "test-key-for-loopback-only")
+        .env("DSH_SESSION_ROOT", session_root)
         .env("PATH", "/usr/bin:/bin");
     command
 }
@@ -395,6 +399,23 @@ fn script_command(base_url: &str, workspace: &std::path::Path) -> Command {
 fn prompt_script_command(base_url: &str, workspace: &std::path::Path, prompt: &str) -> Command {
     let mut command = script_command(base_url, workspace);
     command.args(["--prompt", prompt]);
+    command
+}
+
+fn resume_script_command(
+    base_url: &str,
+    session_root: &std::path::Path,
+    session_id: &str,
+    prompt: &str,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    command
+        .args(["--resume", session_id, "--prompt", prompt, "--no-color"])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", base_url)
+        .env("DEEPSEEK_API_KEY", "test-key-for-loopback-only")
+        .env("DSH_SESSION_ROOT", session_root)
+        .env("PATH", "/usr/bin:/bin");
     command
 }
 
@@ -548,6 +569,9 @@ fn help_describes_only_available_options() {
         assert!(help.contains("--prompt"));
         assert!(help.contains("--model"));
         assert!(help.contains("--workspace"));
+        assert!(help.contains("--resume <SESSION_ID>"));
+        assert!(help.contains("resume: stored model"));
+        assert!(help.contains("resume: optional identity check"));
         assert!(help.contains("--help"));
         assert!(help.contains("--version"));
         assert!(!help.contains("not implemented"));
@@ -607,6 +631,644 @@ fn help_version_and_usage_errors_stop_before_workspace_credentials_or_network() 
 }
 
 #[test]
+fn listing_an_absent_store_is_keyless_empty_and_does_not_create_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("sentinel listener should be nonblocking");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let parent = script_workspace("list-absent-store");
+    let root = std::fs::canonicalize(&parent)
+        .expect("test parent should canonicalize")
+        .join("missing-session-root");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    command
+        .arg("--list-sessions")
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DSH_SESSION_ROOT", &root)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("dsh should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "");
+    assert!(!root.exists());
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    std::fs::remove_dir_all(parent).expect("test parent should be removed");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn listing_prints_sorted_header_facts_and_filters_by_workspace_identity() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let parent = script_workspace("list-populated-store");
+    let root = std::fs::canonicalize(&parent)
+        .expect("test parent should canonicalize")
+        .join("sessions");
+    std::fs::create_dir(&root).expect("private store root should be created");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("store root mode should be private");
+    let workspace_a = script_workspace("list-workspace-a");
+    let workspace_b = script_workspace("list-workspace-b");
+    let canonical_a = std::fs::canonicalize(&workspace_a).unwrap();
+    let canonical_b = std::fs::canonicalize(&workspace_b).unwrap();
+    let metadata_a = std::fs::metadata(&canonical_a).unwrap();
+    let metadata_b = std::fs::metadata(&canonical_b).unwrap();
+    let id_a = "session-550e8400-e29b-41d4-a716-446655440000";
+    let id_b = "session-650e8400-e29b-41d4-a716-446655440000";
+    write_listing_header(
+        &root,
+        id_a,
+        20,
+        &canonical_a,
+        metadata_a.dev(),
+        metadata_a.ino(),
+        b"SECRET-EVENT-BODY\n",
+    );
+    write_listing_header(
+        &root,
+        id_b,
+        30,
+        &canonical_b,
+        metadata_b.dev(),
+        metadata_b.ino(),
+        b"{not-json}\n",
+    );
+    let torn = root.join("session-750e8400-e29b-41d4-a716-446655440000.jsonl");
+    std::fs::write(&torn, b"{\"type\":\"session\"").unwrap();
+    std::fs::set_permissions(&torn, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let all = run_session_list(&root, None);
+    assert!(all.status.success(), "{}", stderr(&all));
+    assert_eq!(
+        stdout(&all),
+        format!(
+            "{id_b}\t30\t{}\n{id_a}\t20\t{}\n",
+            canonical_b.to_str().unwrap(),
+            canonical_a.to_str().unwrap()
+        )
+    );
+    assert_eq!(stderr(&all), "");
+    assert!(!stdout(&all).contains("SECRET-EVENT-BODY"));
+
+    let filtered = run_session_list(&root, Some(&workspace_a));
+    assert!(filtered.status.success(), "{}", stderr(&filtered));
+    assert_eq!(
+        stdout(&filtered),
+        format!("{id_a}\t20\t{}\n", canonical_a.to_str().unwrap())
+    );
+    assert_eq!(stderr(&filtered), "");
+
+    std::fs::remove_dir_all(parent).unwrap();
+    std::fs::remove_dir_all(workspace_a).unwrap();
+    std::fs::remove_dir_all(workspace_b).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_real_script_session_is_immediately_keyless_listable() {
+    let workspace = script_workspace("list-real-script-session");
+    let (base_url, server) = spawn_response_server(vec![text_sse("persist this answer")]);
+    let scripted = run_script(&base_url, &workspace, "create a durable session");
+    assert!(scripted.status.success(), "{}", stderr(&scripted));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
+    let root = canonical_workspace.join(".dsh-test-sessions");
+    let listed = run_session_list(&root, None);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert_eq!(stderr(&listed), "");
+    let output = stdout(&listed);
+    let fields = output
+        .trim_end_matches('\n')
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3);
+    let id = fields[0]
+        .strip_prefix("session-")
+        .expect("listed id should have the product prefix");
+    let parsed = uuid::Uuid::parse_str(id).expect("listed id should contain a UUID");
+    assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+    assert!(fields[1].parse::<i64>().is_ok());
+    assert_eq!(fields[2], canonical_workspace.to_str().unwrap());
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_real_script_session_resumes_from_its_stored_workspace_and_model() {
+    let workspace = script_workspace("resume-real-script-session");
+    let caller_workspace = script_workspace("resume-caller-workspace");
+    std::fs::write(workspace.join("resume-sentinel.txt"), "stored workspace\n").unwrap();
+    std::fs::write(
+        caller_workspace.join("resume-sentinel.txt"),
+        "wrong caller cwd\n",
+    )
+    .unwrap();
+    let (base_url, server) = spawn_response_server(vec![
+        text_sse("first durable answer"),
+        tool_round_sse(&[(
+            "call-resume-read",
+            "read",
+            serde_json::json!({ "file_path": "resume-sentinel.txt" }),
+        )]),
+        text_sse("second durable answer"),
+        text_sse("third durable answer"),
+    ]);
+
+    let first = run_script(&base_url, &workspace, "first durable prompt");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(stdout(&first), "first durable answer\n");
+    assert_eq!(stderr(&first), "");
+
+    let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
+    let root = canonical_workspace.join(".dsh-test-sessions");
+    let listed = run_session_list(&root, None);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let session_id = stdout(&listed)
+        .split_once('\t')
+        .map(|(id, _)| id.to_owned())
+        .expect("one persisted session should be listed");
+
+    let mut second = resume_script_command(&base_url, &root, &session_id, "second durable prompt");
+    second
+        .current_dir(&caller_workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let second = OwnedScriptChild::new(second.spawn().expect("resume should spawn"))
+        .wait_with_output(Duration::from_secs(10));
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert_eq!(stdout(&second), "second durable answer\n");
+    assert_eq!(stderr(&second), "");
+
+    let mut third = resume_script_command(&base_url, &root, &session_id, "third durable prompt");
+    third
+        .args(["--model", "deepseek-reasoner", "--workspace"])
+        .arg(&workspace)
+        .current_dir(&caller_workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let third = OwnedScriptChild::new(third.spawn().expect("overridden resume should spawn"))
+        .wait_with_output(Duration::from_secs(10));
+    assert!(third.status.success(), "{}", stderr(&third));
+    assert_eq!(stdout(&third), "third durable answer\n");
+    assert_eq!(stderr(&third), "");
+
+    let requests = server.join().expect("loopback server should join");
+    assert_eq!(requests.len(), 4);
+    let second_request = request_json(&requests[1]);
+    assert_eq!(second_request["model"], "deepseek-chat");
+    assert_request_contains_text(&second_request, "user", "first durable prompt");
+    assert_request_contains_text(&second_request, "assistant", "first durable answer");
+    assert_request_contains_text(&second_request, "user", "second durable prompt");
+    let post_tool_request = request_json(&requests[2]);
+    assert!(
+        post_tool_request.to_string().contains("stored workspace"),
+        "resumed tools must use the retained stored workspace: {post_tool_request:#}"
+    );
+    assert!(!post_tool_request.to_string().contains("wrong caller cwd"));
+
+    let third_request = request_json(&requests[3]);
+    assert_eq!(third_request["model"], "deepseek-reasoner");
+    assert_request_contains_text(&third_request, "user", "first durable prompt");
+    assert_request_contains_text(&third_request, "assistant", "second durable answer");
+    assert_request_contains_text(&third_request, "user", "third durable prompt");
+
+    let journals = std::fs::read_dir(&root)
+        .expect("session root should remain readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("session entries should remain readable");
+    assert_eq!(journals.len(), 1, "resume must append to the same journal");
+    let journal = std::fs::read_to_string(journals[0].path()).unwrap();
+    let reasons = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "request/header")
+        .filter_map(|event| event["data"]["reason"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(reasons, ["initial", "resume", "resume"]);
+
+    std::fs::remove_dir_all(workspace).unwrap();
+    std::fs::remove_dir_all(caller_workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn invalid_or_missing_resume_stops_before_root_creation_credentials_or_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("sentinel listener should be nonblocking");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let parent = script_workspace("resume-missing-session");
+    let root = std::fs::canonicalize(&parent).unwrap().join("missing-root");
+
+    let mut invalid = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    invalid
+        .args(["--resume", "not-a-session", "--prompt", "must not run"])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DEEPSEEK_API_KEY", "resume-sentinel-secret")
+        .env("DSH_SESSION_ROOT", &root)
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let invalid = OwnedScriptChild::new(invalid.spawn().expect("invalid resume should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(stdout(&invalid), "");
+    assert!(stderr(&invalid).starts_with("dsh: CLI_USAGE:"));
+
+    let mut missing = resume_script_command(
+        &base_url,
+        &root,
+        "session-550e8400-e29b-41d4-a716-446655440000",
+        "must not run",
+    );
+    missing.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let missing = OwnedScriptChild::new(missing.spawn().expect("missing resume should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(stdout(&missing), "");
+    assert_eq!(stderr(&missing), "dsh: CLI_SESSION_NOT_FOUND\n");
+
+    assert!(!root.exists());
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(!stderr(&invalid).contains("resume-sentinel-secret"));
+    assert!(!stderr(&missing).contains("resume-sentinel-secret"));
+    std::fs::remove_dir_all(parent).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn resume_workspace_mismatch_is_zero_mutation_and_releases_the_journal_lock() {
+    let workspace = script_workspace("resume-workspace-source");
+    let wrong_workspace = script_workspace("resume-workspace-mismatch");
+    let (base_url, server) = spawn_response_server(vec![text_sse("stored answer")]);
+    let first = run_script(&base_url, &workspace, "stored prompt");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let journal_path = only_journal_path(&root);
+    let before = std::fs::read(&journal_path).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener.set_nonblocking(true).unwrap();
+    let sentinel_url = format!("http://{}", listener.local_addr().unwrap());
+    let mut command = resume_script_command(
+        &sentinel_url,
+        &root,
+        &session_id,
+        "must not reach the model",
+    );
+    command
+        .arg("--workspace")
+        .arg(&wrong_workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("mismatched resume should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "dsh: CLI_SESSION_WORKSPACE_MISMATCH\n");
+    assert_eq!(std::fs::read(&journal_path).unwrap(), before);
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert_journal_lock_is_released(&journal_path);
+
+    std::fs::remove_dir_all(workspace).unwrap();
+    std::fs::remove_dir_all(wrong_workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn unsupported_and_corrupt_resume_headers_fail_before_network_without_mutation() {
+    let workspace = script_workspace("resume-header-errors");
+    let (base_url, server) = spawn_response_server(vec![text_sse("stored answer")]);
+    let first = run_script(&base_url, &workspace, "stored prompt");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let journal_path = only_journal_path(&root);
+    let original = std::fs::read(&journal_path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener.set_nonblocking(true).unwrap();
+    let sentinel_url = format!("http://{}", listener.local_addr().unwrap());
+
+    let mut unsupported = original.clone();
+    replace_once(&mut unsupported, b"\"version\":0", b"\"version\":9");
+    std::fs::write(&journal_path, &unsupported).unwrap();
+    let output = run_failed_resume(&sentinel_url, &root, &session_id);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "dsh: CLI_SESSION_UNSUPPORTED\n");
+    assert_eq!(std::fs::read(&journal_path).unwrap(), unsupported);
+    assert_journal_lock_is_released(&journal_path);
+
+    let mut corrupt = original.clone();
+    replace_once(
+        &mut corrupt,
+        b"\"type\":\"session\"",
+        b"\"type\":\"xession\"",
+    );
+    std::fs::write(&journal_path, &corrupt).unwrap();
+    let output = run_failed_resume(&sentinel_url, &root, &session_id);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "dsh: CLI_SESSION_CORRUPT\n");
+    assert_eq!(std::fs::read(&journal_path).unwrap(), corrupt);
+    assert_journal_lock_is_released(&journal_path);
+
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    std::fs::write(&journal_path, original).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn resumed_session_is_explicitly_shutdown_when_provider_assembly_fails() {
+    let workspace = script_workspace("resume-provider-assembly-failure");
+    let (base_url, server) = spawn_response_server(vec![text_sse("stored answer")]);
+    let first = run_script(&base_url, &workspace, "stored prompt");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let journal_path = only_journal_path(&root);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener.set_nonblocking(true).unwrap();
+    let sentinel_url = format!(
+        "http://{}?forbidden-query=1",
+        listener.local_addr().unwrap()
+    );
+
+    let mut command = resume_script_command(
+        &sentinel_url,
+        &root,
+        &session_id,
+        "must not reach the model",
+    );
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("resume should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "dsh: CLI_PROVIDER_UNAVAILABLE\n");
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert_journal_lock_is_released(&journal_path);
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn failed_recovery_warning_is_zero_mutation_and_releases_the_journal_lock() {
+    let workspace = script_workspace("resume-warning-output-failure");
+    let (base_url, server) = spawn_response_server(vec![text_sse("stored answer")]);
+    let first = run_script(&base_url, &workspace, "stored prompt");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let journal_path = only_journal_path(&root);
+    let mut before = std::fs::read(&journal_path).unwrap();
+    before.extend_from_slice(b"{\"type\":\"torn-warning-sentinel\"");
+    std::fs::write(&journal_path, &before).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener.set_nonblocking(true).unwrap();
+    let sentinel_url = format!("http://{}", listener.local_addr().unwrap());
+    let read_only_stderr = File::open(&journal_path).expect("read-only stderr should open");
+    let mut command = resume_script_command(
+        &sentinel_url,
+        &root,
+        &session_id,
+        "must not reach the model",
+    );
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(read_only_stderr));
+    let output = OwnedScriptChild::new(command.spawn().expect("warning failure should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(std::fs::read(&journal_path).unwrap(), before);
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert_journal_lock_is_released(&journal_path);
+
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_complete_recovery_warning_precedes_torn_tail_repair_and_continuation() {
+    let workspace = script_workspace("resume-warning-success");
+    let (base_url, server) = spawn_response_server(vec![text_sse("stored answer")]);
+    let first = run_script(&base_url, &workspace, "stored prompt");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let journal_path = only_journal_path(&root);
+    let torn = b"{\"type\":\"torn-warning-sentinel\"";
+    let mut damaged = std::fs::read(&journal_path).unwrap();
+    damaged.extend_from_slice(torn);
+    std::fs::write(&journal_path, damaged).unwrap();
+
+    let (base_url, server) = spawn_response_server(vec![text_sse("resumed after repair")]);
+    let mut command = resume_script_command(&base_url, &root, &session_id, "continue after repair");
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("repair resume should spawn"))
+        .wait_with_output(Duration::from_secs(10));
+    let requests = server.join().expect("loopback server should join");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "resumed after repair\n");
+    let warning = stderr(&output);
+    assert!(warning.contains("incomplete session recovery is required"));
+    assert!(warning.contains(&format!(
+        "recovery will discard {} incomplete journal byte(s)",
+        torn.len()
+    )));
+    assert!(warning.contains("recovery will install a durable resume boundary"));
+    assert!(!warning.contains("recovered an incomplete session"));
+
+    assert_eq!(requests.len(), 1);
+    let request = request_json(&requests[0]);
+    assert_request_contains_text(&request, "user", "stored prompt");
+    assert_request_contains_text(&request, "assistant", "stored answer");
+    assert_request_contains_text(&request, "user", "continue after repair");
+
+    let repaired = std::fs::read(&journal_path).unwrap();
+    assert!(!repaired.ends_with(torn));
+    assert!(repaired.ends_with(b"\n"));
+    for line in repaired
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        serde_json::from_slice::<serde_json::Value>(line)
+            .expect("committed repair must leave complete JSONL rows");
+    }
+    assert_journal_lock_is_released(&journal_path);
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_failed_resume(base_url: &str, root: &std::path::Path, session_id: &str) -> Output {
+    let mut command = resume_script_command(base_url, root, session_id, "must not reach the model");
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    OwnedScriptChild::new(command.spawn().expect("resume should spawn"))
+        .wait_with_output(Duration::from_secs(5))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn replace_once(bytes: &mut [u8], needle: &[u8], replacement: &[u8]) {
+    assert_eq!(needle.len(), replacement.len());
+    let start = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("journal fixture should contain the replaced field");
+    bytes[start..start + needle.len()].copy_from_slice(replacement);
+}
+
+fn assert_request_contains_text(request: &serde_json::Value, role: &str, text: &str) {
+    let messages = request["messages"]
+        .as_array()
+        .expect("provider request should contain messages");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["role"] == role && message["content"] == text),
+        "missing {role} message {text:?}: {request:#}"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn listed_session_id(root: &std::path::Path) -> String {
+    let listed = run_session_list(root, None);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    stdout(&listed)
+        .split_once('\t')
+        .map(|(id, _)| id.to_owned())
+        .expect("one persisted session should be listed")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn only_journal_path(root: &std::path::Path) -> std::path::PathBuf {
+    let entries = std::fs::read_dir(root)
+        .expect("session root should remain readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("session entries should remain readable");
+    assert_eq!(entries.len(), 1, "one session should own one journal");
+    entries[0].path()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn assert_journal_lock_is_released(path: &std::path::Path) {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("journal should remain openable");
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("finished resume must release its journal lock");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_session_list(root: &std::path::Path, workspace: Option<&std::path::Path>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    command
+        .arg("--list-sessions")
+        .env_clear()
+        .env("DSH_SESSION_ROOT", root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(workspace) = workspace {
+        command.arg("--workspace").arg(workspace);
+    }
+    OwnedScriptChild::new(command.spawn().expect("dsh should spawn"))
+        .wait_with_output(Duration::from_secs(5))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_listing_header(
+    root: &std::path::Path,
+    id: &str,
+    created_at: i64,
+    workspace: &std::path::Path,
+    device: u64,
+    inode: u64,
+    body: &[u8],
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let value = serde_json::json!({
+        "type": "session",
+        "version": 0,
+        "id": id,
+        "createdAt": created_at,
+        "cwd": workspace.to_str().unwrap(),
+        "delegationDepth": 0,
+        "rustWorkspaceIdentity": {
+            "device": format!("{device:x}"),
+            "inode": format!("{inode:x}"),
+        },
+    });
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(body);
+    let path = root.join(format!("{id}.jsonl"));
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
 fn real_script_entry_reaches_the_agent_and_loopback_provider() {
     let (base_url, server) = spawn_response_server(vec![text_sse("hello from real dsh")]);
     let workspace = std::env::temp_dir().join(format!("dsh-phase7-script-{}", std::process::id()));
@@ -628,6 +1290,46 @@ fn real_script_entry_reaches_the_agent_and_loopback_provider() {
             .contains("authorization: bearer test-key-for-loopback-only\r\n")
     );
     std::fs::remove_dir_all(&workspace).expect("test workspace should be removed");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn unsafe_session_root_is_reported_before_network_or_generic_agent_output() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("sentinel listener should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("sentinel listener should be nonblocking");
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let workspace = script_workspace("unsafe-session-root");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755))
+        .expect("test root should have an intentionally unsafe private mode");
+
+    let mut command = prompt_script_command(&base_url, &workspace, "must not reach the model");
+    command
+        .env("DSH_SESSION_ROOT", &workspace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("dsh should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "dsh: CLI_SESSION_ROOT_UNAVAILABLE\n");
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(
+        std::fs::metadata(&workspace)
+            .expect("test root should remain")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
 }
 
 #[test]
@@ -1039,8 +1741,10 @@ fn final_script_output_is_bounded_signal_aware_and_supports_dev_null() {
     let mut command = prompt_script_command(&base_url, &workspace, "fill the output pipe");
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = OwnedScriptChild::new(command.spawn().expect("script child should spawn"));
+    let reader = wait_for_script_output(&child);
     let started = Instant::now();
     let output = child.wait_with_output(Duration::from_secs(7));
+    reader.join().expect("output readiness reader should join");
     let requests = server.join().expect("loopback server should join");
     assert_eq!(output.status.code(), Some(1));
     assert!(started.elapsed() >= Duration::from_millis(4_500));

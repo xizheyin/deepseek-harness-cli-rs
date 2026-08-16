@@ -16,9 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentLoopError, AgentRuntime,
-    ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, NoApprovalProvider,
-    ShellPolicy, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
-    ToolExecutorError, ToolPreparation, ToolPreparationFuture, TurnProposal,
+    ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, FileChangePolicy,
+    MutationDeclineReason, NoApprovalProvider, PreparedToolMutation, ShellPolicy,
+    ToolCommitOutcome, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture, TurnProposal,
     tool::{
         ActionDeclineReason, PreparedToolAction, PreparedToolActionSetup, ToolActionControl,
         ToolActionOutcome, ToolActionSetupOutcome, ToolActionTurnStop, ToolClaimProfile,
@@ -27,17 +28,19 @@ use super::{
 use crate::{
     model::{
         ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, JsonValue, LlmCallConfig,
-        LlmCallConfigAdapterDefaults, MAX_JSON_VALUE_BYTES, Message, MessageSource, StreamChunk,
-        ToolSchema,
+        LlmCallConfigAdapterDefaults, LlmFailure, MAX_JSON_VALUE_BYTES, Message, MessageSource,
+        StreamChunk, ToolSchema,
     },
     provider::{
         ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
         RetryBackoff, RetryPolicy,
     },
     session::{
-        ApprovalOutcome, Clock, ClockError, EventKind, EventSeq, MAX_SESSION_RETAINED_JSON_BYTES,
-        NewEvent, Session, StepId, SurfaceIntent, ToolFailure, TurnEndReason, TurnId, UnixMillis,
+        AppendError, ApprovalOutcome, BarrierError, Clock, ClockError, CommittedUiReceiver,
+        EventKind, EventSeq, MAX_SESSION_RETAINED_JSON_BYTES, NewEvent, Session, SessionId,
+        SessionStore, StepId, SurfaceIntent, ToolFailure, TurnEndReason, TurnId, UnixMillis,
     },
+    workspace_authority::WorkspaceAuthority,
 };
 
 const NORMAL_RESULT_BOUND: usize = 128 * 1024;
@@ -229,12 +232,106 @@ struct ScriptedActions {
     run_count: Arc<AtomicUsize>,
 }
 
+struct ScriptedMutations {
+    commit_count: Arc<AtomicUsize>,
+    decline_count: Arc<AtomicUsize>,
+}
+
+impl ScriptedMutations {
+    fn new() -> (Arc<Self>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let decline_count = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                commit_count: commit_count.clone(),
+                decline_count: decline_count.clone(),
+            }),
+            commit_count,
+            decline_count,
+        )
+    }
+}
+
+impl ToolExecutor for ScriptedMutations {
+    fn execute(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        Box::pin(async { Err(ToolExecutorError::new("mutation preparation is required")) })
+    }
+
+    fn prepare(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancellation: CancellationToken,
+    ) -> ToolPreparationFuture<'_> {
+        let commit_count = self.commit_count.clone();
+        let decline_count = self.decline_count.clone();
+        Box::pin(async move {
+            let mutation = PreparedToolMutation::new(
+                ApprovalPrompt::new(
+                    Some("change one fixture file".to_owned()),
+                    "--- a/fixture\n+++ b/fixture\n",
+                )
+                .map_err(|error| ToolExecutorError::new(error.to_string()))?,
+                NORMAL_RESULT_BOUND,
+                Box::new(move |_reason: MutationDeclineReason| {
+                    decline_count.fetch_add(1, Ordering::SeqCst);
+                    mutation_result(false)
+                }),
+                Box::new(move |_cancellation| {
+                    commit_count.fetch_add(1, Ordering::SeqCst);
+                    ToolCommitOutcome::committed(mutation_result(true)?)
+                }),
+            )?;
+            Ok(ToolPreparation::Mutation(mutation))
+        })
+    }
+}
+
+fn mutation_result(committed: bool) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let error = (!committed).then(|| ToolFailure {
+        name: "apply_patch".to_owned(),
+        code: "MUTATION_NOT_COMMITTED".to_owned(),
+    });
+    ToolExecutionResult::new(
+        vec![
+            ContentBlock::text(if committed {
+                "fixture changed"
+            } else {
+                "fixture unchanged"
+            })
+            .map_err(|error| ToolExecutorError::new(error.to_string()))?,
+        ],
+        error.is_some(),
+        error,
+        Some(
+            JsonValue::new(json!({ "committed": committed }))
+                .map_err(|error| ToolExecutorError::new(error.to_string()))?,
+        ),
+        false,
+    )
+    .map_err(|error| ToolExecutorError::new(error.to_string()))
+}
+
 impl ScriptedActions {
     fn one(script: ActionScript) -> (Arc<Self>, Arc<AtomicUsize>) {
         let run_count = Arc::new(AtomicUsize::new(0));
         (
             Arc::new(Self {
                 scripts: Mutex::new(VecDeque::from([script])),
+                run_count: run_count.clone(),
+            }),
+            run_count,
+        )
+    }
+
+    fn many(scripts: Vec<ActionScript>) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let run_count = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                scripts: Mutex::new(scripts.into()),
                 run_count: run_count.clone(),
             }),
             run_count,
@@ -609,6 +706,21 @@ fn schema() -> ToolSchema {
     .unwrap()
 }
 
+fn mutation_schema() -> ToolSchema {
+    ToolSchema::new(
+        "apply_patch",
+        "Apply one approved fixture patch.",
+        JsonValue::new(json!({
+            "type": "object",
+            "properties": { "patch": { "type": "string" } },
+            "required": ["patch"],
+            "additionalProperties": false
+        }))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
 fn user() -> Message {
     Message::user(
         "user-1",
@@ -629,6 +741,46 @@ fn tool_response() -> Vec<StreamChunk> {
                 r#"{"command":"printf fixture","description":"fixture"}"#,
             )
             .unwrap(),
+        )
+        .unwrap(),
+        StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+    ]
+}
+
+fn two_tool_response() -> Vec<StreamChunk> {
+    vec![
+        StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+        StreamChunk::block_end(
+            0,
+            ContentBlock::tool_call(
+                "call-1",
+                "bash",
+                r#"{"command":"printf one","description":"fixture one"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        StreamChunk::block_start(1, ContentBlockType::ToolCall).unwrap(),
+        StreamChunk::block_end(
+            1,
+            ContentBlock::tool_call(
+                "call-2",
+                "bash",
+                r#"{"command":"printf two","description":"fixture two"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+    ]
+}
+
+fn mutation_response() -> Vec<StreamChunk> {
+    vec![
+        StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+        StreamChunk::block_end(
+            0,
+            ContentBlock::tool_call("call-1", "apply_patch", r#"{"patch":"fixture"}"#).unwrap(),
         )
         .unwrap(),
         StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
@@ -685,6 +837,95 @@ fn agent_with_policy(
     .unwrap()
 }
 
+fn agent_with_observer_capacity(
+    id: &str,
+    capacity: usize,
+    provider: Arc<ScriptedProvider>,
+    tools: Arc<dyn ToolExecutor>,
+    shell_policy: ShellPolicy,
+    approval_provider: Arc<dyn ApprovalProvider>,
+) -> (AgentLoop, CommittedUiReceiver) {
+    let mut session = Session::with_clock(id, IncrementingClock(Mutex::new(1_000))).unwrap();
+    let observer = session.attach_ui_observer_for_test(capacity).unwrap();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approval_provider)
+        .with_shell_policy(shell_policy);
+    let agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    (agent, observer)
+}
+
+#[cfg(unix)]
+async fn durable_session_with_event_room(
+    label: &str,
+    remaining_events: u64,
+) -> (
+    Session,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    let suffix = uuid::Uuid::new_v4();
+    let root = parent.join(format!("dsh-{label}-root-{suffix}"));
+    let workspace = parent.join(format!("dsh-{label}-workspace-{suffix}"));
+    for path in [&root, &workspace] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let store = SessionStore::open_existing(&root).unwrap();
+    let authority = WorkspaceAuthority::open(&workspace).unwrap();
+    let id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
+    let journal_path = root.join(format!("{id}.jsonl"));
+    let mut session = store
+        .prepare_new(id, &authority, IncrementingClock(Mutex::new(1_000)))
+        .unwrap();
+    session.materialize_if_needed().await.unwrap();
+    session.set_durable_event_room_for_test(remaining_events);
+    (session, journal_path, root, workspace)
+}
+
+fn assert_observer_failure_closed_turn(
+    agent: &AgentLoop,
+    observer: &CommittedUiReceiver,
+    result: &Result<super::TurnOutcome, AgentLoopError>,
+) {
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Barrier(BarrierError::ObserverUnavailable))
+    ));
+    assert!(observer.is_producer_faulted());
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert!(agent.session().state().pending_approvals().is_empty());
+    assert!(!agent.session().has_unresolved_surface_tool_calls());
+    let events = agent.session().events();
+    assert!(matches!(
+        events
+            .get(events.len().saturating_sub(2))
+            .map(|event| event.kind()),
+        Some(EventKind::StepEnd { .. })
+    ));
+    assert!(matches!(
+        events.last().map(|event| event.kind()),
+        Some(EventKind::TurnEnd {
+            reason: TurnEndReason::Error { error },
+            ..
+        }) if error.code() == "AGENT_OBSERVER_UNAVAILABLE"
+    ));
+}
+
 fn tool_results(agent: &AgentLoop) -> Vec<(&ToolFailure, &serde_json::Value)> {
     agent
         .session()
@@ -713,6 +954,590 @@ fn all_result_meta(agent: &AgentLoop) -> Vec<&serde_json::Value> {
             _ => None,
         })
         .collect()
+}
+
+#[tokio::test]
+async fn observer_fault_before_provider_closes_the_turn_without_dispatch() {
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response()]));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let (mut agent, observer) = agent_with_observer_capacity(
+        "observer-before-provider",
+        4,
+        provider.clone(),
+        tools,
+        ShellPolicy::Allow,
+        Arc::new(NoApprovalProvider),
+    );
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+
+    assert_observer_failure_closed_turn(&agent, &observer, &result);
+    assert!(provider.requests().is_empty());
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn observer_fault_before_tool_records_not_started_without_preparing_it() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let inspect_tools = tools.clone();
+    let (mut agent, observer) = agent_with_observer_capacity(
+        "observer-before-tool",
+        9,
+        provider.clone(),
+        tools,
+        ShellPolicy::Allow,
+        Arc::new(NoApprovalProvider),
+    );
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+
+    assert_observer_failure_closed_turn(&agent, &observer, &result);
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(inspect_tools.scripts.lock().unwrap().len(), 1);
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    let results = tool_results(&agent);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0.code, "ABORTED_BEFORE_DISPATCH");
+    assert_eq!(results[0].1["started"], json!(false));
+}
+
+#[tokio::test]
+async fn observer_fault_on_approval_asked_records_unavailable_without_requesting() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let approvals = Arc::new(CountingAllowApproval::default());
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let (mut agent, observer) = agent_with_observer_capacity(
+        "observer-on-approval-asked",
+        10,
+        provider.clone(),
+        tools,
+        ShellPolicy::Ask,
+        approvals.clone(),
+    );
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+
+    assert_observer_failure_closed_turn(&agent, &observer, &result);
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    let decisions = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ApprovalDecided { decided } => Some(decided.outcome()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, [ApprovalOutcome::Unavailable]);
+    assert_eq!(tool_results(&agent)[0].0.code, "APPROVAL_UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn observer_fault_on_allowed_decision_aborts_before_the_action_body() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let approvals = Arc::new(CountingAllowApproval::default());
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let (mut agent, observer) = agent_with_observer_capacity(
+        "observer-on-approval-decision",
+        11,
+        provider.clone(),
+        tools,
+        ShellPolicy::Ask,
+        approvals.clone(),
+    );
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+
+    assert_observer_failure_closed_turn(&agent, &observer, &result);
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    let decisions = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ApprovalDecided { decided } => Some(decided.outcome()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, [ApprovalOutcome::AllowedOnce]);
+    assert_eq!(tool_results(&agent)[0].0.code, "ABORTED_BEFORE_DISPATCH");
+}
+
+#[test]
+fn memory_event_budgets_and_durable_session_limits_are_distinct() {
+    let memory = [
+        AppendError::EventLimit { maximum: 1 },
+        AppendError::RetainedJsonLimit { maximum: 1 },
+        AppendError::ReservedEventLimit {
+            maximum: 1,
+            reserved: 1,
+        },
+        AppendError::ReservedRetainedJsonLimit {
+            maximum: 1,
+            reserved: 1,
+        },
+    ];
+    for error in &memory {
+        assert!(super::is_memory_budget_error(error));
+        assert!(!super::is_durable_session_limit(error));
+    }
+
+    let durable = [
+        AppendError::DurableRecord,
+        AppendError::DurableEventLimit { maximum: 1 },
+        AppendError::DurableByteLimit { maximum: 1 },
+    ];
+    for error in &durable {
+        assert!(!super::is_memory_budget_error(error));
+        assert!(super::is_durable_session_limit(error));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_event_limit_closes_the_open_step_and_turn_before_reporting_session_limit() {
+    let (session, journal_path, root, workspace) =
+        durable_session_with_event_room("agent-limit", 5).await;
+    // Five slots admit turn/start, step/start, user/message and their two
+    // balanced closure rows, but deliberately leave no sixth slot for the
+    // request/header that would precede a Provider dispatch.
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response()]));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap());
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Session(
+            AppendError::DurableEventLimit { .. }
+        ))
+    ));
+    assert!(provider.requests().is_empty());
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert!(!agent.session().has_unresolved_surface_tool_calls());
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter()
+            .skip(1)
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "turn/start",
+            "step/start",
+            "user/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(
+        rows.last().unwrap()["data"]["reason"]["error"]["code"],
+        "AGENT_SESSION_LIMIT"
+    );
+    assert!(
+        !String::from_utf8(bytes)
+            .unwrap()
+            .contains("AGENT_EVENT_BUDGET")
+    );
+
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_limit_before_approval_records_not_started_and_runs_no_body() {
+    let (session, journal_path, root, workspace) =
+        durable_session_with_event_room("approval-limit", 13).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_response()]));
+    let approvals = Arc::new(CountingAllowApproval::default());
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Session(
+            AppendError::DurableEventLimit { .. }
+        ))
+    ));
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert!(!agent.session().has_unresolved_surface_tool_calls());
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    let event_types = rows
+        .iter()
+        .skip(1)
+        .map(|row| row["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "tool/call")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "tool/result")
+            .count(),
+        1
+    );
+    assert!(!event_types.contains(&"approval/asked"));
+    let result_row = rows
+        .iter()
+        .find(|row| row["type"] == "tool/result")
+        .unwrap();
+    assert_eq!(result_row["data"]["error"]["code"], "SESSION_LIMIT");
+    assert_eq!(result_row["data"]["meta"]["started"], false);
+    assert_eq!(
+        rows.last().unwrap()["data"]["reason"]["error"]["code"],
+        "AGENT_SESSION_LIMIT"
+    );
+
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_limit_closes_every_later_declared_tool_with_the_same_reason() {
+    let (session, journal_path, root, workspace) =
+        durable_session_with_event_room("two-tool-limit", 17).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![two_tool_response()]));
+    let approvals = Arc::new(CountingAllowApproval::default());
+    let (tools, run_count) = ScriptedActions::many(vec![
+        ActionScript::StartedAndQuiescent,
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let inspect_tools = tools.clone();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Session(
+            AppendError::DurableEventLimit { .. }
+        ))
+    ));
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    // The first read-only preparation discovers the approval requirement;
+    // after its audit claim hits the limit, the second tool is not prepared.
+    assert_eq!(inspect_tools.scripts.lock().unwrap().len(), 1);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert!(!agent.session().has_unresolved_surface_tool_calls());
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter().filter(|row| row["type"] == "tool/call").count(),
+        2
+    );
+    let results = rows
+        .iter()
+        .filter(|row| row["type"] == "tool/result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert_eq!(result["data"]["error"]["code"], "SESSION_LIMIT");
+        assert_eq!(result["data"]["meta"]["started"], false);
+    }
+    assert_eq!(
+        rows.last().unwrap()["data"]["reason"]["error"]["code"],
+        "AGENT_SESSION_LIMIT"
+    );
+
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_executor_outcome_loss_closes_current_and_later_declared_tools() {
+    let (session, journal_path, root, workspace) =
+        durable_session_with_event_room("unknown-tool-outcome", 64).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![two_tool_response()]));
+    let (tools, run_count) = ScriptedActions::many(vec![
+        ActionScript::Infrastructure,
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let inspect_tools = tools.clone();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    let TurnEndReason::Error { error } = outcome.reason() else {
+        panic!("the executor failure must close the durable turn as an error")
+    };
+    assert_eq!(error.code(), "AGENT_TOOL_EXECUTOR");
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert_eq!(inspect_tools.scripts.lock().unwrap().len(), 1);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert!(!agent.session().has_unresolved_surface_tool_calls());
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter().filter(|row| row["type"] == "tool/call").count(),
+        2
+    );
+    let results = rows
+        .iter()
+        .filter(|row| row["type"] == "tool/result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["data"]["error"]["code"], "TOOL_OUTCOME_UNKNOWN");
+    assert_eq!(
+        results[0]["data"]["error"]["name"],
+        "ToolOutcomeUnknownError"
+    );
+    assert_eq!(
+        results[1]["data"]["error"]["code"],
+        "ABORTED_BEFORE_DISPATCH"
+    );
+    assert!(results.iter().all(|row| {
+        row["sourceEventSeqs"]
+            .as_array()
+            .is_some_and(|sources| sources.len() == 1)
+    }));
+
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_limit_closes_a_mutation_without_declining_or_committing_it() {
+    let (session, journal_path, root, workspace) =
+        durable_session_with_event_room("mutation-limit", 13).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![mutation_response()]));
+    let approvals = Arc::new(CountingAllowApproval::default());
+    let (tools, commit_count, decline_count) = ScriptedMutations::new();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![mutation_schema()])
+        .unwrap()
+        .with_file_change_approval(FileChangePolicy::Ask, approvals.clone());
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Session(
+            AppendError::DurableEventLimit { .. }
+        ))
+    ));
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(commit_count.load(Ordering::SeqCst), 0);
+    assert_eq!(decline_count.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert!(!agent.session().has_unresolved_surface_tool_calls());
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.iter().filter(|row| row["type"] == "tool/call").count(),
+        1
+    );
+    let results = rows
+        .iter()
+        .filter(|row| row["type"] == "tool/result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["data"]["error"]["code"], "SESSION_LIMIT");
+    assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
+    assert_eq!(
+        rows.last().unwrap()["data"]["reason"]["error"]["code"],
+        "AGENT_SESSION_LIMIT"
+    );
+
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_turn_end_fallback_reports_the_session_limit_instead_of_the_memory_budget() {
+    let (mut session, journal_path, root, workspace) =
+        durable_session_with_event_room("turn-fallback-limit", 64).await;
+    // The terminal Provider failure is durable once in assistant/chunk. The
+    // remaining quota deliberately cannot hold the same large failure again
+    // in turn/end, but it can hold the small pre-reserved session-limit row.
+    session.set_durable_byte_room_for_test(96 * 1024);
+    let failure = LlmFailure::new("x".repeat(64 * 1024), "PROVIDER_TERMINAL").unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        StreamChunk::finish(FinishReason::error(failure).unwrap(), None).unwrap(),
+    ]]));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap());
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let result = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await;
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Store(crate::session::StoreError::Limit))
+    ));
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(run_count.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    agent.shutdown().await.unwrap();
+
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let rows = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|row| !row.is_empty())
+        .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.last().unwrap()["data"]["reason"]["error"]["code"],
+        "AGENT_SESSION_LIMIT"
+    );
+    assert!(
+        !String::from_utf8(bytes)
+            .unwrap()
+            .contains("AGENT_EVENT_BUDGET")
+    );
+
+    std::fs::remove_file(journal_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    std::fs::remove_dir(workspace).unwrap();
 }
 
 async fn assert_no_result_and_poisoned(agent: &mut AgentLoop) {
@@ -818,7 +1643,7 @@ async fn caller_cancellation_wins_over_a_late_allow_without_running_the_action()
     let [(error, meta)] = results.as_slice() else {
         panic!("cancelled approval must publish one pre-dispatch result")
     };
-    assert_eq!(error.code, "ABORTED_BEFORE_DISPATCH");
+    assert_eq!(error.code, "APPROVAL_CANCELLED");
     assert_eq!(meta["started"], json!(false));
 }
 
@@ -976,6 +1801,14 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         config: &config,
         request_header_logged: &mut request_header_logged,
         counters: super::Counters::default(),
+        final_message: None,
+        observer_unavailable: false,
+        session_limit_failure: super::failure_reason(
+            "AGENT_SESSION_LIMIT",
+            "the durable session reached its storage limit",
+        )
+        .unwrap(),
+        durable_limit: None,
         deadline: tokio::time::Instant::now() + Duration::from_secs(30),
     };
     let budget_failure = super::failure_reason(

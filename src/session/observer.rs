@@ -149,19 +149,32 @@ pub(crate) struct UiToolFailure {
 
 #[derive(Debug)]
 pub(crate) struct SourceSeqBitmap {
+    base: EventSeq,
     words: Vec<u64>,
 }
 
 impl SourceSeqBitmap {
     pub(crate) fn from_sources(sources: &[EventSeq]) -> Result<Self, UiProjectionError> {
+        let base = sources
+            .iter()
+            .map(|source| source.get())
+            .min()
+            .map(EventSeq::new)
+            .transpose()
+            .map_err(|_| UiProjectionError)?
+            .unwrap_or_else(|| EventSeq::new(0).expect("zero is a valid event sequence"));
         let mut words = Vec::new();
         words
             .try_reserve_exact(SOURCE_BITMAP_WORDS)
             .map_err(|_| UiProjectionError)?;
         words.resize(SOURCE_BITMAP_WORDS, 0);
-        let mut bitmap = Self::finish_words(words)?;
+        let mut bitmap = Self::finish_words(base, words)?;
         for source in sources {
-            let index = usize::try_from(source.get()).map_err(|_| UiProjectionError)?;
+            let relative = source
+                .get()
+                .checked_sub(base.get())
+                .ok_or(UiProjectionError)?;
+            let index = usize::try_from(relative).map_err(|_| UiProjectionError)?;
             if index >= super::MAX_SESSION_EVENTS {
                 return Err(UiProjectionError);
             }
@@ -170,11 +183,11 @@ impl SourceSeqBitmap {
         Ok(bitmap)
     }
 
-    fn finish_words(words: Vec<u64>) -> Result<Self, UiProjectionError> {
+    fn finish_words(base: EventSeq, words: Vec<u64>) -> Result<Self, UiProjectionError> {
         if words.len() != SOURCE_BITMAP_WORDS || !Self::capacity_is_acceptable(words.capacity()) {
             return Err(UiProjectionError);
         }
-        Ok(Self { words })
+        Ok(Self { base, words })
     }
 
     fn capacity_is_acceptable(capacity: usize) -> bool {
@@ -182,7 +195,10 @@ impl SourceSeqBitmap {
     }
 
     pub(crate) fn contains(&self, source: EventSeq) -> bool {
-        let Ok(index) = usize::try_from(source.get()) else {
+        let Some(relative) = source.get().checked_sub(self.base.get()) else {
+            return false;
+        };
+        let Ok(index) = usize::try_from(relative) else {
             return false;
         };
         self.words
@@ -193,6 +209,11 @@ impl SourceSeqBitmap {
     #[cfg(test)]
     pub(crate) fn word_len_for_test(&self) -> usize {
         self.words.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_for_test(&self) -> EventSeq {
+        self.base
     }
 
     #[cfg(test)]
@@ -212,7 +233,10 @@ impl SourceSeqBitmap {
 
     #[cfg(test)]
     pub(crate) fn from_words_for_test(words: Vec<u64>) -> Result<Self, UiProjectionError> {
-        Self::finish_words(words)
+        Self::finish_words(
+            EventSeq::new(0).expect("zero is a valid event sequence"),
+            words,
+        )
     }
 }
 
@@ -299,31 +323,36 @@ pub(super) fn channel(capacity: usize) -> (CommittedUiSender, CommittedUiReceive
     )
 }
 
-pub(super) fn publish_committed(observer: &mut Option<CommittedUiSender>, event: &SessionEvent) {
+pub(super) fn publish_committed(
+    observer: &mut Option<CommittedUiSender>,
+    event: &SessionEvent,
+) -> bool {
     let Some(active) = observer.as_ref() else {
-        return;
+        return false;
     };
     if active.state.should_fail_projection() {
         active.state.fault();
         *observer = None;
-        return;
+        return true;
     }
     let projection = match CommittedUiEvent::from_event(event) {
         Ok(projection) => projection,
         Err(_) => {
             active.state.fault();
             *observer = None;
-            return;
+            return true;
         }
     };
     match active.sender.try_send(projection) {
-        Ok(()) => {}
+        Ok(()) => false,
         Err(mpsc::error::TrySendError::Full(_)) => {
             active.state.fault();
             *observer = None;
+            true
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             *observer = None;
+            false
         }
     }
 }

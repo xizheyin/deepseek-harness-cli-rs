@@ -11,6 +11,7 @@ use crate::model::{
     CallId, FiniteNumber, JsonValue, LlmCallConfig, LlmCallConfigAdapterDefaults, LlmFailure,
     Message, NonNegativeSafeInteger, StreamChunk, TokenUsage, ToolSchema, TrueMarker,
 };
+use crate::workspace_authority::WorkspaceIdentity;
 
 use super::error::{EventValidationError, HeaderError, NumberError};
 
@@ -18,6 +19,10 @@ use super::error::{EventValidationError, HeaderError, NumberError};
 pub const SESSION_FORMAT_VERSION: u64 = 0;
 /// Recovery result emitted when a model call never reached tool dispatch.
 pub const TOOL_NOT_STARTED: &str = "TOOL_NOT_STARTED";
+/// Conservative result emitted when a durable intent may already have had an effect.
+pub const TOOL_OUTCOME_UNKNOWN: &str = "TOOL_OUTCOME_UNKNOWN";
+/// Reserved identity prefix for tool-result rows emitted only by recovery.
+pub(crate) const RECOVERY_TOOL_RESULT_ID_PREFIX: &str = "dsh-recovery-tool-result-v1-";
 /// Maximum provenance references retained on one surface event.
 pub const MAX_SOURCE_EVENT_SEQS: usize = 4_096;
 /// Maximum compact JSON bytes retained in one session header.
@@ -300,6 +305,29 @@ impl SessionHeader {
             agent_preset: None,
             raw,
         })
+    }
+
+    /// Build the complete top-level durable header in one validated step.
+    pub(crate) fn new_durable(
+        id: impl Into<SessionId>,
+        created_at: UnixMillis,
+        cwd: String,
+        workspace: WorkspaceIdentity,
+    ) -> Result<Self, HeaderError> {
+        if !Path::new(&cwd).is_absolute() {
+            return Err(HeaderError::RelativeWorkingDirectory(cwd));
+        }
+        Self::from_value(json!({
+            "version": SESSION_FORMAT_VERSION,
+            "id": id.into(),
+            "createdAt": created_at,
+            "cwd": cwd,
+            "delegationDepth": 0,
+            "rustWorkspaceIdentity": {
+                "device": format!("{:x}", workspace.device()),
+                "inode": format!("{:x}", workspace.inode()),
+            },
+        }))
     }
 
     /// Parse a header while retaining fields added by plugins or newer Harness versions.
@@ -1441,6 +1469,29 @@ impl EventKind {
         }
     }
 
+    pub(crate) fn live_event_type(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::TurnStart { .. } => "turn/start",
+            Self::TurnEnd { .. } => "turn/end",
+            Self::StepStart { .. } => "step/start",
+            Self::StepEnd { .. } => "step/end",
+            Self::UserMessage { .. } => "user/message",
+            Self::AssistantChunk { .. } => "assistant/chunk",
+            Self::AssistantMessage { .. } => "assistant/message",
+            Self::ToolCall { .. } => "tool/call",
+            Self::ToolResult { .. } => "tool/result",
+            Self::TodoWrite { .. } => "todo/write",
+            Self::RequestHeader { .. } => "request/header",
+            Self::RequestContext { .. } => "request/context",
+            Self::LlmRetry { .. } => "llm/retry",
+            Self::LlmRetryStarted { .. } => "llm/retry-started",
+            Self::ApprovalAsked { .. } => "approval/asked",
+            Self::ApprovalDecided { .. } => "approval/decided",
+            Self::EndSeed => "session/end-seed",
+            Self::Unknown { .. } => return None,
+        })
+    }
+
     #[must_use]
     pub(crate) fn is_surface_eligible(&self) -> bool {
         matches!(
@@ -1566,8 +1617,8 @@ impl SurfaceOp {
 /// Surface placement and provenance supplied with a new event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceIntent {
-    operation: SurfaceOp,
-    source_event_seqs: Option<Vec<EventSeq>>,
+    pub(super) operation: SurfaceOp,
+    pub(super) source_event_seqs: Option<Vec<EventSeq>>,
 }
 
 impl SurfaceIntent {
@@ -1699,5 +1750,9 @@ impl SessionEvent {
             ignorable: None,
             original_data,
         }
+    }
+
+    pub(crate) fn set_time_for_commit(&mut self, time: UnixMillis) {
+        self.time = time;
     }
 }

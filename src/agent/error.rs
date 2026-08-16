@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     model::ModelError,
-    session::{AppendError, EventValidationError},
+    session::{AppendError, BarrierError, EventValidationError, StoreError},
 };
 
 /// Invalid Agent construction or configured resource ceiling.
@@ -61,6 +61,10 @@ pub enum AgentLoopError {
     Admission(AppendError),
     #[error(transparent)]
     Session(#[from] AppendError),
+    #[error(transparent)]
+    Barrier(#[from] BarrierError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]

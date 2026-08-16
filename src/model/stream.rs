@@ -1,12 +1,10 @@
-//! Strict whole-stream grammar shared by real and fake providers.
+//! Strict provider-neutral whole-stream grammar shared by Session and providers.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::model::{
-    ContentBlockKind, ContentBlockType, FinishReasonKind, StreamChunk, StreamChunkKind,
-};
+use super::{ContentBlockKind, ContentBlockType, FinishReasonKind, StreamChunk, StreamChunkKind};
 
 /// Maximum provider-neutral chunks emitted by one model call.
 pub const MAX_PROVIDER_STREAM_CHUNKS: usize = 4_000;

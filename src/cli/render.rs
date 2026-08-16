@@ -52,6 +52,27 @@ impl VisibleRenderer {
         &mut self,
         input: &str,
         trusted_line_prefix: Option<&'static str>,
+        emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.render_fragment_with_line_policy(input, trusted_line_prefix, false, emit)
+    }
+
+    /// Render one untrusted table field without allowing it to create another
+    /// physical output row. Unix paths may legally contain LF, so session-list
+    /// output needs a stricter boundary than ordinary conversational text.
+    pub(super) fn render_single_line_fragment<E>(
+        &mut self,
+        input: &str,
+        emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.render_fragment_with_line_policy(input, None, true, emit)
+    }
+
+    fn render_fragment_with_line_policy<E>(
+        &mut self,
+        input: &str,
+        trusted_line_prefix: Option<&'static str>,
+        escape_line_feed: bool,
         mut emit: impl FnMut(&str) -> Result<(), E>,
     ) -> Result<(), E> {
         for character in input.chars() {
@@ -63,10 +84,11 @@ impl VisibleRenderer {
             }
 
             match character {
-                '\n' => {
+                '\n' if !escape_line_feed => {
                     self.append_piece("\n", &mut emit)?;
                     self.at_line_start = true;
                 }
+                '\n' => self.append_piece("\\n", &mut emit)?,
                 '\t' => self.append_piece("\\t", &mut emit)?,
                 '\r' => self.append_piece("\\r", &mut emit)?,
                 character if must_escape(character) => {

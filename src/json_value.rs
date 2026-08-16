@@ -1,6 +1,6 @@
 //! Bounded, lossless JSON values shared by model and session boundaries.
 
-use std::{fmt, mem::ManuallyDrop};
+use std::{fmt, mem::ManuallyDrop, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::Visitor};
 use serde_json::{Number, Value};
@@ -18,7 +18,7 @@ pub const MAX_JSON_VALUE_BYTES: usize = 8 * 1024 * 1024;
 /// A bounded JSON value that is safe to retain in the session core.
 #[derive(Clone, Debug)]
 pub struct JsonValue {
-    value: Value,
+    value: Arc<Value>,
     encoded_len: usize,
 }
 
@@ -51,7 +51,7 @@ impl JsonValue {
             return Err(error);
         }
         Ok(Self {
-            value,
+            value: Arc::new(value),
             encoded_len: encoded.len(),
         })
     }
@@ -60,7 +60,7 @@ impl JsonValue {
     #[must_use]
     pub fn null() -> Self {
         Self {
-            value: Value::Null,
+            value: Arc::new(Value::Null),
             encoded_len: 4,
         }
     }
@@ -80,7 +80,7 @@ impl JsonValue {
     /// Consume the wrapper and return the owned JSON tree.
     #[must_use]
     pub fn into_value(self) -> Value {
-        self.value
+        Arc::try_unwrap(self.value).unwrap_or_else(|shared| (*shared).clone())
     }
 
     /// Compare using JavaScript JSON-number semantics (`1` equals `1.0`).

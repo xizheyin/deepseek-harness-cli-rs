@@ -1,4 +1,8 @@
-use std::{future::poll_fn, io, task::Poll};
+use std::{
+    future::poll_fn,
+    io,
+    task::{Context, Poll},
+};
 
 use futures_util::FutureExt as _;
 
@@ -35,21 +39,22 @@ impl SignalStreams {
     }
 
     pub(super) async fn next(&mut self) -> UiSignal {
-        poll_fn(|context| {
-            for (stream, observed) in [
-                (&mut self.quit, UiSignal::Quit),
-                (&mut self.terminate, UiSignal::Terminate),
-                (&mut self.hangup, UiSignal::Hangup),
-                (&mut self.suspend, UiSignal::Suspend),
-                (&mut self.interrupt, UiSignal::Interrupt),
-            ] {
-                if matches!(stream.poll_recv(context), Poll::Ready(Some(()))) {
-                    return Poll::Ready(observed);
-                }
+        poll_fn(|context| self.poll_next(context)).await
+    }
+
+    pub(super) fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<UiSignal> {
+        for (stream, observed) in [
+            (&mut self.quit, UiSignal::Quit),
+            (&mut self.terminate, UiSignal::Terminate),
+            (&mut self.hangup, UiSignal::Hangup),
+            (&mut self.suspend, UiSignal::Suspend),
+            (&mut self.interrupt, UiSignal::Interrupt),
+        ] {
+            if matches!(stream.poll_recv(context), Poll::Ready(Some(()))) {
+                return Poll::Ready(observed);
             }
-            Poll::Pending
-        })
-        .await
+        }
+        Poll::Pending
     }
 
     /// Samples every distinct coalesced Unix signal class at most once.

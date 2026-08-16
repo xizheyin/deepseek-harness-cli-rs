@@ -852,6 +852,24 @@ A predictable quota failure is therefore detected before a tool side effect.
 An unexpected operating-system write/fsync failure may still make an outcome
 unknown; recovery records that uncertainty and never fabricates success.
 
+The old in-memory limits and the durable journal limits have deliberately
+different closure semantics. Exhausting the bounded memory Session keeps the
+existing `AGENT_EVENT_BUDGET` turn reason. A durable record, ordinary-event, or
+ordinary-byte limit instead latches the first concrete append error, prevents
+any not-yet-started tool or approval body from running, uses Agent-owned
+`SESSION_LIMIT` tool results to close every already-declared call, then appends
+balanced `step/end` and `turn/end`. The durable turn's protected fallback is
+`AGENT_SESSION_LIMIT` from the moment its claim is created; it is not the old
+memory-budget reason. Therefore, even when a large preferred `turn/end` cannot
+fit and claim settlement selects its smaller fallback without returning an
+append error, the journal remains truthful. After the final barrier the Agent
+returns the original durable append error when one exists, or the stable store
+limit classification for that fallback-only case; the process boundary emits
+`CLI_SESSION_LIMIT`. A storage/barrier failure while closing remains stronger
+because the balanced durable tail was not proven. Tests cover both event-limit
+closure and a large terminal Provider failure whose first durable chunk fits
+but whose duplicate preferred `turn/end` does not.
+
 ## Append, flush, and rollback
 
 An in-process append remains atomic with respect to projection and the live UI.
@@ -1250,6 +1268,20 @@ sorted by `createdAt` descending and then canonical session ID ascending, so
 filesystem iteration order cannot change output. A busy valid journal remains
 listable; an incomplete/invalid header is omitted from output while its
 canonical filename still consumes a store slot.
+
+The first CLI format is deliberately plain and machine-checkable: an empty
+list writes zero bytes; otherwise each physical line is
+`<canonical-id> TAB <createdAt-unix-ms> TAB <workspace> LF`. The ID and decimal
+timestamp are validated facts. The workspace field is rendered through a
+single-line terminal-safety boundary: LF, TAB, CR, C0/C1 controls, bidi/format
+controls, and escape bytes become visible escapes, so a hostile hand-written
+header cannot forge another row or terminal command. `-w/--workspace` is opened
+once and compared to the durable workspace device/inode, rather than opening
+the untrusted stored `cwd` path. A structurally valid safe-integer future
+header version may remain visible in the list when it still has the complete
+Rust durable workspace metadata; actual resume performs the version check and
+returns `CLI_SESSION_UNSUPPORTED`. This keeps discovery useful without treating
+an unknown event schema as readable.
 
 On resume:
 

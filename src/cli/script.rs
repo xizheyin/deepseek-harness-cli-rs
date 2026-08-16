@@ -1,15 +1,21 @@
 #[cfg(test)]
 use std::convert::Infallible;
 
+#[cfg(test)]
 use thiserror::Error;
 
 use crate::{
+    agent::TurnOutcome,
     model::{ContentBlockKind, Message},
-    session::{EventKind, EventSeq, SessionEvent, TurnEndReason, TurnId},
+    session::TurnEndReason,
 };
+
+#[cfg(test)]
+use crate::session::{EventKind, EventSeq, SessionEvent, TurnId};
 
 use super::render::VisibleRenderer;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum ScriptSummaryError {
     #[error("the script turn has no durable turn/end event")]
@@ -59,7 +65,15 @@ impl ScriptTurnSummary<'_> {
     }
 }
 
-pub(super) fn summarize_turn(
+pub(super) fn summarize_outcome(outcome: &TurnOutcome) -> ScriptTurnSummary<'_> {
+    ScriptTurnSummary {
+        message: outcome.final_message(),
+        reason: outcome.reason(),
+    }
+}
+
+#[cfg(test)]
+fn summarize_turn(
     events: &[SessionEvent],
     start: EventSeq,
     turn: TurnId,
