@@ -1068,7 +1068,13 @@ by its fallback: one transient Clock failure retries the exact Session-owned
 candidate, with durable and memory-mode error classification tested separately.
 A second Clock rejection preserves that root error and leaves the exact
 candidate Session-owned for shutdown/recovery rather than obscuring it with
-`NeedsAppendSettle`. Typed `EventKind` allocations, attempt folds/raw handoff,
+`NeedsAppendSettle`. Durable hot-attempt admission now also precharges its bounded
+validator tables, block/source vectors, and partial-block table before opening
+the stream. A plugin-defined block-type string is charged before Clock and is
+rolled back with a rejected chunk; committed bookkeeping remains Session-owned
+through seal, closure, barrier, and explicit attempt retirement. Provider/model
+route facts share the immutable request config instead of duplicating strings.
+Typed `EventKind` allocations, attempt model payload/raw-to-surface handoff,
 cold-recovery work, and complete closure payload headroom are not charged yet,
 so the complete shared 32 MiB invariant, pressure trigger, summary
 dispatch/checkpoint construction, and Agent-level context-overflow interception

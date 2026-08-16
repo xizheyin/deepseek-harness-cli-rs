@@ -973,9 +973,9 @@ mod tests {
 
     use crate::model::{
         ContentBlock, ContentBlockType, FinishReason, FiniteNumber, LlmCallConfig, LlmFailure,
-        Message, MessageSource, NonNegativeSafeInteger, StreamChunk, TokenUsage,
+        Message, MessageSource, NonNegativeSafeInteger, StreamChunk, StreamChunkKind, TokenUsage,
     };
-    use crate::resident_credit::ChargedBytes;
+    use crate::resident_credit::{ChargedBytes, string_backing_charge};
     use crate::session::projection::{Projection, ValidationPolicy};
     use crate::session::{
         AppendError, AttemptDisposition, BarrierError, ClaimedAppend, Clock, ClockError,
@@ -1966,6 +1966,197 @@ mod tests {
             .await
             .unwrap();
         reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn attempt_bookkeeping_resident_begin_is_exact_and_atomic() {
+        let baseline = Session::attempt_bookkeeping_baseline_for_test();
+        assert!(baseline > 0);
+        let resident_limit = baseline + 1024 * 1024;
+
+        let (over_path, over_file) = test_file("attempt-bookkeeping-begin-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let (mut over, turn, step) =
+            attempt_ready_session("attempt-bookkeeping-begin-over", over_writer).await;
+        let over_pool = over.set_resident_limit_for_test(resident_limit);
+        let over_filler = over_pool
+            .try_acquire(resident_limit - (baseline - 1))
+            .unwrap();
+        let before_nonce = over.next_attempt_nonce;
+        {
+            let mut reservation = over.reservation();
+            assert!(matches!(
+                reservation.begin_attempt(turn, step),
+                Err(AppendError::DurableResidentLimit { maximum }) if maximum == resident_limit
+            ));
+            assert_eq!(
+                reservation
+                    .session()
+                    .active_attempt_bookkeeping_bytes_for_test(),
+                None
+            );
+            assert_eq!(reservation.session().next_attempt_nonce, before_nonce);
+            assert_eq!(reservation.session().state().open_step(), Some(step));
+        }
+        assert_eq!(over_pool.used_for_test(), over_filler.bytes());
+        drop(over_filler);
+        over.append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        over.append_settled(NewEvent::log(EventKind::turn_end(
+            turn,
+            TurnEndReason::Error {
+                error: LlmFailure::new("attempt was not admitted", "ATTEMPT_LIMIT").unwrap(),
+            },
+        )))
+        .await
+        .unwrap();
+        over.flush_barrier().await.unwrap();
+        assert_eq!(over_pool.used_for_test(), 0);
+        over.shutdown().await.unwrap();
+        std::fs::remove_file(over_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("attempt-bookkeeping-begin-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let (mut exact, turn, step) =
+            attempt_ready_session("attempt-bookkeeping-begin-exact", exact_writer).await;
+        let exact_pool = exact.set_resident_limit_for_test(resident_limit);
+        let exact_filler = exact_pool.try_acquire(resident_limit - baseline).unwrap();
+        let mut reservation = exact.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline)
+        );
+        assert_eq!(exact_pool.used_for_test(), resident_limit);
+        drop(exact_filler);
+        assert_eq!(exact_pool.used_for_test(), baseline);
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        assert!(reservation.retire_attempt(&token).is_err());
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline)
+        );
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(exact_pool.used_for_test(), baseline);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        drop(reservation);
+        exact.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_attempt_bookkeeping_delta_rolls_back_before_clock_retry() {
+        let (path, file) = test_file("attempt-bookkeeping-delta-clock");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, step) = attempt_ready_session_with_clock(
+            "attempt-bookkeeping-delta-clock",
+            clock.clone(),
+            writer,
+        )
+        .await;
+        let pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let baseline = reservation
+            .session()
+            .active_attempt_bookkeeping_bytes_for_test()
+            .unwrap();
+        assert_eq!(pool.used_for_test(), baseline);
+
+        let chunk =
+            StreamChunk::block_start(0, ContentBlockType::Other("vendor-extension".to_owned()))
+                .unwrap();
+        let expected_delta = match chunk.kind() {
+            StreamChunkKind::BlockStart {
+                block_type: ContentBlockType::Other(value),
+                ..
+            } => string_backing_charge(value.capacity()).unwrap(),
+            _ => panic!("the fixture must be an extension block start"),
+        };
+        let prepared = Session::prepare_event(NewEvent::log(EventKind::assistant_chunk(
+            turn,
+            step,
+            chunk.clone(),
+        )))
+        .unwrap();
+        let original_data_charge = prepared.original_data.resident_bytes();
+        drop(prepared);
+        let before_resident_rejection = clock.calls.load(Ordering::SeqCst);
+        let resident_filler = pool
+            .try_acquire(32 * 1024 * 1024 - baseline - original_data_charge - expected_delta + 1)
+            .unwrap();
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::DurableResidentLimit { maximum })
+                if maximum == 32 * 1024 * 1024
+        ));
+        assert_eq!(
+            clock.calls.load(Ordering::SeqCst),
+            before_resident_rejection
+        );
+        assert_eq!(pool.used_for_test(), baseline + resident_filler.bytes());
+        drop(resident_filler);
+        assert_eq!(pool.used_for_test(), baseline);
+
+        clock.fail_after(0);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(pool.used_for_test(), baseline);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline)
+        );
+
+        reservation
+            .append_attempt_chunk_settled(&token, chunk)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), baseline + expected_delta);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_bookkeeping_bytes_for_test(),
+            Some(baseline + expected_delta)
+        );
+
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), baseline + expected_delta);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(pool.used_for_test(), 0);
         drop(reservation);
         session.shutdown().await.unwrap();
         std::fs::remove_file(path).unwrap();
@@ -4782,7 +4973,15 @@ mod tests {
     }
 
     async fn attempt_ready_session(id: &str, writer: JournalWriter) -> (Session, TurnId, StepId) {
-        let mut session = Session::new_active_for_test(id, SystemClock, writer).unwrap();
+        attempt_ready_session_with_clock(id, SystemClock, writer).await
+    }
+
+    async fn attempt_ready_session_with_clock(
+        id: &str,
+        clock: impl Clock + 'static,
+        writer: JournalWriter,
+    ) -> (Session, TurnId, StepId) {
+        let mut session = Session::new_active_for_test(id, clock, writer).unwrap();
         let turn = TurnId::new(1).unwrap();
         let step = StepId::new(1).unwrap();
         session

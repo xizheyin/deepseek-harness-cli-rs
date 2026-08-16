@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet, TryReserveError};
 
 use thiserror::Error;
 
+use crate::resident_credit::{hash_table_backing_charge, string_backing_charge};
+
 use super::{ContentBlockKind, ContentBlockType, FinishReasonKind, StreamChunk, StreamChunkKind};
 
 /// Maximum provider-neutral chunks emitted by one model call.
@@ -44,6 +46,14 @@ enum PreparedStreamTransitionKind {
 }
 
 impl StreamValidator {
+    /// Deterministic charge for the two tables reserved by `try_bounded`.
+    pub(crate) fn bounded_bookkeeping_resident_bytes() -> Option<usize> {
+        hash_table_backing_charge::<(u64, ContentBlockType)>(MAX_PROVIDER_STREAM_CHUNKS)?
+            .checked_add(hash_table_backing_charge::<u64>(
+                MAX_PROVIDER_STREAM_CHUNKS,
+            )?)
+    }
+
     /// Build the Session-owned validator with all per-attempt table capacity
     /// reserved up front. Provider adapters may continue to use `Default`;
     /// durable Session admission needs the fallible constructor so no hidden
@@ -196,6 +206,26 @@ impl StreamValidator {
                 expected: type_name(expected),
                 actual: actual.map_or_else(|| "none".to_owned(), type_name),
             }),
+        }
+    }
+}
+
+impl PreparedStreamTransition {
+    /// New variable-size bookkeeping retained by this transition.
+    ///
+    /// Standard block kinds are inline enum values. Only an extension block
+    /// type owns a new string after the transition commits.
+    pub(crate) fn retained_bookkeeping_resident_bytes(&self) -> Option<usize> {
+        match &self.kind {
+            PreparedStreamTransitionKind::BlockStart {
+                block_type: ContentBlockType::Other(value),
+                ..
+            } => string_backing_charge(value.capacity()),
+            PreparedStreamTransitionKind::Continue
+            | PreparedStreamTransitionKind::BlockStart { .. }
+            | PreparedStreamTransitionKind::BlockEnd { .. }
+            | PreparedStreamTransitionKind::Usage
+            | PreparedStreamTransitionKind::Finish => Some(0),
         }
     }
 }

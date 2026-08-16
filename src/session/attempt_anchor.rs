@@ -15,10 +15,11 @@ use serde::Serializer as _;
 use thiserror::Error;
 
 use crate::model::{
-    ContentBlock, ContentBlockKind, FinishReason, FinishReasonKind, JsonValue, LlmFailure,
-    MAX_PROVIDER_STREAM_CHUNKS, Message, MessageSourceKind, PreparedStreamTransition, StreamChunk,
-    StreamChunkKind, StreamProtocolError, StreamValidator, TokenUsage,
+    ContentBlock, ContentBlockKind, FinishReason, FinishReasonKind, JsonValue, LlmCallConfig,
+    LlmFailure, MAX_PROVIDER_STREAM_CHUNKS, Message, MessageSourceKind, PreparedStreamTransition,
+    StreamChunk, StreamChunkKind, StreamProtocolError, StreamValidator, TokenUsage,
 };
+use crate::resident_credit::{hash_table_backing_charge, vec_backing_charge};
 
 use super::{
     EpochHeader, EventKind, EventSeq, SessionEvent, StepId, TurnId,
@@ -169,17 +170,23 @@ fn replace_bucket(total: u64, previous: u64, next: u64) -> Result<u64, AttemptEr
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AttemptRoute {
-    provider: String,
-    model: String,
+    config: LlmCallConfig,
 }
 
 impl AttemptRoute {
     fn from_header(header: Option<&EpochHeader>) -> Result<Self, AttemptError> {
         let header = header.ok_or(AttemptError::MissingRoute)?;
         Ok(Self {
-            provider: header.config.provider().to_owned(),
-            model: header.config.model().to_owned(),
+            config: header.config.clone(),
         })
+    }
+
+    fn provider(&self) -> &str {
+        self.config.provider()
+    }
+
+    fn model(&self) -> &str {
+        self.config.model()
     }
 }
 
@@ -203,6 +210,22 @@ struct OpenAttempt {
 }
 
 impl OpenAttempt {
+    fn bounded_bookkeeping_resident_bytes() -> Result<usize, AttemptError> {
+        let validator =
+            StreamValidator::bounded_bookkeeping_resident_bytes().ok_or(AttemptError::Capacity)?;
+        let order =
+            vec_backing_charge::<u64>(MAX_PROVIDER_STREAM_CHUNKS).ok_or(AttemptError::Capacity)?;
+        let sources = vec_backing_charge::<EventSeq>(MAX_PROVIDER_STREAM_CHUNKS)
+            .ok_or(AttemptError::Capacity)?;
+        let blocks = hash_table_backing_charge::<(u64, PartialBlock)>(MAX_PROVIDER_STREAM_CHUNKS)
+            .ok_or(AttemptError::Capacity)?;
+        validator
+            .checked_add(order)
+            .and_then(|bytes| bytes.checked_add(sources))
+            .and_then(|bytes| bytes.checked_add(blocks))
+            .ok_or(AttemptError::Capacity)
+    }
+
     fn try_new(
         generation: u64,
         turn: TurnId,
@@ -243,6 +266,9 @@ impl OpenAttempt {
         usage_projection: &UsageProjection,
     ) -> Result<PreparedExistingChunk, AttemptError> {
         let stream = self.validator.prepare(chunk)?;
+        let resident_bookkeeping_bytes = stream
+            .retained_bookkeeping_resident_bytes()
+            .ok_or(AttemptError::Capacity)?;
         let emitted_bytes = self
             .emitted_bytes
             .checked_add(chunk.raw().encoded_len())
@@ -330,6 +356,7 @@ impl OpenAttempt {
             emitted_bytes,
             operation,
             next_usage,
+            resident_bookkeeping_bytes,
         })
     }
 
@@ -430,6 +457,7 @@ pub(super) struct PreparedExistingChunk {
     emitted_bytes: usize,
     operation: PreparedChunkOperation,
     next_usage: Option<UsageProjection>,
+    resident_bookkeeping_bytes: usize,
 }
 
 enum PreparedChunkOperation {
@@ -553,6 +581,49 @@ pub(super) enum PreparedAttemptChunk {
     Continue(PreparedExistingChunk),
 }
 
+impl PreparedAttemptChunk {
+    pub(super) fn resident_bookkeeping_bytes(&self) -> usize {
+        match self {
+            Self::Replace { .. } => 0,
+            Self::Continue(prepared) => prepared.resident_bookkeeping_bytes,
+        }
+    }
+}
+
+pub(super) struct PreparedLiveAttempt {
+    generation: u64,
+    turn: TurnId,
+    step: StepId,
+    route: AttemptRoute,
+    usage: UsageProjection,
+    next_generation: u64,
+    context_overflow_used: bool,
+    context_overflow_start_used: bool,
+    context_overflow_replacement_generation: Option<u64>,
+}
+
+impl PreparedLiveAttempt {
+    pub(super) fn resident_bookkeeping_bytes(&self) -> Result<usize, AttemptError> {
+        OpenAttempt::bounded_bookkeeping_resident_bytes()
+    }
+
+    pub(super) fn commit(self) -> Result<AttemptProjection, AttemptError> {
+        Ok(AttemptProjection {
+            state: AttemptState::Streaming(OpenAttempt::try_new(
+                self.generation,
+                self.turn,
+                self.step,
+                self.route,
+            )?),
+            usage: self.usage,
+            next_generation: self.next_generation,
+            context_overflow_used: self.context_overflow_used,
+            context_overflow_start_used: self.context_overflow_start_used,
+            context_overflow_replacement_generation: self.context_overflow_replacement_generation,
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PreparedAttempt {
     content: Vec<ContentBlock>,
@@ -596,6 +667,12 @@ impl Default for AttemptProjection {
 }
 
 impl AttemptProjection {
+    #[cfg(test)]
+    pub(super) fn bookkeeping_baseline_for_test() -> usize {
+        OpenAttempt::bounded_bookkeeping_resident_bytes()
+            .expect("the fixed attempt bookkeeping charge must fit usize")
+    }
+
     pub(super) fn is_outside_step(&self) -> bool {
         matches!(self.state, AttemptState::OutsideStep)
     }
@@ -684,6 +761,7 @@ impl AttemptProjection {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn begin_live(
         &self,
         turn: TurnId,
@@ -691,19 +769,28 @@ impl AttemptProjection {
         header: Option<&EpochHeader>,
         replacement_generation: u64,
     ) -> Result<Self, AttemptError> {
+        self.prepare_begin_live(turn, step, header, replacement_generation)?
+            .commit()
+    }
+
+    pub(super) fn prepare_begin_live(
+        &self,
+        turn: TurnId,
+        step: StepId,
+        header: Option<&EpochHeader>,
+        replacement_generation: u64,
+    ) -> Result<PreparedLiveAttempt, AttemptError> {
         self.require_ready("provider dispatch", turn, step)?;
         self.require_context_replay_progress("provider dispatch", replacement_generation)?;
         let next_generation = self
             .next_generation
             .checked_add(1)
             .ok_or(AttemptError::Capacity)?;
-        Ok(Self {
-            state: AttemptState::Streaming(OpenAttempt::try_new(
-                self.next_generation,
-                turn,
-                step,
-                AttemptRoute::from_header(header)?,
-            )?),
+        Ok(PreparedLiveAttempt {
+            generation: self.next_generation,
+            turn,
+            step,
+            route: AttemptRoute::from_header(header)?,
             usage: self.usage.clone(),
             next_generation,
             context_overflow_used: self.context_overflow_used,
@@ -1026,7 +1113,7 @@ impl AttemptProjection {
                 ));
             }
         };
-        if turn != retry.turn() || step != retry.step() || route.provider != retry.provider() {
+        if turn != retry.turn() || step != retry.step() || route.provider() != retry.provider() {
             return Err(boundary(
                 "llm/retry",
                 "route, turn, or step does not match the attempt",
@@ -1269,8 +1356,8 @@ fn validate_message_route(
             provider,
             model,
             replay_state: actual_replay,
-        } if provider == &route.provider
-            && model == &route.model
+        } if provider == route.provider()
+            && model == route.model()
             && actual_replay.as_ref().map(json_digest).transpose()? == replay_digest =>
         {
             Ok(())

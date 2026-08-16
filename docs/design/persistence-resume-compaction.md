@@ -955,10 +955,22 @@ an irreversible tool side effect, transfers the reserved row to the exact
 preferred result and keeps that result in the Session-owned pending operation;
 it can never substitute the fallback. Claim growth allocates a replacement row
 before changing any counter, while rebind changes only the prepared payload and
-preserves the row allocation. Typed `EventKind` allocations, attempt-retained
-payloads, cold recovery, and the rest of the complete 32 MiB proof remain later
-implementation slices. A transient durable clock rejection is retried once
-from that exact owner.
+preserves the row allocation. Durable live-attempt admission also precharges the fixed
+bookkeeping high-water before opening the stream: the validator's open/seen
+tables, ordered block/source vectors, and partial-block table. The route shares
+the immutable request-config allocation rather than copying provider/model
+strings. A plugin-defined block type acquires its new retained string credit
+after stream validation but before the Clock; rejection drops that delta, while
+commit merges it into the Session-owned active-attempt lease. That lease stays
+owned through seal, logical closure, and the following durable barrier. During
+a normal live Session it is released by `retire_attempt`; dropping the Session
+also releases it through Rust ownership. It deliberately excludes `ContentBlock`,
+usage, finish/replay, and successful-message allocations: those values cross
+into the long-lived model-visible surface and cannot honestly be released with
+attempt bookkeeping. Typed `EventKind` allocations, this model-payload/raw
+handoff, cold recovery, complete closure payload headroom, and the rest of the
+complete 32 MiB proof remain later implementation slices. A transient durable
+clock rejection is retried once from that exact owner.
 If that retry is also rejected, the Agent returns the original Clock cause
 instead of attempting a `step/end` that cannot pass the still-pending truthful
 result; shutdown or cold recovery retains responsibility for the open tail.

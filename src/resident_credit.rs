@@ -296,6 +296,29 @@ pub(super) fn vec_backing_charge<T>(capacity: usize) -> Option<usize> {
     heap_allocation_charge(bytes, align_of::<T>())
 }
 
+/// Conservative charge for one bounded hash-table backing allocation.
+///
+/// `std::collections::HashMap` does not expose its bucket/control allocation.
+/// The Session only uses this helper for tables reserved once to a fixed entry
+/// ceiling. Charging twice the next power-of-two entry count (with a small
+/// minimum) safely covers the load-factor slack plus one control byte per
+/// bucket without depending on allocator-specific usable-size APIs.
+pub(super) fn hash_table_backing_charge<T>(maximum_entries: usize) -> Option<usize> {
+    if maximum_entries == 0 {
+        return Some(0);
+    }
+    let buckets = maximum_entries
+        .checked_next_power_of_two()?
+        .checked_mul(2)?
+        .max(16);
+    let entries = buckets.checked_mul(size_of::<T>())?;
+    let controls = buckets.checked_add(16)?;
+    heap_allocation_charge(
+        entries.checked_add(controls)?,
+        align_of::<T>().max(align_of::<usize>()),
+    )
+}
+
 /// Conservative charge for the allocation that stores one `Arc<T>` inner.
 pub(super) fn arc_inner_charge<T>() -> Option<usize> {
     let value_offset = round_up(2_usize.checked_mul(size_of::<usize>())?, align_of::<T>())?;
@@ -329,7 +352,7 @@ fn round_up(value: usize, align: usize) -> Option<usize> {
 mod tests {
     use super::{
         ChargedBytes, ResidentCreditPool, arc_inner_charge, byte_buffer_charge,
-        string_backing_charge, vec_backing_charge,
+        hash_table_backing_charge, string_backing_charge, vec_backing_charge,
     };
 
     #[test]
@@ -369,6 +392,12 @@ mod tests {
         assert_eq!(vec_backing_charge::<()>(usize::MAX), Some(0));
         assert!(arc_inner_charge::<u64>().is_some_and(|charge| charge >= 48));
         assert_eq!(vec_backing_charge::<u64>(usize::MAX), None);
+        assert_eq!(hash_table_backing_charge::<(u64, u64)>(0), Some(0));
+        assert!(
+            hash_table_backing_charge::<(u64, u64)>(4_000)
+                .is_some_and(|charge| charge > 4_000 * std::mem::size_of::<(u64, u64)>())
+        );
+        assert_eq!(hash_table_backing_charge::<u64>(usize::MAX), None);
     }
 
     #[test]

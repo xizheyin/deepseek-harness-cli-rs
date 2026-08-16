@@ -13,7 +13,7 @@ use super::{
     SessionId, StepId, SurfaceOp, TurnId,
     attempt_anchor::{
         AttemptDisposition, AttemptError, AttemptProjection, CommittedAttemptFacts,
-        PreparedAttempt, PreparedAttemptChunk, RecoveryAttemptProof,
+        PreparedAttempt, PreparedAttemptChunk, PreparedLiveAttempt, RecoveryAttemptProof,
     },
     compaction::{
         COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
@@ -379,7 +379,33 @@ pub(super) enum PreparedDurableProjection {
     },
 }
 
+pub(super) struct PreparedLiveProjectionAttempt {
+    expected: Arc<AttemptProjection>,
+    prepared: PreparedLiveAttempt,
+}
+
+impl PreparedLiveProjectionAttempt {
+    pub(super) fn resident_bookkeeping_bytes(&self) -> Result<usize, AttemptError> {
+        self.prepared.resident_bookkeeping_bytes()
+    }
+
+    pub(super) fn commit(self, current: &mut Projection) -> Result<(), AttemptError> {
+        if !Arc::ptr_eq(&current.attempt, &self.expected) {
+            return Err(AttemptError::OwnershipChanged);
+        }
+        current.attempt = Arc::new(self.prepared.commit()?);
+        Ok(())
+    }
+}
+
 impl PreparedDurableProjection {
+    pub(super) fn attempt_bookkeeping_resident_bytes(&self) -> usize {
+        match self {
+            Self::AttemptChunk { prepared, .. } => prepared.resident_bookkeeping_bytes(),
+            Self::Replace { .. } => 0,
+        }
+    }
+
     pub(super) fn commit_memory(self, current: &mut Projection) -> bool {
         match self {
             Self::Replace {
@@ -497,11 +523,11 @@ impl Projection {
         projection
     }
 
-    pub(super) fn begin_live_attempt(
-        &mut self,
+    pub(super) fn prepare_live_attempt(
+        &self,
         turn: TurnId,
         step: StepId,
-    ) -> Result<(), AttemptError> {
+    ) -> Result<PreparedLiveProjectionAttempt, AttemptError> {
         if self.compaction.open.is_some() {
             return Err(AttemptError::Boundary {
                 event_type: "provider dispatch",
@@ -512,23 +538,33 @@ impl Projection {
         // that predate token ownership. Keep compatibility replay permissive,
         // and initialize the strict fold only when the live Agent explicitly
         // begins a new owned attempt inside the current step.
-        if self.policy == ValidationPolicy::MemoryCompatible && self.attempt.is_outside_step() {
+        let prepared = if self.policy == ValidationPolicy::MemoryCompatible
+            && self.attempt.is_outside_step()
+        {
             if self.open_turn() != Some(turn) || self.open_step() != Some(step) {
                 return Err(AttemptError::Boundary {
                     event_type: "assistant/chunk",
                     detail: "the attempt does not belong to the open step",
                 });
             }
-            self.attempt = Arc::new(self.attempt.step_start(turn, step)?);
-        }
-        let next = self.attempt.begin_live(
-            turn,
-            step,
-            self.request_header.as_deref(),
-            self.compaction.replacement_generation,
-        )?;
-        self.attempt = Arc::new(next);
-        Ok(())
+            self.attempt.step_start(turn, step)?.prepare_begin_live(
+                turn,
+                step,
+                self.request_header.as_deref(),
+                self.compaction.replacement_generation,
+            )?
+        } else {
+            self.attempt.prepare_begin_live(
+                turn,
+                step,
+                self.request_header.as_deref(),
+                self.compaction.replacement_generation,
+            )?
+        };
+        Ok(PreparedLiveProjectionAttempt {
+            expected: Arc::clone(&self.attempt),
+            prepared,
+        })
     }
 
     pub(super) fn seal_live_attempt(&mut self) -> Result<PreparedAttempt, AttemptError> {

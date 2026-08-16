@@ -703,6 +703,12 @@ struct ActiveAttemptOwner {
     turn: TurnId,
     step: StepId,
     phase: ActiveAttemptPhase,
+    /// Attempt-only tables, vectors, and extension-type strings.
+    ///
+    /// Model payloads intentionally remain outside this partial slice: after
+    /// a successful closure they move into the long-lived surface and need a
+    /// separate surface lease rather than this 32 MiB attempt/journal pool.
+    resident_bookkeeping_credit: Option<ResidentCreditLease>,
 }
 
 /// Exclusive append view that prevents ordinary events from consuming claims.
@@ -1611,6 +1617,32 @@ impl Session {
             Some(pool) => pool,
             None => return commit.reject(event, AppendError::DurablePoisoned),
         };
+        let attempt_bookkeeping_bytes = match &commit.owner {
+            DurableOperationOwner::Attempt {
+                kind: AttemptOperationKind::Chunk,
+                ..
+            } => prepared_projection.attempt_bookkeeping_resident_bytes(),
+            DurableOperationOwner::Ordinary
+            | DurableOperationOwner::Claim { .. }
+            | DurableOperationOwner::Attempt { .. }
+            | DurableOperationOwner::OwnedPrune(_)
+            | DurableOperationOwner::OverflowPruneMarker { .. } => 0,
+        };
+        let mut attempt_bookkeeping_credit = if attempt_bookkeeping_bytes == 0 {
+            None
+        } else {
+            match resident_pool.try_acquire(attempt_bookkeeping_bytes) {
+                Ok(credit) => Some(credit),
+                Err(error) => {
+                    return commit.reject(
+                        event,
+                        AppendError::DurableResidentLimit {
+                            maximum: error.maximum(),
+                        },
+                    );
+                }
+            }
+        };
         if commit.encoded_row.is_none() {
             let encoded = match commit.reserved_row.take() {
                 Some(bytes) => match ChargedEventLineTemplate::in_reserved(&event, bytes) {
@@ -1762,6 +1794,20 @@ impl Session {
         if !prepared_projection.commit(&mut self.projection, row_locator) {
             *storage = SessionStorage::Failed(StoreError::Poisoned);
             return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+        }
+        if let Some(delta) = attempt_bookkeeping_credit.take() {
+            let Some(active) = &mut self.active_attempt else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            let Some(credit) = &mut active.resident_bookkeeping_credit else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            if credit.merge(delta).is_err() {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            }
         }
         if let DurableOperationOwner::Attempt {
             authority,
@@ -2702,9 +2748,25 @@ impl Session {
         assert_eq!(pending_batch.event_count, 0);
         assert!(pending_batch.bytes.is_none());
         assert!(pending_operation.is_none());
+        assert!(self.active_attempt.is_none());
         let pool = ResidentCreditPool::with_limit_for_test(maximum);
         self.resident_pool = Some(pool.clone());
         pool
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attempt_bookkeeping_baseline_for_test() -> usize {
+        attempt_anchor::AttemptProjection::bookkeeping_baseline_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_attempt_bookkeeping_bytes_for_test(&self) -> Option<usize> {
+        self.active_attempt.as_ref().map(|attempt| {
+            attempt
+                .resident_bookkeeping_credit
+                .as_ref()
+                .map_or(0, ResidentCreditLease::bytes)
+        })
     }
 
     /// Number of events supplied through construction before this lifecycle began.
@@ -3140,9 +3202,26 @@ impl SessionReservation<'_> {
         }
         let nonce = self.session.next_attempt_nonce;
         let next_nonce = nonce.checked_add(1).ok_or(AppendError::SequenceExhausted)?;
-        self.session
+        let prepared = self
+            .session
             .projection
-            .begin_live_attempt(turn, step)
+            .prepare_live_attempt(turn, step)
+            .map_err(EventValidationError::from)?;
+        let resident_bookkeeping_credit = match self.session.resident_pool.as_ref() {
+            Some(pool) => Some(
+                pool.try_acquire(
+                    prepared
+                        .resident_bookkeeping_bytes()
+                        .map_err(EventValidationError::from)?,
+                )
+                .map_err(|error| AppendError::DurableResidentLimit {
+                    maximum: error.maximum(),
+                })?,
+            ),
+            None => None,
+        };
+        prepared
+            .commit(&mut self.session.projection)
             .map_err(EventValidationError::from)?;
         self.session.next_attempt_nonce = next_nonce;
         self.session.active_attempt = Some(ActiveAttemptOwner {
@@ -3151,6 +3230,7 @@ impl SessionReservation<'_> {
             turn,
             step,
             phase: ActiveAttemptPhase::Open,
+            resident_bookkeeping_credit,
         });
         Ok(AttemptToken {
             authority: self.session.attempt_authority.clone(),
