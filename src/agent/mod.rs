@@ -1227,6 +1227,14 @@ async fn run_entered_turn(
         .await
         {
             Ok(Ok(resolution)) => resolution,
+            Ok(Err(error)) if reservation.has_pending_preferred_only_result() => {
+                // An irreversible tool side effect already produced this
+                // exact result. A second pre-commit failure leaves Session as
+                // its sole owner, so step/end cannot truthfully pass it. Keep
+                // the original cause visible and let shutdown/recovery finish
+                // the append-only tail.
+                return Err(error);
+            }
             Ok(Err(error)) if is_fatal_loop_error(&error) => return Err(error),
             Ok(Err(_)) | Err(_) => StepResolution::new(StepOutcome::Error(failure_reason(
                 "AGENT_INTERNAL",
@@ -3817,9 +3825,23 @@ async fn settle_tool_result(
         }
     };
     if preferred_required {
-        reservation
+        match reservation
             .settle_preferred_only_settled(&mut plan.result_claim, preferred)
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(first @ AppendError::Clock(_)) if reservation.session().is_durable() => {
+                match reservation
+                    .resume_preferred_only_settled(&mut plan.result_claim)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(AppendError::Clock(_)) => return Err(first.into()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
         driver.counters.tool_result_bytes = driver.counters.tool_result_bytes.saturating_add(size);
         return Ok(true);
     }

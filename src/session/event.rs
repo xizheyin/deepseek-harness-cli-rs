@@ -1800,6 +1800,23 @@ impl SessionEvent {
         self.time = time;
     }
 
+    /// Recover the exact pre-envelope owner after a live durable append is
+    /// rejected before commit. This is a move, not a payload clone.
+    pub(crate) fn into_new(self) -> (NewEvent, JsonValue) {
+        debug_assert!(self.ignorable.is_none());
+        let surface = self.surface_op.map(|operation| SurfaceIntent {
+            operation,
+            source_event_seqs: self.source_event_seqs,
+        });
+        (
+            NewEvent {
+                kind: self.kind,
+                surface,
+            },
+            self.original_data,
+        )
+    }
+
     pub(crate) fn into_original_data(self) -> serde_json::Value {
         self.original_data.into_value()
     }

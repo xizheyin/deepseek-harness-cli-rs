@@ -80,6 +80,8 @@ struct ArmedClock(Arc<Mutex<ArmedClockState>>);
 struct ArmedClockState {
     next: i64,
     successful_calls_before_failure: Option<usize>,
+    failures_remaining: usize,
+    emitted_failures: usize,
     cancel_on_failure: Option<CancellationToken>,
 }
 
@@ -88,13 +90,26 @@ impl ArmedClock {
         Self(Arc::new(Mutex::new(ArmedClockState {
             next,
             successful_calls_before_failure: None,
+            failures_remaining: 0,
+            emitted_failures: 0,
             cancel_on_failure: None,
         })))
     }
 
     fn fail_after(&self, successful_calls: usize, cancel_on_failure: Option<CancellationToken>) {
+        self.fail_repeatedly_after(successful_calls, 1, cancel_on_failure);
+    }
+
+    fn fail_repeatedly_after(
+        &self,
+        successful_calls: usize,
+        failures: usize,
+        cancel_on_failure: Option<CancellationToken>,
+    ) {
         let mut state = self.0.lock().unwrap();
         state.successful_calls_before_failure = Some(successful_calls);
+        state.failures_remaining = failures;
+        state.emitted_failures = 0;
         state.cancel_on_failure = cancel_on_failure;
     }
 }
@@ -104,11 +119,18 @@ impl Clock for ArmedClock {
         let mut state = self.0.lock().unwrap();
         if let Some(remaining) = state.successful_calls_before_failure {
             if remaining == 0 {
-                state.successful_calls_before_failure = None;
+                state.failures_remaining = state.failures_remaining.saturating_sub(1);
+                state.emitted_failures = state.emitted_failures.saturating_add(1);
+                let failure_number = state.emitted_failures;
+                if state.failures_remaining == 0 {
+                    state.successful_calls_before_failure = None;
+                }
                 if let Some(cancellation) = state.cancel_on_failure.take() {
                     cancellation.cancel();
                 }
-                return Err(ClockError::new("injected prune replacement clock failure"));
+                return Err(ClockError::new(format!(
+                    "injected live clock failure {failure_number}"
+                )));
             }
             state.successful_calls_before_failure = Some(remaining - 1);
         }
@@ -118,9 +140,41 @@ impl Clock for ArmedClock {
     }
 }
 
+#[derive(Clone)]
+struct PanicWhenArmedClock {
+    next: Arc<Mutex<i64>>,
+    armed: Arc<AtomicBool>,
+}
+
+impl PanicWhenArmedClock {
+    fn new(next: i64) -> Self {
+        Self {
+            next: Arc::new(Mutex::new(next)),
+            armed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Clock for PanicWhenArmedClock {
+    fn now(&self) -> Result<UnixMillis, ClockError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            panic!("injected live clock panic");
+        }
+        let mut next = self.next.lock().unwrap();
+        let value = *next;
+        *next += 1;
+        UnixMillis::new(value).map_err(|error| ClockError::new(error.to_string()))
+    }
+}
+
 struct ScriptedProvider {
     attempts: Mutex<VecDeque<Vec<StreamChunk>>>,
     requests: Mutex<Vec<Vec<Message>>>,
+    panic_clock_on_stream: Option<PanicWhenArmedClock>,
 }
 
 struct PruneThenFitProvider {
@@ -231,7 +285,13 @@ impl ScriptedProvider {
         Self {
             attempts: Mutex::new(attempts.into()),
             requests: Mutex::new(Vec::new()),
+            panic_clock_on_stream: None,
         }
+    }
+
+    fn with_clock_panic_on_stream(mut self, clock: PanicWhenArmedClock) -> Self {
+        self.panic_clock_on_stream = Some(clock);
+        self
     }
 
     fn requests(&self) -> Vec<Vec<Message>> {
@@ -277,6 +337,9 @@ impl ModelProvider for ScriptedProvider {
             .lock()
             .unwrap()
             .push(request.messages().to_vec());
+        if let Some(clock) = &self.panic_clock_on_stream {
+            clock.arm();
+        }
         Box::pin(stream::iter(
             self.attempts
                 .lock()
@@ -295,6 +358,8 @@ enum ActionScript {
     ActionNotStarted,
     Infrastructure,
     StartedAndQuiescent,
+    StartedAfterClockRejection(ArmedClock),
+    StartedAfterTwoClockRejections(ArmedClock),
     StartedOwnershipLost,
     OversizedStartedResult,
     StopThenCleanup(StopThenCleanup),
@@ -651,6 +716,20 @@ fn run_action_script(
                 turn_stop: ToolActionTurnStop::None,
                 result: started_result("small started result"),
             },
+            ActionScript::StartedAfterClockRejection(clock) => {
+                clock.fail_after(0, None);
+                ToolActionOutcome::StartedAndQuiescent {
+                    turn_stop: ToolActionTurnStop::None,
+                    result: started_result("clock-retried started result"),
+                }
+            }
+            ActionScript::StartedAfterTwoClockRejections(clock) => {
+                clock.fail_repeatedly_after(0, 2, None);
+                ToolActionOutcome::StartedAndQuiescent {
+                    turn_stop: ToolActionTurnStop::None,
+                    result: started_result("session-owned result after two clock rejections"),
+                }
+            }
             ActionScript::StartedOwnershipLost => ToolActionOutcome::StartedOwnershipLost {
                 turn_stop: ToolActionTurnStop::None,
             },
@@ -1068,6 +1147,201 @@ async fn durable_session_with_clock(
     session.materialize_if_needed().await.unwrap();
     session.set_durable_event_room_for_test(remaining_events);
     (session, journal_path, root, workspace)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_durable_clock_panic_during_streaming_still_closes_step_and_turn() {
+    let clock = PanicWhenArmedClock::new(1_000);
+    let (session, journal, root, workspace) =
+        durable_session_with_clock("agent-stream-clock-panic", 512, clock.clone()).await;
+    let provider =
+        Arc::new(ScriptedProvider::new(vec![text_response()]).with_clock_panic_on_stream(clock));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    let TurnEndReason::Error { error } = outcome.reason() else {
+        panic!("the injected clock panic must close the turn as an error")
+    };
+    assert_eq!(error.code(), "AGENT_INTERNAL");
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    agent.shutdown().await.unwrap();
+
+    let event_types = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        event_types
+            .iter()
+            .any(|event_type| event_type == "step/end")
+    );
+    assert!(
+        event_types
+            .iter()
+            .any(|event_type| event_type == "turn/end")
+    );
+    assert!(
+        !event_types
+            .iter()
+            .any(|event_type| event_type == "assistant/message")
+    );
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_durable_clock_rejection_retries_the_exact_started_tool_result() {
+    let clock = ArmedClock::new(1_000);
+    let (session, journal, root, workspace) =
+        durable_session_with_clock("agent-tool-result-clock-retry", 512, clock.clone()).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAfterClockRejection(clock));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+    agent.shutdown().await.unwrap();
+
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    assert!(journal_text.contains("clock-retried started result"));
+    assert!(!journal_text.contains("TOOL_OUTPUT_BUDGET_EXCEEDED"));
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_clock_rejection_preserves_the_root_error_and_session_owned_result() {
+    let clock = ArmedClock::new(1_000);
+    let (session, journal, root, workspace) =
+        durable_session_with_clock("agent-tool-result-clock-repeat", 512, clock.clone()).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_response()]));
+    let (tools, run_count) =
+        ScriptedActions::one(ActionScript::StartedAfterTwoClockRejections(clock));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let error = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap_err();
+    let AgentLoopError::Session(AppendError::Clock(error)) = error else {
+        panic!("the first Clock rejection must remain the public root cause")
+    };
+    assert_eq!(error.to_string(), "injected live clock failure 1");
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert!(agent.session().state().open_step().is_some());
+    assert!(agent.session().state().open_turn().is_some());
+    assert!(
+        !std::fs::read_to_string(&journal)
+            .unwrap()
+            .contains("session-owned result after two clock rejections")
+    );
+
+    // The third clock read succeeds during shutdown, proving that Session kept
+    // the exact irreversible result rather than replacing it with a fallback.
+    agent.shutdown().await.unwrap();
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    assert_eq!(
+        journal_text
+            .matches("session-owned result after two clock rejections")
+            .count(),
+        1
+    );
+    assert!(!journal_text.contains("TOOL_OUTPUT_BUDGET_EXCEEDED"));
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn a_memory_clock_rejection_is_not_misclassified_as_a_durable_error() {
+    let clock = ArmedClock::new(1_000);
+    let session = Session::with_clock("agent-memory-tool-clock", clock.clone()).unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![tool_response()]));
+    let (tools, run_count) = ScriptedActions::one(ActionScript::StartedAfterClockRejection(clock));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    let TurnEndReason::Error { error } = outcome.reason() else {
+        panic!("the memory clock rejection must close as an internal turn error")
+    };
+    assert_eq!(error.code(), "AGENT_INTERNAL");
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
 }
 
 #[cfg(unix)]

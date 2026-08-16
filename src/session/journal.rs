@@ -2220,6 +2220,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_owned_step_end_resumes_without_a_local_fallback_payload() {
+        let (path, file) = test_file("attempt-step-end-drop");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-step-end-drop", writer).await;
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer_at(&path, FlightKind::Append, offset);
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let mut step_end = reservation
+            .claim_batch([NewEvent::log(EventKind::step_end(turn, step))])
+            .unwrap()
+            .remove(0);
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "flush before the owned step closure".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            }))
+            .await
+            .unwrap();
+
+        {
+            let mut waiting = Box::pin(reservation.settle_step_end_with_attempt_settled(
+                &mut step_end,
+                Some(&token),
+                Some(AttemptDisposition::Failed),
+            ));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("owned step closure unexpectedly completed: {result:?}")
+                }
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            reservation.flush_barrier().await,
+            Err(BarrierError::Append(AppendError::NeedsAppendSettle))
+        );
+
+        reservation
+            .settle_step_end_with_attempt_settled(
+                &mut step_end,
+                Some(&token),
+                Some(AttemptDisposition::Failed),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(reservation.session().state().open_step(), None);
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("provider failed", "AGENT_PROVIDER_STREAM").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_retry_reopens_the_same_step_only_after_its_owned_attempt_closes() {
         let (path, file) = test_file("attempt-retry-lifecycle");
         let writer = JournalWriter::start(file, 0).unwrap();
@@ -3017,6 +3112,470 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_clock_rejection_restores_the_exact_claim_payload_without_copying_it() {
+        let (path, file) = test_file("session-claim-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session =
+            Session::new_active_for_test("session-claim-clock-rejection", clock.clone(), writer)
+                .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "clock rejection keeps this allocation".repeat(64),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let (before_pointer, before_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a new claim must own its fallback")
+                .event
+                .kind,
+        );
+        let next_before = reservation.session().next_seq();
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(reservation.session().next_seq(), next_before);
+        assert!(!reservation.session.has_pending_durable_operation());
+        let (after_pointer, after_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a rejected operation must return the fallback")
+                .event
+                .kind,
+        );
+        assert_eq!(
+            (after_pointer, after_capacity),
+            (before_pointer, before_capacity)
+        );
+
+        reservation.settle_exact_settled(&mut claim).await.unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_preferred_claim_keeps_its_exact_fallback_available() {
+        let (path, file) = test_file("session-preferred-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-preferred-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "fallback survives".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        clock.fail_after(0);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred is rejected by the clock".repeat(8),
+                status: TodoStatus::InProgress,
+            }],
+        });
+
+        assert!(matches!(
+            reservation.settle_settled(&mut claim, preferred).await,
+            Err(AppendError::Clock(_))
+        ));
+        let receipt = reservation.settle_exact_settled(&mut claim).await.unwrap();
+        assert_eq!(receipt.event_type(), "todo/write");
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        let rows = std::fs::read(&path).unwrap();
+        let todo = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "todo/write")
+            .expect("the restored fallback must be durable");
+        assert_eq!(todo["data"]["todos"][0]["content"], "fallback survives");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_rejection_restores_a_fallback_selected_by_durable_room() {
+        let (path, file) = test_file("session-selected-fallback-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-selected-fallback-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let fallback = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "selected fallback".to_owned(),
+                status: TodoStatus::Pending,
+            }],
+        });
+        let fallback_row =
+            Session::durable_row_upper_bound(&Session::prepare_event(fallback.clone()).unwrap())
+                .unwrap();
+        let turn_end = NewEvent::log(EventKind::turn_end(turn, TurnEndReason::Completed));
+        let turn_end_row =
+            Session::durable_row_upper_bound(&Session::prepare_event(turn_end.clone()).unwrap())
+                .unwrap();
+        session.set_durable_byte_room_for_test(fallback_row + turn_end_row);
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation.claim_batch([fallback]).unwrap().remove(0);
+        let preferred = || {
+            NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "preferred cannot fit".repeat(4_096),
+                    status: TodoStatus::InProgress,
+                }],
+            })
+        };
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation.settle_settled(&mut claim, preferred()).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert!(matches!(
+            reservation.settle_settled(&mut claim, preferred()).await,
+            Ok(ClaimedAppend::Fallback(_))
+        ));
+        reservation.append_settled(turn_end).await.unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_preferred_only_candidate_remains_session_owned() {
+        let (path, file) = test_file("session-preferred-only-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-preferred-only-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "preferred-only fallback".repeat(16),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        clock.fail_after(0);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred-only candidate".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        });
+
+        assert!(matches!(
+            reservation
+                .settle_preferred_only_settled(&mut claim, preferred)
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::InvalidClaim)
+        );
+        reservation
+            .resume_preferred_only_settled(&mut claim)
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        let rows = std::fs::read(&path).unwrap();
+        let todo = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "todo/write")
+            .expect("the exact preferred-only candidate must be durable");
+        assert_eq!(
+            todo["data"]["todos"][0]["content"],
+            "preferred-only candidate"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_writer_returns_the_session_owned_fallback_to_its_claim() {
+        let (path, file) = test_file("session-claim-poison-restore");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::Append);
+        let mut session =
+            Session::new_active_for_test("session-claim-poison-restore", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "the poisoned writer must not trap this fallback".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let (before_pointer, before_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a new claim must own its fallback")
+                .event
+                .kind,
+        );
+        {
+            let mut settlement = Box::pin(reservation.settle_exact_settled(&mut claim));
+            poll_fn(|context| match settlement.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim unexpectedly settled: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        reservation.session.latch_durable_corruption();
+        release.send(()).unwrap();
+
+        assert_eq!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::DurablePoisoned)
+        );
+        assert!(!reservation.session.has_pending_durable_operation());
+        let (after_pointer, after_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a rejected poisoned operation must restore its fallback")
+                .event
+                .kind,
+        );
+        assert_eq!(
+            (after_pointer, after_capacity),
+            (before_pointer, before_capacity)
+        );
+
+        drop(reservation);
+        assert!(session.shutdown().await.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_panic_becomes_a_rejection_and_restores_the_exact_claim() {
+        let (path, file) = test_file("session-claim-clock-panic");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = PanicOnceClock::new();
+        let mut session =
+            Session::new_active_for_test("session-claim-clock-panic", clock.clone(), writer)
+                .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "panic-safe fallback".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        clock.panic_after(0);
+
+        assert!(matches!(
+            reservation.settle_exact_settled(&mut claim).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert!(!reservation.session.has_pending_durable_operation());
+        reservation.settle_exact_settled(&mut claim).await.unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_claim_clock_rejection_keeps_both_owners_retryable() {
+        let (path, file) = test_file("attempt-claim-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session =
+            Session::new_active_for_test("attempt-claim-clock-rejection", clock.clone(), writer)
+                .unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let mut claim = reservation.claim_batch([closure]).unwrap().remove(0);
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation
+                .settle_attempt_closure_exact_settled(
+                    &mut claim,
+                    &token,
+                    AttemptDisposition::Committed,
+                )
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation
+            .settle_attempt_closure_exact_settled(&mut claim, &token, AttemptDisposition::Committed)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_claim_settlement_resumes_the_same_candidate_once() {
         let (path, file) = test_file("session-claim-cancel-safe");
         drop(file);
@@ -3037,12 +3596,21 @@ mod tests {
 
         let mut reservation = session.reservation();
         let mut claims = reservation
-            .claim_batch([NewEvent::log(EventKind::step_start(
-                TurnId::new(1).unwrap(),
-                StepId::new(1).unwrap(),
-            ))])
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "the exact fallback allocation must move into Session".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })])
             .unwrap();
         let mut claim = claims.remove(0);
+        let (fallback_pointer, fallback_capacity) = todo_content_allocation(
+            &claim
+                .ready_fallback()
+                .expect("a new claim must own its fallback")
+                .event
+                .kind,
+        );
         {
             let mut settlement = Box::pin(reservation.settle_exact_settled(&mut claim));
             poll_fn(|context| match settlement.as_mut().poll(context) {
@@ -3051,6 +3619,17 @@ mod tests {
             })
             .await;
         }
+        let SessionMode::Durable {
+            pending_operation: Some(operation),
+            ..
+        } = &reservation.session.mode
+        else {
+            panic!("the cancelled settlement must remain Session-owned");
+        };
+        let (pending_pointer, pending_capacity) =
+            todo_content_allocation(&operation.prepared.event.kind);
+        assert_eq!(pending_pointer, fallback_pointer);
+        assert_eq!(pending_capacity, fallback_capacity);
         assert_eq!(
             arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
             FlightKind::Append
@@ -3069,6 +3648,11 @@ mod tests {
             ),
             Err(crate::session::AppendError::NeedsAppendSettle)
         );
+        let larger_reservation = claim.reserved_retained_json_bytes + 1;
+        assert_eq!(
+            reservation.reserve_claim_retained_json_bytes(&mut claim, larger_reservation),
+            Err(crate::session::AppendError::NeedsAppendSettle)
+        );
 
         release.send(()).unwrap();
         let receipt = reservation.settle_exact_settled(&mut claim).await.unwrap();
@@ -3082,6 +3666,66 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_a_session_owned_claim_after_the_caller_is_dropped() {
+        let (path, file) = test_file("session-claim-shutdown-owner");
+        drop(file);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer(&path, FlightKind::Append);
+        let mut session =
+            Session::new_active_for_test("session-claim-shutdown-owner", SystemClock, writer)
+                .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(
+                TurnId::new(1).unwrap(),
+            )))
+            .await
+            .unwrap();
+
+        {
+            let mut reservation = session.reservation();
+            let mut claim = reservation
+                .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "Session remains the only owner".repeat(32),
+                        status: TodoStatus::Pending,
+                    }],
+                })])
+                .unwrap()
+                .remove(0);
+            let mut settlement = Box::pin(reservation.settle_exact_settled(&mut claim));
+            poll_fn(|context| match settlement.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim unexpectedly settled: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        session.shutdown().await.unwrap();
+
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        let rows = std::fs::read_to_string(&path).unwrap();
+        assert!(rows.contains("Session remains the only owner"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn todo_content_allocation(kind: &EventKind) -> (*const u8, usize) {
+        let EventKind::TodoWrite { todos } = kind else {
+            panic!("test event must be todo/write");
+        };
+        let content = &todos.first().expect("test todo must exist").content;
+        (content.as_ptr(), content.capacity())
     }
 
     #[tokio::test]
@@ -3550,6 +4194,40 @@ mod tests {
             if call == self.fail_at.load(Ordering::SeqCst) {
                 return Err(ClockError::new("injected clock failure"));
             }
+            UnixMillis::new(i64::try_from(call).unwrap()).map_err(|_| ClockError::new("clock"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicOnceClock {
+        calls: Arc<AtomicUsize>,
+        panic_at: Arc<AtomicUsize>,
+    }
+
+    impl PanicOnceClock {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                panic_at: Arc::new(AtomicUsize::new(usize::MAX)),
+            }
+        }
+
+        fn panic_after(&self, successful_calls: usize) {
+            self.panic_at.store(
+                self.calls.load(Ordering::SeqCst) + successful_calls,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    impl Clock for PanicOnceClock {
+        fn now(&self) -> Result<UnixMillis, ClockError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(
+                call,
+                self.panic_at.load(Ordering::SeqCst),
+                "injected clock panic"
+            );
             UnixMillis::new(i64::try_from(call).unwrap()).map_err(|_| ClockError::new("clock"))
         }
     }

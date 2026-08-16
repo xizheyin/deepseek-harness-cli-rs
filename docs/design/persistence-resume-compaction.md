@@ -940,7 +940,23 @@ owned writer state, and moves the unchanged prepared value into the retry.
 Claim settlement has matching `settle_settled`/`settle_exact_settled` helpers;
 the claim remains unsettled across a control outcome. It never regenerates an
 ID/time-bearing payload and never deep-clones a large row merely to retry
-storage. The public synchronous `append` remains the finite memory-mode seam;
+storage. A durable claim is a closed four-state owner:
+`Ready(PreparedEvent)`, `PendingFallback`,
+`PendingPreferred(PreparedEvent)`, or `Settled`. Selecting the fallback moves
+the exact value into the Session-owned pending operation; selecting a preferred
+value leaves the fallback in the claim. A pre-commit rejection moves the same
+owner back to `Ready` when fallback remains legal. `PreferredOnly`, used after
+an irreversible tool side effect, instead keeps the exact preferred result in
+the Session-owned pending operation; it can never substitute the fallback. A
+transient durable clock rejection is retried once from that exact owner.
+If that retry is also rejected, the Agent returns the original Clock cause
+instead of attempting a `step/end` that cannot pass the still-pending truthful
+result; shutdown or cold recovery retains responsibility for the open tail.
+Cancellation likewise leaves the candidate in Session until the same claim
+resumes or shutdown takes over. A panicking injected clock is normalized to the
+same pre-commit clock rejection, so it cannot strand a stream candidate in
+front of the Agent's reserved failure closure. The public synchronous `append`
+remains the finite memory-mode seam;
 calling it on durable mode returns an async-required error before state change.
 Durable `remaining_budget()` is likewise unavailable/fallible because the old
 4,096/16 MiB answer describes only memory mode. Journal quota uses exact
