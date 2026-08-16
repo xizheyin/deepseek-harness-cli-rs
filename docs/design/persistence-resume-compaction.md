@@ -1466,8 +1466,8 @@ entries for a summary or exactly one for a prune. A summary/raw-output list has
 at most 4,096 blocks; tools have at most 256 entries; system text has at most
 4 MiB. Retry policy has at most 256 distinct nonempty codes of at most 256
 bytes; normal mode requires `maxRetries` and a nonempty code list, while always
-mode omits both retries and codes. Backoff uses the existing timer ceiling and
-requires initial <= maximum and jitter in `[0, 1]`.
+mode omits `maxRetries` and requires `retryableCodes: []`. Backoff uses the
+existing timer ceiling and requires initial <= maximum and jitter in `[0, 1]`.
 
 `instructionFormatVersion` is exactly `1`. Its message ID is 1 to 1,024 visible
 ASCII bytes. The message is a user-role plugin
