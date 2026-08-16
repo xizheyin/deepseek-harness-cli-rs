@@ -1,5 +1,7 @@
 //! Bounded physical JSONL encoding for durable session artifacts.
 
+use std::io;
+
 use serde::ser::{SerializeMap as _, Serializer as _};
 use thiserror::Error;
 
@@ -135,9 +137,9 @@ pub(crate) fn encode_event_line(event: &SessionEvent) -> Result<Vec<u8>, JsonlEn
 pub(super) fn prepared_event_line_upper_bound(
     prepared: &PreparedEvent,
 ) -> Result<u64, JsonlEncodeError> {
-    let mut bytes = Vec::new();
+    let mut counter = CountingWriter::default();
     {
-        let mut serializer = serde_json::Serializer::new(&mut bytes);
+        let mut serializer = serde_json::Serializer::new(&mut counter);
         let surface = prepared.event.surface.as_ref();
         let mut map = serializer.serialize_map(Some(
             4 + usize::from(
@@ -158,14 +160,34 @@ pub(super) fn prepared_event_line_upper_bound(
         }
         map.end()?;
     }
-    if bytes.len() >= MAX_JOURNAL_EVENT_LINE_BYTES {
+    if counter.overflowed || counter.bytes >= MAX_JOURNAL_EVENT_LINE_BYTES {
         return Err(JsonlEncodeError::EventTooLarge);
     }
-    let complete = bytes
-        .len()
+    let complete = counter
+        .bytes
         .checked_add(1)
         .ok_or(JsonlEncodeError::EventTooLarge)?;
     u64::try_from(complete).map_err(|_| JsonlEncodeError::EventTooLarge)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+    overflowed: bool,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self.bytes.checked_add(buffer.len()) {
+            Some(total) => self.bytes = total,
+            None => self.overflowed = true,
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 enum LineEncodeError {
@@ -188,13 +210,16 @@ fn encode_line(value: serde_json::Value, maximum: usize) -> Result<Vec<u8>, Line
 #[cfg(test)]
 mod tests {
     use crate::{
-        session::{Clock, ClockError, EventKind, EventSeq, NewEvent, Session, UnixMillis},
+        session::{
+            Clock, ClockError, EventKind, EventSeq, NewEvent, Session, SessionEvent, SurfaceIntent,
+            UnixMillis,
+        },
         workspace_authority::WorkspaceIdentity,
     };
 
     use super::{
-        DurableTimestamp, EventLineTemplate, JsonlEncodeError, encode_event_line,
-        encode_header_line,
+        DurableTimestamp, EventLineTemplate, JsonlEncodeError, MAX_SAFE_INTEGER, encode_event_line,
+        encode_header_line, prepared_event_line_upper_bound,
     };
 
     #[derive(Clone, Copy)]
@@ -282,5 +307,34 @@ mod tests {
             assert_eq!(parsed["time"], raw);
         }
         assert!(DurableTimestamp::new(9_007_199_254_740_992).is_none());
+    }
+
+    #[test]
+    fn prepared_line_count_matches_the_exact_largest_physical_row() {
+        let maximum_seq = EventSeq::new(MAX_SAFE_INTEGER).unwrap();
+        let maximum_time = UnixMillis::new(i64::try_from(MAX_SAFE_INTEGER).unwrap()).unwrap();
+        let prepared = Session::prepare_event(NewEvent::surface(
+            EventKind::EndSeed,
+            SurfaceIntent::append().with_sources(vec![
+                EventSeq::new(0).unwrap(),
+                EventSeq::new(MAX_SAFE_INTEGER - 1).unwrap(),
+            ]),
+        ))
+        .unwrap();
+        let expected = prepared_event_line_upper_bound(&prepared).unwrap();
+        let event = SessionEvent::from_new(
+            maximum_seq,
+            maximum_time,
+            prepared.event,
+            prepared.original_data,
+        );
+        let actual = encode_event_line(&event).unwrap();
+
+        assert_eq!(u64::try_from(actual.len()).unwrap(), expected);
+        let value: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+        assert_eq!(value["seq"], MAX_SAFE_INTEGER);
+        assert_eq!(value["time"], MAX_SAFE_INTEGER);
+        assert_eq!(value["surfaceOp"], "append");
+        assert_eq!(value["sourceEventSeqs"][1], MAX_SAFE_INTEGER - 1);
     }
 }

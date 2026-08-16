@@ -1,6 +1,6 @@
 //! Messages, content blocks, and merge-extensible provenance.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
@@ -127,8 +127,13 @@ pub enum ContentBlockKind {
 }
 
 /// One provider-neutral block with lossless support for plugin-added shapes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ContentBlock {
+    inner: Arc<ContentBlockInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ContentBlockInner {
     kind: ContentBlockKind,
     raw: JsonValue,
 }
@@ -171,7 +176,7 @@ impl ContentBlock {
     ) -> Result<Self, ModelError> {
         let content = content
             .into_iter()
-            .map(|block| block.raw.into_value())
+            .map(ContentBlock::into_raw_value)
             .collect::<Vec<_>>();
         let mut value = json!({
             "type": "tool-result",
@@ -188,32 +193,57 @@ impl ContentBlock {
     pub fn from_value(value: Value) -> Result<Self, ModelError> {
         let raw = JsonValue::new(value)?;
         let kind = parse_content_block(raw.as_value());
-        Ok(Self { kind, raw })
+        Ok(Self {
+            inner: Arc::new(ContentBlockInner { kind, raw }),
+        })
     }
 
     /// Known facts, or `Other` for a plugin/forward-compatible block.
     #[must_use]
     pub fn kind(&self) -> &ContentBlockKind {
-        &self.kind
+        &self.inner.kind
     }
 
     /// Exact bounded JSON supplied by the producer.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
     }
 
     /// Nested model-facing blocks for a tool result, when this is one.
     #[must_use]
     pub fn tool_result_content(&self) -> Option<&[Value]> {
-        if !matches!(self.kind, ContentBlockKind::ToolResult { .. }) {
+        if !matches!(self.inner.kind, ContentBlockKind::ToolResult { .. }) {
             return None;
         }
-        self.raw
+        self.inner
+            .raw
             .as_value()
             .get("content")?
             .as_array()
             .map(Vec::as_slice)
+    }
+
+    fn into_raw_value(self) -> Value {
+        Arc::try_unwrap(self.inner).map_or_else(
+            |shared| shared.raw.as_value().clone(),
+            |inner| inner.raw.into_value(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl fmt::Debug for ContentBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContentBlock")
+            .field("kind", &self.inner.kind)
+            .field("raw", &self.inner.raw)
+            .finish()
     }
 }
 
@@ -222,7 +252,7 @@ impl Serialize for ContentBlock {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -845,6 +875,19 @@ mod tests {
         assert_eq!(message, cloned);
         assert_eq!(
             serde_json::to_value(&message).unwrap(),
+            serde_json::to_value(&cloned).unwrap()
+        );
+    }
+
+    #[test]
+    fn content_block_clone_shares_one_immutable_payload() {
+        let block = ContentBlock::text("x".repeat(1024 * 1024)).unwrap();
+        let cloned = block.clone();
+
+        assert!(block.shares_allocation_with(&cloned));
+        assert_eq!(block, cloned);
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
             serde_json::to_value(&cloned).unwrap()
         );
     }

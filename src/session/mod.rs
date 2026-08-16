@@ -814,10 +814,13 @@ impl Session {
         }
     }
 
+    /// Match a cancelled attempt append before rebuilding its full JSON payload.
+    /// Once Session owns an operation, that ownership error intentionally wins
+    /// over validation of a different replacement candidate.
     fn pending_attempt_operation(
         &self,
         token: &AttemptToken,
-        expected: &PreparedEvent,
+        expected: &NewEvent,
     ) -> Result<Option<AttemptOperationKind>, AppendError> {
         let SessionMode::Durable {
             pending_operation, ..
@@ -841,7 +844,7 @@ impl Session {
             }) if Arc::ptr_eq(authority, &token.authority)
                 && Arc::ptr_eq(reservation, &token.reservation)
                 && *nonce == token.nonce
-                && prepared == expected =>
+                && prepared.event == *expected =>
             {
                 Ok(Some(*kind))
             }
@@ -2513,10 +2516,9 @@ impl SessionReservation<'_> {
     ) -> Result<AppendReceipt, AppendError> {
         self.session
             .validate_open_attempt_token(token, &self.owner)?;
-        let prepared = Session::prepare_event(NewEvent::log(EventKind::assistant_chunk(
-            token.turn, token.step, chunk,
-        )))?;
+        let event = NewEvent::log(EventKind::assistant_chunk(token.turn, token.step, chunk));
         if matches!(&self.session.mode, SessionMode::Memory { .. }) {
+            let prepared = Session::prepare_event(event)?;
             return self.session.append_prepared_with_admission(
                 prepared,
                 self.reserved_events,
@@ -2525,7 +2527,7 @@ impl SessionReservation<'_> {
             );
         }
         self.session.ensure_durable_active()?;
-        if let Some(kind) = self.session.pending_attempt_operation(token, &prepared)? {
+        if let Some(kind) = self.session.pending_attempt_operation(token, &event)? {
             if kind != AttemptOperationKind::Chunk {
                 return Err(invalid_attempt("a different attempt operation is pending"));
             }
@@ -2535,6 +2537,7 @@ impl SessionReservation<'_> {
                 .await?
                 .ok_or(AppendError::DurableWriter);
         }
+        let prepared = Session::prepare_event(event)?;
         let protected_events =
             u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
         let SessionMode::Durable {
@@ -2585,8 +2588,8 @@ impl SessionReservation<'_> {
     ) -> Result<AppendReceipt, AppendError> {
         self.session
             .validate_open_attempt_token(token, &self.owner)?;
-        let prepared = Session::prepare_event(event)?;
         if matches!(&self.session.mode, SessionMode::Memory { .. }) {
+            let prepared = Session::prepare_event(event)?;
             let receipt = self.session.append_prepared_with_admission(
                 prepared,
                 self.reserved_events,
@@ -2598,7 +2601,7 @@ impl SessionReservation<'_> {
             return Ok(receipt);
         }
         self.session.ensure_durable_active()?;
-        if let Some(kind) = self.session.pending_attempt_operation(token, &prepared)? {
+        if let Some(kind) = self.session.pending_attempt_operation(token, &event)? {
             if kind != AttemptOperationKind::Closure(disposition) {
                 return Err(invalid_attempt("a different attempt closure is pending"));
             }
@@ -2609,6 +2612,7 @@ impl SessionReservation<'_> {
                 .ok_or(AppendError::DurableWriter)?;
             return Ok(receipt);
         }
+        let prepared = Session::prepare_event(event)?;
         let protected_events =
             u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
         let SessionMode::Durable {

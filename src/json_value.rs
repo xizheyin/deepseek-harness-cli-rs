@@ -1,6 +1,6 @@
 //! Bounded, lossless JSON values shared by model and session boundaries.
 
-use std::{fmt, mem::ManuallyDrop, sync::Arc};
+use std::{fmt, io, mem::ManuallyDrop, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::Visitor};
 use serde_json::{Number, Value};
@@ -35,24 +35,24 @@ impl JsonValue {
 
         let mut value = ManuallyDrop::into_inner(guarded);
         normalize_numbers(&mut value);
-        let encoded = match serde_json::to_vec(&value) {
-            Ok(encoded) => encoded,
+        let encoded_len = match encoded_len(&value) {
+            Ok(encoded_len) => encoded_len,
             Err(error) => {
                 drop_json_iteratively(value);
-                return Err(JsonValueError::Encode(error.to_string()));
+                return Err(error);
             }
         };
-        if encoded.len() > MAX_JSON_VALUE_BYTES {
+        if encoded_len > MAX_JSON_VALUE_BYTES {
             let error = JsonValueError::TooLarge {
                 maximum: MAX_JSON_VALUE_BYTES,
-                actual: encoded.len(),
+                actual: encoded_len,
             };
             drop_json_iteratively(value);
             return Err(error);
         }
         Ok(Self {
             value: Arc::new(value),
-            encoded_len: encoded.len(),
+            encoded_len,
         })
     }
 
@@ -412,38 +412,35 @@ where
 }
 
 pub(crate) fn json_values_equal(first: &Value, second: &Value) -> bool {
-    let mut pending = vec![(first, second)];
-    while let Some((left, right)) = pending.pop() {
-        match (left, right) {
-            (Value::Null, Value::Null) => {}
-            (Value::Bool(left), Value::Bool(right)) if left == right => {}
-            (Value::String(left), Value::String(right)) if left == right => {}
-            (Value::Number(left), Value::Number(right)) => {
-                if left.as_f64() != right.as_f64() {
-                    return false;
-                }
-            }
-            (Value::Array(left), Value::Array(right)) => {
-                if left.len() != right.len() {
-                    return false;
-                }
-                pending.extend(left.iter().zip(right));
-            }
-            (Value::Object(left), Value::Object(right)) => {
-                if left.len() != right.len() {
-                    return false;
-                }
-                for (key, left_value) in left {
-                    let Some(right_value) = right.get(key) else {
-                        return false;
-                    };
-                    pending.push((left_value, right_value));
-                }
-            }
-            _ => return false,
-        }
+    json_values_equal_at(first, second, 0)
+}
+
+fn json_values_equal_at(first: &Value, second: &Value, depth: usize) -> bool {
+    if depth > MAX_JSON_DEPTH {
+        return false;
     }
-    true
+    match (first, second) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| json_values_equal_at(left, right, depth.saturating_add(1)))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left_value)| {
+                    right.get(key).is_some_and(|right_value| {
+                        json_values_equal_at(left_value, right_value, depth.saturating_add(1))
+                    })
+                })
+        }
+        _ => false,
+    }
 }
 
 fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
@@ -517,6 +514,32 @@ fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
     Ok(())
 }
 
+fn encoded_len(value: &Value) -> Result<usize, JsonValueError> {
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|error| JsonValueError::Encode(error.to_string()))?;
+    Ok(writer.len)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    len: usize,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("encoded JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn normalize_numbers(value: &mut Value) {
     match value {
         Value::Number(number) => {
@@ -587,5 +610,38 @@ fn drop_json_iteratively(value: Value) {
                 parents.pop();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::JsonValue;
+
+    #[test]
+    fn encoded_length_matches_compact_json_for_escape_and_unicode_shapes() {
+        for value in [
+            json!(null),
+            json!({"text": "\0\n\"\\é😀\u{2028}"}),
+            json!([0, 1.0, -2, true, false]),
+            json!({"nested": [{"x": "y"}]}),
+        ] {
+            let actual = JsonValue::new(value).unwrap();
+            let expected = serde_json::to_vec(actual.as_value()).unwrap().len();
+            assert_eq!(actual.encoded_len(), expected);
+        }
+    }
+
+    #[test]
+    fn semantic_equality_does_not_need_a_width_sized_worklist() {
+        let left = JsonValue::new(Value::Array(vec![Value::Bool(true); 100_000])).unwrap();
+        let right = left.clone();
+        assert_eq!(left, right);
+
+        let mut different = vec![Value::Bool(true); 100_000];
+        different[99_999] = Value::Bool(false);
+        let different = JsonValue::new(Value::Array(different)).unwrap();
+        assert_ne!(left, different);
     }
 }

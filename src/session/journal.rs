@@ -2467,6 +2467,18 @@ mod tests {
             FlightKind::Append
         );
         release.send(()).unwrap();
+        let invalid_replacement = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::log(EventKind::Unknown {
+                    event_type: "future/required".to_owned(),
+                    data: crate::model::JsonValue::null(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_replacement, AppendError::NeedsAppendSettle);
         let mismatch = reservation
             .append_attempt_closure_settled(
                 &token,

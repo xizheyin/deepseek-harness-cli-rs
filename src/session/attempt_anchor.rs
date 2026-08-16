@@ -29,6 +29,7 @@ pub(super) const MAX_ATTEMPT_EMITTED_BYTES: usize = 10 * 1024 * 1024;
 
 const CONTENT_DIGEST_DOMAIN: &[u8] = b"dsh.attempt-content.v1\0";
 const SOURCE_DIGEST_DOMAIN: &[u8] = b"dsh.attempt-sources.v1\0";
+const REPLAY_DIGEST_DOMAIN: &[u8] = b"dsh.attempt-replay.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AttemptDisposition {
@@ -182,12 +183,12 @@ impl AttemptRoute {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct PartialBlock {
     block: Option<ContentBlock>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct OpenAttempt {
     generation: u64,
     turn: TurnId,
@@ -452,7 +453,7 @@ enum PreparedChunkOperation {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct FinishedAttempt {
     generation: u64,
     turn: TurnId,
@@ -467,7 +468,7 @@ struct FinishedAttempt {
     provider_assistant_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct SealedAttempt {
     generation: u64,
     turn: TurnId,
@@ -477,7 +478,7 @@ struct SealedAttempt {
     source_digest: [u8; 32],
     usage: Option<TokenUsage>,
     reason: FinishReason,
-    replay_state: Option<JsonValue>,
+    replay_digest: Option<[u8; 32]>,
     normalized_digest: Option<[u8; 32]>,
     provider_assistant_tokens: Option<u64>,
 }
@@ -498,7 +499,7 @@ impl CommittedAttemptFacts {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum AttemptState {
     OutsideStep,
     Ready { turn: TurnId, step: StepId },
@@ -532,7 +533,7 @@ enum RecoveryAttemptPhase {
     Sealed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct AttemptProjection {
     state: AttemptState,
     usage: UsageProjection,
@@ -820,13 +821,24 @@ impl AttemptProjection {
     }
 
     pub(super) fn take_prepared(&mut self) -> Result<PreparedAttempt, AttemptError> {
+        let replay_digest = match &self.state {
+            AttemptState::Finished(finished) => finished
+                .replay_state
+                .as_ref()
+                .map(json_digest)
+                .transpose()?,
+            _ => {
+                return Err(boundary(
+                    "provider attempt seal",
+                    "the stream has no terminal finish",
+                ));
+            }
+        };
         let state = std::mem::replace(&mut self.state, AttemptState::OutsideStep);
         let AttemptState::Finished(finished) = state else {
+            // The immutable preflight above established this exact variant.
             self.state = state;
-            return Err(boundary(
-                "provider attempt seal",
-                "the stream has no terminal finish",
-            ));
+            return Err(AttemptError::OwnershipChanged);
         };
         let FinishedAttempt {
             generation,
@@ -851,7 +863,7 @@ impl AttemptProjection {
             source_digest: source_digest(&sources),
             usage: usage.clone(),
             reason: reason.clone(),
-            replay_state: replay_state.clone(),
+            replay_digest,
             normalized_digest,
             provider_assistant_tokens,
         };
@@ -888,7 +900,7 @@ impl AttemptProjection {
             route,
             expected_usage,
             reason,
-            replay_state,
+            replay_digest,
             digest,
             provider_assistant_tokens,
         ) = match &self.state {
@@ -902,7 +914,11 @@ impl AttemptProjection {
                     &finished.route,
                     &finished.usage,
                     &finished.reason,
-                    &finished.replay_state,
+                    finished
+                        .replay_state
+                        .as_ref()
+                        .map(json_digest)
+                        .transpose()?,
                     finished.normalized_digest,
                     finished.provider_assistant_tokens,
                 )
@@ -920,7 +936,7 @@ impl AttemptProjection {
                     &sealed.route,
                     &sealed.usage,
                     &sealed.reason,
-                    &sealed.replay_state,
+                    sealed.replay_digest,
                     sealed.normalized_digest,
                     sealed.provider_assistant_tokens,
                 )
@@ -950,7 +966,7 @@ impl AttemptProjection {
         if expected_usage != usage {
             return Err(AttemptError::UsageMismatch);
         }
-        validate_message_route(message, route, replay_state)?;
+        validate_message_route(message, route, replay_digest)?;
         if matches!(reason.kind(), FinishReasonKind::MaxTokens)
             && message
                 .content()
@@ -1092,7 +1108,7 @@ impl AttemptProjection {
             ));
         }
         Ok(Self {
-            state: self.state.clone(),
+            state: AttemptState::Ready { turn, step },
             usage: self.usage.clone(),
             next_generation: self.next_generation,
             context_overflow_used: true,
@@ -1246,7 +1262,7 @@ fn terminal_failure(reason: &FinishReason) -> Option<&LlmFailure> {
 fn validate_message_route(
     message: &Message,
     route: &AttemptRoute,
-    replay_state: &Option<JsonValue>,
+    replay_digest: Option<[u8; 32]>,
 ) -> Result<(), AttemptError> {
     match message.source().kind() {
         MessageSourceKind::Model {
@@ -1255,12 +1271,20 @@ fn validate_message_route(
             replay_state: actual_replay,
         } if provider == &route.provider
             && model == &route.model
-            && actual_replay == replay_state =>
+            && actual_replay.as_ref().map(json_digest).transpose()? == replay_digest =>
         {
             Ok(())
         }
         _ => Err(AttemptError::RouteMismatch),
     }
+}
+
+fn json_digest(value: &JsonValue) -> Result<[u8; 32], AttemptError> {
+    let mut context = Context::new(&SHA256);
+    context.update(REPLAY_DIGEST_DOMAIN);
+    let mut writer = DigestWriter(context);
+    serde_json::to_writer(&mut writer, value).map_err(|_| AttemptError::Digest)?;
+    Ok(writer.finish())
 }
 
 fn content_digest<'a>(
@@ -1365,17 +1389,42 @@ mod tests {
         Ok(())
     }
 
+    fn streaming_atomicity_facts(
+        projection: &AttemptProjection,
+    ) -> (RecoveryAttemptProof, usize, usize, usize, usize) {
+        let AttemptState::Streaming(open) = &projection.state else {
+            panic!("test requires one streaming attempt");
+        };
+        (
+            projection.recovery_proof().unwrap(),
+            open.validator.chunk_count(),
+            open.emitted_bytes,
+            open.order.len(),
+            open.blocks.len(),
+        )
+    }
+
     fn assistant_event(
         seq: u64,
         content: Vec<ContentBlock>,
         usage: Option<TokenUsage>,
         sources: Vec<EventSeq>,
     ) -> SessionEvent {
+        assistant_event_with_replay(seq, content, usage, sources, None)
+    }
+
+    fn assistant_event_with_replay(
+        seq: u64,
+        content: Vec<ContentBlock>,
+        usage: Option<TokenUsage>,
+        sources: Vec<EventSeq>,
+        replay_state: Option<JsonValue>,
+    ) -> SessionEvent {
         let message = Message::new(
             "assistant-1",
             MessageRole::Assistant,
             content,
-            MessageSource::model("mock", "mock-model").unwrap(),
+            MessageSource::model_with_replay_state("mock", "mock-model", replay_state).unwrap(),
         )
         .unwrap();
         event(
@@ -1422,6 +1471,47 @@ mod tests {
             committed.step_end(turn(), step(), None).unwrap().state,
             AttemptState::OutsideStep
         );
+    }
+
+    #[test]
+    fn sealed_replay_digest_accepts_semantic_same_and_rejects_change() {
+        let replay = JsonValue::new(json!({"number": 1.0, "nested": [true, null]})).unwrap();
+        let mut projection = AttemptProjection::default()
+            .step_start(turn(), step())
+            .unwrap()
+            .begin_live(turn(), step(), Some(&header()), 0)
+            .unwrap();
+        commit_chunk(
+            &mut projection,
+            4,
+            StreamChunk::finish(FinishReason::stop().unwrap(), Some(replay.clone())).unwrap(),
+        )
+        .unwrap();
+
+        let prepared = projection.take_prepared().unwrap();
+        let (_, _, _, prepared_replay, sources) = prepared.into_parts();
+        assert_eq!(prepared_replay, Some(replay));
+
+        let changed = assistant_event_with_replay(
+            5,
+            vec![],
+            None,
+            sources.clone(),
+            Some(JsonValue::new(json!({"number": 2, "nested": [true, null]})).unwrap()),
+        );
+        assert_eq!(
+            projection.assistant(&changed),
+            Err(AttemptError::RouteMismatch)
+        );
+
+        let equivalent = assistant_event_with_replay(
+            5,
+            vec![],
+            None,
+            sources,
+            Some(JsonValue::new(json!({"number": 1, "nested": [true, null]})).unwrap()),
+        );
+        projection.assistant(&equivalent).unwrap();
     }
 
     #[test]
@@ -1722,7 +1812,7 @@ mod tests {
             )
             .unwrap();
         }
-        let before = projection.clone();
+        let before = streaming_atomicity_facts(&projection);
         let error = commit_chunk(
             &mut projection,
             4_000,
@@ -1735,7 +1825,7 @@ mod tests {
                 maximum: MAX_PROVIDER_STREAM_CHUNKS,
             })
         );
-        assert_eq!(projection, before);
+        assert_eq!(streaming_atomicity_facts(&projection), before);
 
         let failure = LlmFailure::new("failed", "MODEL_FAILURE").unwrap();
         commit_chunk(
@@ -1814,7 +1904,7 @@ mod tests {
             StreamChunk::text_delta(0, "x".repeat(second + 1)).unwrap(),
         )
         .unwrap();
-        let before = one_over.clone();
+        let before = streaming_atomicity_facts(&one_over);
         assert_eq!(
             commit_chunk(&mut one_over, 4, terminal()),
             Err(AttemptError::EmittedBytes {
@@ -1822,6 +1912,6 @@ mod tests {
                 actual: MAX_ATTEMPT_EMITTED_BYTES + 1,
             })
         );
-        assert_eq!(one_over, before);
+        assert_eq!(streaming_atomicity_facts(&one_over), before);
     }
 }

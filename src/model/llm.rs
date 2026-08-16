@@ -1,6 +1,6 @@
 //! Provider call configuration, failures, usage, and stream chunks.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
@@ -14,8 +14,13 @@ use super::{
 };
 
 /// Serializable provider or transport failure facts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LlmFailure {
+    inner: Arc<LlmFailureInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LlmFailureInner {
     message: String,
     code: String,
     status: Option<u16>,
@@ -38,20 +43,7 @@ impl LlmFailure {
         provider_retry_after_ms: Option<PositiveFiniteNumber>,
         request_id: Option<ProviderRequestId>,
     ) -> Result<Self, ModelError> {
-        if message.is_empty() {
-            return Err(ModelError::InvalidFailure("message must not be empty"));
-        }
-        if code.is_empty() {
-            return Err(ModelError::InvalidFailure("code must not be empty"));
-        }
-        if status.is_some_and(|status| !(100..=599).contains(&status)) {
-            return Err(ModelError::InvalidFailure(
-                "status must be an integer from 100 through 599",
-            ));
-        }
-        if request_id.as_ref().is_some_and(ProviderRequestId::is_empty) {
-            return Err(ModelError::InvalidFailure("requestId must not be empty"));
-        }
+        validate_failure_parts(&message, &code, status, request_id.as_ref())?;
         let mut value = json!({ "message": message, "code": code });
         if let Some(status) = status {
             value["status"] = Value::from(status);
@@ -63,50 +55,70 @@ impl LlmFailure {
         if let Some(request_id) = &request_id {
             value["requestId"] = Value::String(request_id.as_str().to_owned());
         }
-        Ok(Self {
+        Ok(Self::from_validated_parts(
             message,
             code,
             status,
             provider_retry_after_ms,
             request_id,
-            raw: JsonValue::new(value)?,
-        })
+            JsonValue::new(value)?,
+        ))
+    }
+
+    fn from_validated_parts(
+        message: String,
+        code: String,
+        status: Option<u16>,
+        provider_retry_after_ms: Option<PositiveFiniteNumber>,
+        request_id: Option<ProviderRequestId>,
+        raw: JsonValue,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LlmFailureInner {
+                message,
+                code,
+                status,
+                provider_retry_after_ms,
+                request_id,
+                raw,
+            }),
+        }
     }
 
     /// Human-readable failure summary.
     #[must_use]
     pub fn message(&self) -> &str {
-        &self.message
+        &self.inner.message
     }
 
     /// Stable provider-neutral failure code.
     #[must_use]
     pub fn code(&self) -> &str {
-        &self.code
+        &self.inner.code
     }
 
     /// Optional HTTP status.
     #[must_use]
     pub fn status(&self) -> Option<u16> {
-        self.status
+        self.inner.status
     }
 
     /// Positive provider-requested retry delay in milliseconds.
     #[must_use]
     pub fn provider_retry_after_ms(&self) -> Option<PositiveFiniteNumber> {
-        self.provider_retry_after_ms
+        self.inner.provider_retry_after_ms
     }
 
     /// Opaque provider request identifier for diagnostics.
     #[must_use]
     pub fn request_id(&self) -> Option<&ProviderRequestId> {
-        self.request_id.as_ref()
+        self.inner.request_id.as_ref()
     }
 
     /// Complete validated failure JSON, including extension fields.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
     }
 
     fn from_value(value: Value) -> Result<Self, ModelError> {
@@ -119,10 +131,60 @@ impl LlmFailure {
             optional_typed::<PositiveFiniteNumber>(fields, "providerRetryAfterMs", "LLM failure")?;
         let request_id =
             optional_string(fields, "requestId", "LLM failure")?.map(ProviderRequestId::new);
-        let mut failure =
-            Self::from_parts(message, code, status, provider_retry_after_ms, request_id)?;
-        failure.raw = raw;
-        Ok(failure)
+        validate_failure_parts(&message, &code, status, request_id.as_ref())?;
+        Ok(Self::from_validated_parts(
+            message,
+            code,
+            status,
+            provider_retry_after_ms,
+            request_id,
+            raw,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+fn validate_failure_parts(
+    message: &str,
+    code: &str,
+    status: Option<u16>,
+    request_id: Option<&ProviderRequestId>,
+) -> Result<(), ModelError> {
+    if message.is_empty() {
+        return Err(ModelError::InvalidFailure("message must not be empty"));
+    }
+    if code.is_empty() {
+        return Err(ModelError::InvalidFailure("code must not be empty"));
+    }
+    if status.is_some_and(|status| !(100..=599).contains(&status)) {
+        return Err(ModelError::InvalidFailure(
+            "status must be an integer from 100 through 599",
+        ));
+    }
+    if request_id.is_some_and(ProviderRequestId::is_empty) {
+        return Err(ModelError::InvalidFailure("requestId must not be empty"));
+    }
+    Ok(())
+}
+
+impl fmt::Debug for LlmFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmFailure")
+            .field("message", &self.inner.message)
+            .field("code", &self.inner.code)
+            .field("status", &self.inner.status)
+            .field(
+                "provider_retry_after_ms",
+                &self.inner.provider_retry_after_ms,
+            )
+            .field("request_id", &self.inner.request_id)
+            .field("raw", &self.inner.raw)
+            .finish()
     }
 }
 
@@ -131,7 +193,7 @@ impl Serialize for LlmFailure {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -156,8 +218,13 @@ pub enum FinishReasonKind {
 }
 
 /// Why one provider stream stopped.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FinishReason {
+    inner: Arc<FinishReasonInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FinishReasonInner {
     kind: FinishReasonKind,
     raw: JsonValue,
 }
@@ -199,18 +266,35 @@ impl FinishReason {
             },
             _ => FinishReasonKind::Other { kind: tag },
         };
-        Ok(Self { kind, raw })
+        Ok(Self {
+            inner: Arc::new(FinishReasonInner { kind, raw }),
+        })
     }
 
     #[must_use]
     pub fn kind(&self) -> &FinishReasonKind {
-        &self.kind
+        &self.inner.kind
     }
 
     /// Complete validated reason JSON, including adapter-defined variants.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl fmt::Debug for FinishReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FinishReason")
+            .field("kind", &self.inner.kind)
+            .field("raw", &self.inner.raw)
+            .finish()
     }
 }
 
@@ -219,7 +303,7 @@ impl Serialize for FinishReason {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -437,8 +521,13 @@ pub enum StreamChunkKind {
 }
 
 /// Provider-neutral streaming event emitted by an adapter.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct StreamChunk {
+    inner: Arc<StreamChunkInner>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct StreamChunkInner {
     kind: StreamChunkKind,
     raw: JsonValue,
 }
@@ -545,24 +634,26 @@ impl StreamChunk {
             },
             _ => StreamChunkKind::Other { chunk_type },
         };
-        Ok(Self { kind, raw })
+        Ok(Self {
+            inner: Arc::new(StreamChunkInner { kind, raw }),
+        })
     }
 
     #[must_use]
     pub fn kind(&self) -> &StreamChunkKind {
-        &self.kind
+        &self.inner.kind
     }
 
     /// Complete validated chunk JSON, including adapter-defined fields.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
-        &self.raw
+        &self.inner.raw
     }
 
     /// Whether this chunk contains non-empty model output.
     #[must_use]
     pub fn is_token_delta(&self) -> bool {
-        match &self.kind {
+        match &self.inner.kind {
             StreamChunkKind::TextDelta { text, .. }
             | StreamChunkKind::ReasoningDelta { text, .. } => !text.is_empty(),
             StreamChunkKind::ToolCallDelta {
@@ -573,6 +664,21 @@ impl StreamChunk {
             _ => false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl fmt::Debug for StreamChunk {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamChunk")
+            .field("kind", &self.inner.kind)
+            .field("raw", &self.inner.raw)
+            .finish()
+    }
 }
 
 impl Serialize for StreamChunk {
@@ -580,7 +686,7 @@ impl Serialize for StreamChunk {
     where
         S: Serializer,
     {
-        self.raw.serialize(serializer)
+        self.inner.raw.serialize(serializer)
     }
 }
 
@@ -1021,7 +1127,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{JsonValue, LlmCallConfig, ToolSchema};
+    use super::{FinishReason, JsonValue, LlmCallConfig, LlmFailure, StreamChunk, ToolSchema};
 
     #[test]
     fn provider_request_prefix_values_clone_shallowly() {
@@ -1046,6 +1152,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&config).unwrap(),
             serde_json::to_value(&config_clone).unwrap()
+        );
+    }
+
+    #[test]
+    fn finish_and_stream_chunk_clones_share_their_payloads() {
+        let failure = LlmFailure::new("x".repeat(256 * 1024), "TEST").unwrap();
+        let failure_clone = failure.clone();
+        assert!(failure.shares_allocation_with(&failure_clone));
+        let finish = FinishReason::error(failure).unwrap();
+        let finish_clone = finish.clone();
+        assert!(finish.shares_allocation_with(&finish_clone));
+
+        let chunk = StreamChunk::text_delta(0, "x".repeat(1024 * 1024)).unwrap();
+        let chunk_clone = chunk.clone();
+        assert!(chunk.shares_allocation_with(&chunk_clone));
+        assert_eq!(chunk, chunk_clone);
+        assert_eq!(
+            serde_json::to_value(&chunk).unwrap(),
+            serde_json::to_value(&chunk_clone).unwrap()
         );
     }
 }

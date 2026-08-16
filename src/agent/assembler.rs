@@ -7,9 +7,7 @@ pub(crate) struct AssembledAssistant {
     pub(crate) replay_state: Option<crate::model::JsonValue>,
 }
 
-pub(crate) fn without_tool_calls(content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+pub(crate) fn without_tool_calls(mut content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    content.retain(|block| !matches!(block.kind(), ContentBlockKind::ToolCall { .. }));
     content
-        .into_iter()
-        .filter(|block| !matches!(block.kind(), ContentBlockKind::ToolCall { .. }))
-        .collect()
 }
