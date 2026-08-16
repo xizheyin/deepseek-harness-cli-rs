@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     model::{
-        LlmCallConfig, LlmCallConfigAdapterDefaults, Message, ModelError, NonNegativeSafeInteger,
-        StreamChunk, ToolSchema,
+        LlmCallConfig, LlmCallConfigAdapterDefaults, LlmFailure, Message, ModelError,
+        NonNegativeSafeInteger, StreamChunk, ToolSchema,
     },
     session::SessionId,
 };
@@ -45,6 +45,7 @@ pub struct ProviderRequest {
     purpose: RequestPurpose,
     session_id: Option<SessionId>,
     retained_bytes: usize,
+    preflight_encoded_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for ProviderRequest {
@@ -59,6 +60,7 @@ impl std::fmt::Debug for ProviderRequest {
             .field("purpose", &self.purpose)
             .field("session_id_present", &self.session_id.is_some())
             .field("retained_bytes", &self.retained_bytes)
+            .field("preflight_encoded_bytes", &self.preflight_encoded_bytes)
             .finish()
     }
 }
@@ -88,6 +90,7 @@ impl ProviderRequest {
             purpose: RequestPurpose::Conversation,
             session_id: None,
             retained_bytes,
+            preflight_encoded_bytes: None,
         })
     }
 
@@ -102,6 +105,7 @@ impl ProviderRequest {
             .ok_or(ProviderRequestError::SizeOverflow)?;
         ensure_request_size(self.retained_bytes)?;
         self.system = Some(system);
+        self.preflight_encoded_bytes = None;
         Ok(self)
     }
 
@@ -130,6 +134,7 @@ impl ProviderRequest {
             .ok_or(ProviderRequestError::SizeOverflow)?;
         ensure_request_size(self.retained_bytes)?;
         self.tools = tools;
+        self.preflight_encoded_bytes = None;
         Ok(self)
     }
 
@@ -137,6 +142,7 @@ impl ProviderRequest {
     #[must_use]
     pub fn with_purpose(mut self, purpose: RequestPurpose) -> Self {
         self.purpose = purpose;
+        self.preflight_encoded_bytes = None;
         self
     }
 
@@ -154,6 +160,7 @@ impl ProviderRequest {
             return Err(ProviderRequestError::InvalidSessionId);
         }
         self.session_id = Some(session_id);
+        self.preflight_encoded_bytes = None;
         Ok(self)
     }
 
@@ -203,6 +210,222 @@ impl ProviderRequest {
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Exact provider wire size proved before the request was admitted.
+    #[must_use]
+    pub fn preflight_encoded_bytes(&self) -> Option<usize> {
+        self.preflight_encoded_bytes
+    }
+}
+
+/// Borrowed, side-effect-free facts used to preflight one exact request.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderRequestDraft<'a> {
+    config: &'a LlmCallConfig,
+    system: Option<&'a str>,
+    messages: &'a [Message],
+    tools: &'a [ToolSchema],
+    purpose: RequestPurpose,
+    session_id: Option<&'a SessionId>,
+}
+
+impl<'a> ProviderRequestDraft<'a> {
+    /// Start a draft from the proposed configuration and virtual surface.
+    pub fn new(
+        config: &'a LlmCallConfig,
+        messages: &'a [Message],
+    ) -> Result<Self, ProviderRequestError> {
+        validate_request_parts(config, None, messages, &[], None)?;
+        Ok(Self {
+            config,
+            system: None,
+            messages,
+            tools: &[],
+            purpose: RequestPurpose::Conversation,
+            session_id: None,
+        })
+    }
+
+    /// Include the exact system prompt in the provider wire.
+    pub fn with_system(mut self, system: &'a str) -> Result<Self, ProviderRequestError> {
+        validate_request_parts(
+            self.config,
+            Some(system),
+            self.messages,
+            self.tools,
+            self.session_id,
+        )?;
+        self.system = Some(system);
+        Ok(self)
+    }
+
+    /// Include the exact ordered tool catalogue in the provider wire.
+    pub fn with_tools(mut self, tools: &'a [ToolSchema]) -> Result<Self, ProviderRequestError> {
+        validate_request_parts(
+            self.config,
+            self.system,
+            self.messages,
+            tools,
+            self.session_id,
+        )?;
+        self.tools = tools;
+        Ok(self)
+    }
+
+    /// Select purpose-specific provider behavior.
+    #[must_use]
+    pub fn with_purpose(mut self, purpose: RequestPurpose) -> Self {
+        self.purpose = purpose;
+        self
+    }
+
+    /// Include the bounded routing identity sent in the HTTP header.
+    pub fn with_session_id(
+        mut self,
+        session_id: &'a SessionId,
+    ) -> Result<Self, ProviderRequestError> {
+        validate_session_id(session_id)?;
+        self.session_id = Some(session_id);
+        Ok(self)
+    }
+
+    /// Proposed provider/model configuration before adapter defaults.
+    #[must_use]
+    pub fn config(&self) -> &LlmCallConfig {
+        self.config
+    }
+
+    /// Optional system prompt.
+    #[must_use]
+    pub fn system(&self) -> Option<&str> {
+        self.system
+    }
+
+    /// Ordered virtual model surface.
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        self.messages
+    }
+
+    /// Ordered tool declarations.
+    #[must_use]
+    pub fn tools(&self) -> &[ToolSchema] {
+        self.tools
+    }
+
+    /// Purpose-specific provider behavior.
+    #[must_use]
+    pub fn purpose(&self) -> RequestPurpose {
+        self.purpose
+    }
+
+    /// Optional host-side routing identity.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.session_id
+    }
+
+    /// Finish a provider preflight after adapter defaults and wire counting.
+    pub fn finish(
+        self,
+        prepared: PreparedProviderCall,
+        encoded_bytes: usize,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        if let Err(error) = validate_request_parts(
+            prepared.config(),
+            self.system,
+            self.messages,
+            self.tools,
+            self.session_id,
+        ) {
+            return Err(ProviderPreflightError::from_request(error, prepared));
+        }
+        if encoded_bytes > MAX_PROVIDER_REQUEST_BYTES {
+            return Err(ProviderPreflightError::WireTooLarge {
+                maximum: MAX_PROVIDER_REQUEST_BYTES,
+                prepared,
+            });
+        }
+        Ok(PreparedRequestPreflight {
+            prepared,
+            encoded_bytes,
+        })
+    }
+
+    /// Materialize the exact owned request after its facts are durably admitted.
+    pub fn into_request(
+        self,
+        preflight: PreparedRequestPreflight,
+    ) -> Result<ProviderRequest, ProviderRequestError> {
+        let retained_bytes = validate_request_parts(
+            preflight.prepared.config(),
+            self.system,
+            self.messages,
+            self.tools,
+            self.session_id,
+        )?;
+        let mut messages = Vec::new();
+        messages
+            .try_reserve_exact(self.messages.len())
+            .map_err(|_| ProviderRequestError::Capacity)?;
+        messages.extend(self.messages.iter().cloned());
+        let mut tools = Vec::new();
+        tools
+            .try_reserve_exact(self.tools.len())
+            .map_err(|_| ProviderRequestError::Capacity)?;
+        tools.extend(self.tools.iter().cloned());
+        let system = self.system.map(try_clone_request_string).transpose()?;
+        let session_id = self
+            .session_id
+            .map(|value| try_clone_request_string(value.as_str()).map(SessionId::new))
+            .transpose()?;
+        Ok(ProviderRequest {
+            prepared: preflight.prepared,
+            system,
+            messages,
+            tools,
+            purpose: self.purpose,
+            session_id,
+            retained_bytes,
+            preflight_encoded_bytes: Some(preflight.encoded_bytes),
+        })
+    }
+}
+
+fn try_clone_request_string(value: &str) -> Result<String, ProviderRequestError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| ProviderRequestError::Capacity)?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+/// One exact prepared call plus its provider-specific encoded byte count.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedRequestPreflight {
+    prepared: PreparedProviderCall,
+    encoded_bytes: usize,
+}
+
+impl PreparedRequestPreflight {
+    /// Effective provider/model facts that must be logged unchanged.
+    #[must_use]
+    pub fn prepared_call(&self) -> &PreparedProviderCall {
+        &self.prepared
+    }
+
+    /// Exact number of bytes the provider encoder will emit.
+    #[must_use]
+    pub fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+
+    /// Move the exact prepared call into the final request.
+    #[must_use]
+    pub fn into_prepared_call(self) -> PreparedProviderCall {
+        self.prepared
     }
 }
 
@@ -317,6 +540,51 @@ fn ensure_request_size(actual: usize) -> Result<(), ProviderRequestError> {
     Ok(())
 }
 
+fn validate_request_parts(
+    config: &LlmCallConfig,
+    system: Option<&str>,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    session_id: Option<&SessionId>,
+) -> Result<usize, ProviderRequestError> {
+    if messages.len() > MAX_PROVIDER_MESSAGES {
+        return Err(ProviderRequestError::TooManyMessages {
+            maximum: MAX_PROVIDER_MESSAGES,
+            actual: messages.len(),
+        });
+    }
+    if tools.len() > MAX_PROVIDER_TOOLS {
+        return Err(ProviderRequestError::TooManyTools {
+            maximum: MAX_PROVIDER_TOOLS,
+            actual: tools.len(),
+        });
+    }
+    if let Some(session_id) = session_id {
+        validate_session_id(session_id)?;
+    }
+    let retained_bytes = add_sizes(
+        config.raw().encoded_len(),
+        system
+            .into_iter()
+            .map(str::len)
+            .chain(messages.iter().map(|message| message.raw().encoded_len()))
+            .chain(tools.iter().map(|tool| tool.raw().encoded_len())),
+    )?;
+    ensure_request_size(retained_bytes)?;
+    Ok(retained_bytes)
+}
+
+fn validate_session_id(session_id: &SessionId) -> Result<(), ProviderRequestError> {
+    let value = session_id.as_str();
+    if value.is_empty()
+        || value.len() > MAX_PROVIDER_SESSION_ID_BYTES
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(ProviderRequestError::InvalidSessionId);
+    }
+    Ok(())
+}
+
 /// Invalid provider-neutral request construction.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ProviderRequestError {
@@ -332,6 +600,9 @@ pub enum ProviderRequestError {
     /// Aggregate size arithmetic exceeded the platform range.
     #[error("provider request size overflowed")]
     SizeOverflow,
+    /// Bounded handle storage could not be reserved.
+    #[error("provider request capacity could not be reserved")]
+    Capacity,
     /// A session ID cannot be put in one safe HTTP header value.
     #[error("session id must be 1 to 1024 printable non-space ASCII bytes")]
     InvalidSessionId,
@@ -358,6 +629,12 @@ pub trait ModelProvider: Send + Sync {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError>;
 
+    /// Prepare and count one exact provider wire without credentials or I/O.
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError>;
+
     /// Begin one one-shot model request. Work starts only when the stream is
     /// polled. Polling must remain non-blocking and dropping/cancelling the
     /// stream must reclaim provider-owned work; detached background requests
@@ -377,6 +654,56 @@ pub enum ProviderPrepareError {
     /// A resolved typed model fact could not be represented safely.
     #[error(transparent)]
     Model(#[from] ModelError),
+}
+
+/// A side-effect-free provider request could not be admitted for dispatch.
+#[derive(Debug, Eq, Error, PartialEq)]
+pub enum ProviderPreflightError {
+    /// Adapter preparation failed before an encodable request existed.
+    #[error(transparent)]
+    Preparation(#[from] ProviderPrepareError),
+    /// The exact provider wire exceeded its hard byte limit.
+    #[error("provider request wire exceeds the {maximum}-byte limit")]
+    WireTooLarge {
+        maximum: usize,
+        prepared: PreparedProviderCall,
+    },
+    /// Adapter defaults made the provider-neutral request exceed a hard
+    /// message, tool, retained-byte, or arithmetic limit.
+    #[error("prepared provider request exceeds a hard resource limit")]
+    RequestLimit { prepared: PreparedProviderCall },
+    /// A prepared request could not be represented safely on this provider wire.
+    #[error("provider request is invalid")]
+    InvalidRequest {
+        failure: LlmFailure,
+        prepared: PreparedProviderCall,
+    },
+}
+
+impl ProviderPreflightError {
+    fn from_request(error: ProviderRequestError, prepared: PreparedProviderCall) -> Self {
+        if matches!(
+            error,
+            ProviderRequestError::TooManyMessages { .. }
+                | ProviderRequestError::TooManyTools { .. }
+                | ProviderRequestError::TooLarge { .. }
+                | ProviderRequestError::SizeOverflow
+        ) {
+            return Self::RequestLimit { prepared };
+        }
+        let failure = LlmFailure::new(error.to_string(), "INVALID_REQUEST")
+            .expect("bounded provider request errors are valid fixed LLM failures");
+        Self::InvalidRequest { failure, prepared }
+    }
+
+    /// Bounded provider-neutral failure suitable for durable Agent closure.
+    #[must_use]
+    pub fn failure(&self) -> Option<&LlmFailure> {
+        match self {
+            Self::InvalidRequest { failure, .. } => Some(failure),
+            Self::Preparation(_) | Self::WireTooLarge { .. } | Self::RequestLimit { .. } => None,
+        }
+    }
 }
 
 /// Failures in the provider-neutral live-stream contract itself.

@@ -9,9 +9,9 @@ use deepseek_harness_cli::{
     provider::{
         MAX_PROVIDER_MESSAGES, MAX_PROVIDER_REQUEST_BYTES, MAX_PROVIDER_SESSION_ID_BYTES,
         MAX_PROVIDER_STREAM_CHUNKS, MAX_PROVIDER_TOOLS, MAX_RETRYABLE_CODE_BYTES,
-        MAX_RETRYABLE_CODES, PreparedProviderCall, ProviderRequest, ProviderRequestError,
-        RetryBackoff, RetryMode, RetryPolicy, RetryPolicyError, StreamProtocolError,
-        StreamValidator,
+        MAX_RETRYABLE_CODES, PreparedProviderCall, ProviderPreflightError, ProviderRequest,
+        ProviderRequestDraft, ProviderRequestError, RetryBackoff, RetryMode, RetryPolicy,
+        RetryPolicyError, StreamProtocolError, StreamValidator,
         deepseek::{
             CredentialLookup, CredentialRef, CredentialSource, DEEPSEEK_PROVIDER,
             DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DeepSeekConfig, DeepSeekConfigError,
@@ -125,6 +125,47 @@ fn provider_request_is_bounded_before_wire_serialization() {
             maximum: MAX_PROVIDER_REQUEST_BYTES,
             ..
         })
+    ));
+}
+
+#[test]
+fn prepared_defaults_that_cross_the_retained_limit_remain_a_hard_preflight_limit() {
+    let proposed = call_config();
+    let exact_system = "x".repeat(
+        MAX_PROVIDER_REQUEST_BYTES
+            .checked_sub(proposed.raw().encoded_len())
+            .unwrap(),
+    );
+    let exact = ProviderRequestDraft::new(&proposed, &[])
+        .unwrap()
+        .with_system(&exact_system)
+        .unwrap();
+    assert!(
+        exact
+            .finish(
+                PreparedProviderCall::new(
+                    proposed.clone(),
+                    LlmCallConfigAdapterDefaults::default(),
+                    None,
+                ),
+                1,
+            )
+            .is_ok()
+    );
+
+    let mut raw = proposed.raw().as_value().clone();
+    raw["maxTokens"] = json!(1_024);
+    let effective = serde_json::from_value(raw).unwrap();
+    let prepared =
+        PreparedProviderCall::new(effective, LlmCallConfigAdapterDefaults::default(), None);
+    let grown = ProviderRequestDraft::new(&proposed, &[])
+        .unwrap()
+        .with_system(&exact_system)
+        .unwrap()
+        .finish(prepared, 1);
+    assert!(matches!(
+        grown,
+        Err(ProviderPreflightError::RequestLimit { .. })
     ));
 }
 

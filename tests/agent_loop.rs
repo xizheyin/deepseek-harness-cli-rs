@@ -23,7 +23,8 @@ use deepseek_harness_cli::{
         PositiveFiniteNumber, StreamChunk, TokenUsage, ToolSchema,
     },
     provider::{
-        ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
+        ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
+        ProviderPrepareError, ProviderRequest, ProviderRequestDraft, ProviderStream,
         ProviderStreamError, RetryBackoff, RetryPolicy,
     },
     session::{
@@ -35,6 +36,14 @@ use futures_util::stream;
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+fn fake_preflight(
+    draft: ProviderRequestDraft<'_>,
+    prepare: impl FnOnce(LlmCallConfig) -> Result<PreparedProviderCall, ProviderPrepareError>,
+) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+    let prepared = prepare(draft.config().clone())?;
+    draft.finish(prepared, 1)
+}
 
 #[derive(Default)]
 struct FixedRuntime(Mutex<u64>);
@@ -183,6 +192,13 @@ impl ModelProvider for FakeProvider {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
         Ok(prepared(config).with_retry_policy(self.retry_policy.clone()))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
     }
 
     fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
@@ -610,6 +626,13 @@ impl ModelProvider for NoMaxTokensProvider {
         ))
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
+    }
+
     fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
         *self.streams.lock().unwrap() += 1;
         Box::pin(stream::pending())
@@ -640,6 +663,19 @@ fn prepared(config: LlmCallConfig) -> PreparedProviderCall {
 struct PendingProvider;
 
 struct PanicPrepareProvider;
+
+#[derive(Default)]
+struct InvalidPreflightProvider {
+    streams: AtomicUsize,
+}
+
+#[derive(Default)]
+struct WireTooLargeProvider {
+    preparations: AtomicUsize,
+    preflights: AtomicUsize,
+    streams: AtomicUsize,
+    cancel_during_preflight: Option<CancellationToken>,
+}
 
 struct PanicStreamProvider {
     cancellation: Mutex<Option<CancellationToken>>,
@@ -706,6 +742,13 @@ impl ModelProvider for SequencedPreparedProvider {
         ))
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
+    }
+
     fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
         Box::pin(stream::iter(
             self.attempts
@@ -725,6 +768,13 @@ impl ModelProvider for PolicyProvider {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
         Ok(prepared(config).with_retry_policy(self.policy.clone()))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
     }
 
     fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
@@ -749,6 +799,13 @@ impl ModelProvider for PendingProvider {
         Ok(prepared(config))
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
+    }
+
     fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
         Box::pin(stream::pending())
     }
@@ -762,8 +819,74 @@ impl ModelProvider for PanicPrepareProvider {
         panic!("SECRET_PROVIDER_PREPARE_PANIC")
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
+    }
+
     fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
         unreachable!("a failed preparation must not open a stream")
+    }
+}
+
+impl ModelProvider for InvalidPreflightProvider {
+    fn prepare_call(
+        &self,
+        config: LlmCallConfig,
+    ) -> Result<PreparedProviderCall, ProviderPrepareError> {
+        Ok(prepared(config))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        let prepared = self.prepare_call(draft.config().clone())?;
+        Err(ProviderPreflightError::InvalidRequest {
+            failure: LlmFailure::new(
+                "the provider rejected the encoded request",
+                "INVALID_REQUEST",
+            )
+            .unwrap(),
+            prepared,
+        })
+    }
+
+    fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        Box::pin(stream::pending())
+    }
+}
+
+impl ModelProvider for WireTooLargeProvider {
+    fn prepare_call(
+        &self,
+        config: LlmCallConfig,
+    ) -> Result<PreparedProviderCall, ProviderPrepareError> {
+        self.preparations.fetch_add(1, Ordering::SeqCst);
+        Ok(prepared(config))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        self.preflights.fetch_add(1, Ordering::SeqCst);
+        let prepared = self.prepare_call(draft.config().clone())?;
+        if let Some(cancellation) = &self.cancel_during_preflight {
+            cancellation.cancel();
+        }
+        Err(ProviderPreflightError::WireTooLarge {
+            maximum: 1,
+            prepared,
+        })
+    }
+
+    fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        Box::pin(stream::pending())
     }
 }
 
@@ -773,6 +896,13 @@ impl ModelProvider for PanicStreamProvider {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
         Ok(prepared(config))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
     }
 
     fn stream(&self, _request: ProviderRequest, cancel: CancellationToken) -> ProviderStream {
@@ -789,6 +919,13 @@ impl ModelProvider for PanicStreamPollProvider {
         Ok(prepared(config))
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
+    }
+
     fn stream(&self, _request: ProviderRequest, cancel: CancellationToken) -> ProviderStream {
         *self.cancellation.lock().unwrap() = Some(cancel);
         Box::pin(stream::poll_fn(|_| panic!("SECRET_PROVIDER_POLL_PANIC")))
@@ -801,6 +938,13 @@ impl ModelProvider for TokenObservingProvider {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
         Ok(prepared(config))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
     }
 
     fn stream(&self, _request: ProviderRequest, cancel: CancellationToken) -> ProviderStream {
@@ -844,6 +988,13 @@ impl ModelProvider for CancelAtEofProvider {
         Ok(prepared(config))
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
+    }
+
     fn stream(&self, _request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
         let chunks = VecDeque::from(text_response("must not commit"));
         let cancellation = self.cancellation.clone();
@@ -868,6 +1019,13 @@ impl ModelProvider for Phase7CancelThenContinueProvider {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
         Ok(prepared(config))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        fake_preflight(draft, |config| self.prepare_call(config))
     }
 
     fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
@@ -2664,6 +2822,127 @@ async fn provider_must_materialize_a_bounded_output_limit_before_dispatch() {
 }
 
 #[tokio::test]
+async fn hard_wire_limit_closes_only_the_open_turn_before_dispatch() {
+    let provider = Arc::new(WireTooLargeProvider::default());
+    let mut agent = AgentLoop::with_runtime(
+        session("wire-hard-limit"),
+        provider.clone(),
+        Arc::new(FakeTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user("must fit before entering a step")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome.reason(),
+        TurnEndReason::Error { error } if error.code() == "AGENT_CONTEXT_LIMIT"
+    ));
+    assert_eq!(outcome.steps(), 0);
+    assert_eq!(outcome.attempts(), 0);
+    assert_eq!(
+        rust_event_types(agent.session()),
+        vec!["turn/start", "turn/end"]
+    );
+    assert_eq!(provider.preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.preflights.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.session().state().open_turn(), None);
+    assert_eq!(agent.session().state().open_step(), None);
+}
+
+#[tokio::test]
+async fn cancellation_latched_during_preflight_overrides_the_hard_wire_limit() {
+    let cancellation = CancellationToken::new();
+    let provider = Arc::new(WireTooLargeProvider {
+        cancel_during_preflight: Some(cancellation.clone()),
+        ..WireTooLargeProvider::default()
+    });
+    let mut agent = AgentLoop::with_runtime(
+        session("wire-hard-limit-cancelled"),
+        provider.clone(),
+        Arc::new(FakeTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user("cancellation wins")]),
+            cancellation,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.reason(),
+        &TurnEndReason::Aborted {
+            reason: deepseek_harness_cli::session::TurnEndCancelCause::User,
+        }
+    );
+    assert_eq!(outcome.steps(), 0);
+    assert_eq!(outcome.attempts(), 0);
+    assert_eq!(
+        rust_event_types(agent.session()),
+        vec!["turn/start", "turn/end"]
+    );
+    assert_eq!(provider.preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.preflights.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn invalid_preflight_keeps_the_prepared_header_and_context_without_streaming() {
+    let provider = Arc::new(InvalidPreflightProvider::default());
+    let mut agent = AgentLoop::with_runtime(
+        session("invalid-preflight"),
+        provider.clone(),
+        Arc::new(FakeTools::default()),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user("invalid encoded request")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome.reason(),
+        TurnEndReason::Error { error } if error.code() == "INVALID_REQUEST"
+    ));
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(outcome.attempts(), 1);
+    assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rust_event_types(agent.session()),
+        vec![
+            "turn/start",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(agent.session().state().open_step(), None);
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test]
 async fn provider_extension_error_text_never_enters_the_session() {
     let provider = Arc::new(FakeProvider::with_results(vec![vec![Err(
         ProviderStreamError::Model(ModelError::InvalidShape {
@@ -3103,6 +3382,18 @@ async fn provider_and_tool_panics_close_without_persisting_the_panic_payload() {
         outcome.reason(),
         TurnEndReason::Error { error } if error.code() == "AGENT_PROVIDER_PANIC"
     ));
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(outcome.attempts(), 1);
+    assert_eq!(
+        rust_event_types(prepare_agent.session()),
+        vec![
+            "turn/start",
+            "step/start",
+            "user/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
     assert_eq!(prepare_agent.session().state().open_turn(), None);
     assert!(
         !prepare_agent

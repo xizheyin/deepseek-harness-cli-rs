@@ -169,6 +169,59 @@ pub(crate) fn decode_event(value: Value, index: usize) -> Result<SessionEvent, C
     })
 }
 
+/// Parse the typed facts needed by Projection from a validated raw
+/// `tool/result` data object without cloning unrelated extension fields.
+pub(crate) fn decode_raw_tool_result_kind(data: &JsonValue) -> Result<EventKind, CodecError> {
+    let index = 0;
+    let fields = data
+        .as_value()
+        .as_object()
+        .ok_or_else(|| envelope_error(index, "tool/result data must be an object"))?;
+    let required = |field: &'static str| {
+        fields
+            .get(field)
+            .cloned()
+            .ok_or_else(|| envelope_error(index, format!("missing tool/result {field}")))
+    };
+    let turn = serde_json::from_value::<TurnId>(required("turn")?)
+        .map_err(|error| envelope_error(index, format!("invalid tool/result turn: {error}")))?;
+    let step = serde_json::from_value::<StepId>(required("step")?)
+        .map_err(|error| envelope_error(index, format!("invalid tool/result step: {error}")))?;
+    let message =
+        Message::from_value(required("message")?).map_err(|error| CodecError::EventData {
+            index,
+            detail: format!("invalid tool/result message: {error}"),
+        })?;
+    let error = fields
+        .get("error")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value::<ToolFailure>)
+        .transpose()
+        .map_err(|source| CodecError::EventPayload {
+            index,
+            event_type: "tool/result".to_owned(),
+            source,
+        })?;
+    let meta = fields
+        .get("meta")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(JsonValue::new)
+        .transpose()
+        .map_err(|error| CodecError::EventData {
+            index,
+            detail: format!("invalid tool/result meta: {error}"),
+        })?;
+    Ok(EventKind::ToolResult {
+        turn,
+        step,
+        message,
+        error,
+        meta,
+    })
+}
+
 fn decode_kind(
     event_type: &str,
     data: Value,
@@ -355,10 +408,6 @@ fn envelope_error(index: usize, detail: impl Into<String>) -> CodecError {
         index,
         detail: detail.into(),
     }
-}
-
-pub(crate) fn event_data_value(event: &SessionEvent) -> Result<Value, serde_json::Error> {
-    Ok(event.original_data.as_value().clone())
 }
 
 pub(crate) fn kind_data_value(kind: &EventKind) -> Result<Value, serde_json::Error> {
@@ -563,7 +612,7 @@ struct EmptyData {}
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{decode_event, event_data_value};
+    use super::decode_event;
     use crate::session::{CodecError, EventKind};
 
     fn envelope(event_type: &str, seq: u64, data: Value) -> Value {
@@ -625,7 +674,7 @@ mod tests {
                 .expect("valid compaction payload");
             assert_eq!(event.kind().event_type(), event_type);
             event.kind().validate().expect("payload validation");
-            assert_eq!(event_data_value(&event).unwrap(), data);
+            assert_eq!(event.data().as_value(), &data);
         }
     }
 

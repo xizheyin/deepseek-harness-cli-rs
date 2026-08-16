@@ -32,8 +32,9 @@ use crate::{
         StreamChunk, ToolSchema,
     },
     provider::{
-        ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
-        RetryBackoff, RetryPolicy,
+        ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
+        ProviderPrepareError, ProviderRequest, ProviderRequestDraft, ProviderStream, RetryBackoff,
+        RetryPolicy,
     },
     session::{
         AppendError, ApprovalOutcome, BarrierError, Clock, ClockError, CommittedUiReceiver,
@@ -72,9 +73,156 @@ impl Clock for IncrementingClock {
     }
 }
 
+#[derive(Clone)]
+struct ArmedClock(Arc<Mutex<ArmedClockState>>);
+
+struct ArmedClockState {
+    next: i64,
+    successful_calls_before_failure: Option<usize>,
+    cancel_on_failure: Option<CancellationToken>,
+}
+
+impl ArmedClock {
+    fn new(next: i64) -> Self {
+        Self(Arc::new(Mutex::new(ArmedClockState {
+            next,
+            successful_calls_before_failure: None,
+            cancel_on_failure: None,
+        })))
+    }
+
+    fn fail_after(&self, successful_calls: usize, cancel_on_failure: Option<CancellationToken>) {
+        let mut state = self.0.lock().unwrap();
+        state.successful_calls_before_failure = Some(successful_calls);
+        state.cancel_on_failure = cancel_on_failure;
+    }
+}
+
+impl Clock for ArmedClock {
+    fn now(&self) -> Result<UnixMillis, ClockError> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(remaining) = state.successful_calls_before_failure {
+            if remaining == 0 {
+                state.successful_calls_before_failure = None;
+                if let Some(cancellation) = state.cancel_on_failure.take() {
+                    cancellation.cancel();
+                }
+                return Err(ClockError::new("injected prune replacement clock failure"));
+            }
+            state.successful_calls_before_failure = Some(remaining - 1);
+        }
+        let value = state.next;
+        state.next += 1;
+        UnixMillis::new(value).map_err(|error| ClockError::new(error.to_string()))
+    }
+}
+
 struct ScriptedProvider {
     attempts: Mutex<VecDeque<Vec<StreamChunk>>>,
     requests: Mutex<Vec<Vec<Message>>>,
+}
+
+struct PruneThenFitProvider {
+    preparations: AtomicUsize,
+    preflights: AtomicUsize,
+    streams: AtomicUsize,
+    requests: Mutex<Vec<Vec<Message>>>,
+    request_models: Mutex<Vec<String>>,
+    fault_observer_on_first_preflight: Option<Arc<Mutex<CommittedUiReceiver>>>,
+    clock_failure_on_first_preflight: Option<(ArmedClock, Option<CancellationToken>)>,
+}
+
+impl Default for PruneThenFitProvider {
+    fn default() -> Self {
+        Self {
+            preparations: AtomicUsize::new(0),
+            preflights: AtomicUsize::new(0),
+            streams: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            request_models: Mutex::new(Vec::new()),
+            fault_observer_on_first_preflight: None,
+            clock_failure_on_first_preflight: None,
+        }
+    }
+}
+
+impl ModelProvider for PruneThenFitProvider {
+    fn prepare_call(
+        &self,
+        config: LlmCallConfig,
+    ) -> Result<PreparedProviderCall, ProviderPrepareError> {
+        let preparation = self.preparations.fetch_add(1, Ordering::SeqCst);
+        let mut raw = config.raw().as_value().clone();
+        raw["model"] = if preparation == 0 {
+            "discarded-after-hard-limit"
+        } else {
+            "selected-after-prune"
+        }
+        .into();
+        raw["maxTokens"] = json!(1_024);
+        let effective = serde_json::from_value(raw).unwrap();
+        let context_window = if preparation == 0 { 4_096 } else { 8_192 };
+        Ok(PreparedProviderCall::new(
+            effective,
+            LlmCallConfigAdapterDefaults::default(),
+            Some(crate::model::NonNegativeSafeInteger::new(context_window).unwrap()),
+        ))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        let attempt = self.preflights.fetch_add(1, Ordering::SeqCst);
+        let prepared = self.prepare_call(draft.config().clone())?;
+        if attempt == 0 {
+            if let Some(observer) = &self.fault_observer_on_first_preflight {
+                observer.lock().unwrap().fail_next_projection_for_test();
+            }
+            if let Some((clock, cancellation)) = &self.clock_failure_on_first_preflight {
+                clock.fail_after(1, cancellation.clone());
+            }
+            return Err(ProviderPreflightError::WireTooLarge {
+                maximum: 1,
+                prepared,
+            });
+        }
+        draft.finish(prepared, 1)
+    }
+
+    fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+        self.streams.fetch_add(1, Ordering::SeqCst);
+        self.request_models
+            .lock()
+            .unwrap()
+            .push(request.config().model().to_owned());
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.messages().to_vec());
+        Box::pin(stream::iter(text_response().into_iter().map(Ok)))
+    }
+}
+
+struct LargePrunableTools;
+
+impl ToolExecutor for LargePrunableTools {
+    fn execute(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        Box::pin(async {
+            ToolExecutionResult::new(
+                vec![ContentBlock::text("x".repeat(16_387)).unwrap()],
+                false,
+                None,
+                None,
+                false,
+            )
+            .map_err(|error| ToolExecutorError::new(error.to_string()))
+        })
+    }
 }
 
 impl ScriptedProvider {
@@ -113,6 +261,14 @@ impl ModelProvider for ScriptedProvider {
             )
             .unwrap(),
         ))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        let prepared = self.prepare_call(draft.config().clone())?;
+        draft.finish(prepared, 1)
     }
 
     fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
@@ -873,6 +1029,25 @@ async fn durable_session_with_event_room(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
+    durable_session_with_clock(
+        label,
+        remaining_events,
+        IncrementingClock(Mutex::new(1_000)),
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn durable_session_with_clock(
+    label: &str,
+    remaining_events: u64,
+    clock: impl Clock + 'static,
+) -> (
+    Session,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
@@ -888,12 +1063,362 @@ async fn durable_session_with_event_room(
     let authority = WorkspaceAuthority::open(&workspace).unwrap();
     let id = SessionId::new(format!("session-{}", uuid::Uuid::new_v4()));
     let journal_path = root.join(format!("{id}.jsonl"));
-    let mut session = store
-        .prepare_new(id, &authority, IncrementingClock(Mutex::new(1_000)))
-        .unwrap();
+    let mut session = store.prepare_new(id, &authority, clock).unwrap();
     session.materialize_if_needed().await.unwrap();
     session.set_durable_event_room_for_test(remaining_events);
     (session, journal_path, root, workspace)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hard_wire_limit_prunes_a_durable_tool_result_before_entering_the_step() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-hard-prune", 512).await;
+    let first_provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let first_config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut first = AgentLoop::with_runtime(
+        session,
+        first_provider,
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        first_config.clone(),
+    )
+    .unwrap();
+    let first_outcome = first
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(first_outcome.reason(), &TurnEndReason::Completed);
+
+    let provider = Arc::new(PruneThenFitProvider::default());
+    let mut resumed = AgentLoop::with_runtime(
+        first.into_session(),
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        first_config,
+    )
+    .unwrap();
+    let outcome = resumed
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "user-2",
+                    vec![ContentBlock::text("continue after pruning").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(outcome.steps(), 1);
+    assert_eq!(outcome.attempts(), 1);
+    assert_eq!(provider.preparations.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.preflights.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.streams.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.request_models.lock().unwrap().as_slice(),
+        ["selected-after-prune"]
+    );
+    assert_eq!(
+        resumed.session().request_header().unwrap().config.model(),
+        "selected-after-prune"
+    );
+    let request_context = resumed.session().request_context().unwrap();
+    assert_eq!(request_context.model(), Some("selected-after-prune"));
+    assert_eq!(request_context.context_window().unwrap().get(), 8_192);
+    resumed.shutdown().await.unwrap();
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    let event_types = journal_text
+        .lines()
+        .skip(1)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let second_turn = event_types
+        .iter()
+        .rposition(|event_type| event_type == "turn/start")
+        .unwrap();
+    let second_step = event_types[second_turn + 1..]
+        .iter()
+        .position(|event_type| event_type == "step/start")
+        .map(|offset| second_turn + 1 + offset)
+        .unwrap();
+    assert_eq!(
+        &event_types[second_turn + 1..second_step],
+        &["compaction/prune".to_owned(), "tool/result".to_owned()]
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].iter().any(|message| {
+        message.content().iter().any(|block| {
+            block.tool_result_content().is_some_and(|content| {
+                content.iter().any(|nested| {
+                    nested.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && nested
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|text| text.contains("tool result middle pruned"))
+                })
+            })
+        })
+    }));
+
+    drop(resumed);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn preflight_snapshot_rejects_an_identical_surface_with_a_new_generation() {
+    let mut session =
+        Session::with_clock("preflight-generation", IncrementingClock(Mutex::new(1_000))).unwrap();
+    let message = user();
+    let original = session
+        .append(NewEvent::surface(
+            EventKind::user_message(message.clone()),
+            SurfaceIntent::append(),
+        ))
+        .unwrap();
+    let proposed = LlmCallConfig::new("mock", "model").unwrap();
+    let messages = session.messages();
+    let provider = ScriptedProvider::new(Vec::new());
+    let draft = ProviderRequestDraft::new(&proposed, &messages).unwrap();
+    let preflight = provider.preflight_request(draft).unwrap();
+    let snapshot = super::PreflightedRequest {
+        proposed,
+        messages,
+        expected_surface_generation: session.surface_generation(),
+        preflight,
+    };
+    assert!(snapshot.matches_surface(&session));
+
+    session
+        .append(NewEvent::surface(
+            EventKind::user_message(message),
+            SurfaceIntent::replace(original.seq(), original.seq(), vec![original.seq()]),
+        ))
+        .unwrap();
+
+    assert!(session.messages_equal(&snapshot.messages));
+    assert!(!snapshot.matches_surface(&session));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn marker_only_hard_limit_never_repreflights_and_a_latched_cancel_wins() {
+    for cancel_on_failure in [false, true] {
+        let label = if cancel_on_failure {
+            "agent-prune-marker-cancel"
+        } else {
+            "agent-prune-marker-limit"
+        };
+        let clock = ArmedClock::new(1_000);
+        let (session, journal, root, workspace) =
+            durable_session_with_clock(label, 512, clock.clone()).await;
+        let first_provider = Arc::new(ScriptedProvider::new(vec![
+            tool_response(),
+            text_response(),
+        ]));
+        let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+            .with_tools(vec![schema()])
+            .unwrap()
+            .with_shell_policy(ShellPolicy::Allow);
+        let mut first = AgentLoop::with_runtime(
+            session,
+            first_provider,
+            Arc::new(LargePrunableTools),
+            Arc::new(FixedRuntime::default()),
+            config.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+                .await
+                .unwrap()
+                .reason(),
+            &TurnEndReason::Completed
+        );
+
+        let cancellation = CancellationToken::new();
+        let provider = Arc::new(PruneThenFitProvider {
+            clock_failure_on_first_preflight: Some((
+                clock,
+                cancel_on_failure.then(|| cancellation.clone()),
+            )),
+            ..PruneThenFitProvider::default()
+        });
+        let mut resumed = AgentLoop::with_runtime(
+            first.into_session(),
+            provider.clone(),
+            Arc::new(LargePrunableTools),
+            Arc::new(FixedRuntime::default()),
+            config,
+        )
+        .unwrap();
+        let outcome = resumed
+            .run_turn(
+                TurnProposal::Enter(vec![
+                    Message::user(
+                        "user-marker-only",
+                        vec![ContentBlock::text("continue after marker").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ]),
+                cancellation,
+            )
+            .await
+            .unwrap();
+
+        if cancel_on_failure {
+            assert_eq!(
+                outcome.reason(),
+                &TurnEndReason::Aborted {
+                    reason: crate::session::TurnEndCancelCause::User,
+                }
+            );
+        } else {
+            assert!(matches!(
+                outcome.reason(),
+                TurnEndReason::Error { error } if error.code() == "AGENT_CONTEXT_LIMIT"
+            ));
+        }
+        assert_eq!(outcome.steps(), 0);
+        assert_eq!(outcome.attempts(), 0);
+        assert_eq!(provider.preflights.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+        assert_eq!(resumed.session().state().open_step(), None);
+        assert_eq!(resumed.session().state().open_turn(), None);
+
+        resumed.shutdown().await.unwrap();
+        let rows = std::fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let second_turn = rows
+            .iter()
+            .rposition(|row| row["type"] == "turn/start")
+            .unwrap();
+        let second_tail = rows[second_turn + 1..]
+            .iter()
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(second_tail, ["compaction/prune", "turn/end"]);
+
+        drop(resumed);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn observer_failure_after_a_durable_prune_pair_still_closes_the_turn() {
+    let (mut session, journal, root, workspace) =
+        durable_session_with_event_room("agent-prune-observer", 512).await;
+    let observer = Arc::new(Mutex::new(
+        session.attach_ui_observer_for_test(512).unwrap(),
+    ));
+    let first_provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut first = AgentLoop::with_runtime(
+        session,
+        first_provider,
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config.clone(),
+    )
+    .unwrap();
+    let first_outcome = first
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(first_outcome.reason(), &TurnEndReason::Completed);
+
+    let provider = Arc::new(PruneThenFitProvider {
+        fault_observer_on_first_preflight: Some(Arc::clone(&observer)),
+        ..PruneThenFitProvider::default()
+    });
+    let mut resumed = AgentLoop::with_runtime(
+        first.into_session(),
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    let result = resumed
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "user-observer",
+                    vec![ContentBlock::text("continue after pruning").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(AgentLoopError::Barrier(BarrierError::ObserverUnavailable))
+    ));
+    assert!(observer.lock().unwrap().is_producer_faulted());
+    assert_eq!(provider.preflights.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+    assert_eq!(resumed.session().state().open_step(), None);
+    assert_eq!(resumed.session().state().open_turn(), None);
+
+    resumed.shutdown().await.unwrap();
+    let rows = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let second_turn = rows
+        .iter()
+        .rposition(|row| row["type"] == "turn/start")
+        .unwrap();
+    let second_tail = rows[second_turn + 1..]
+        .iter()
+        .map(|row| row["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(second_tail, ["compaction/prune", "tool/result", "turn/end"]);
+    assert_eq!(
+        rows.last().unwrap()["data"]["reason"]["error"]["code"],
+        "AGENT_OBSERVER_UNAVAILABLE"
+    );
+
+    drop(resumed);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
 }
 
 fn assert_observer_failure_closed_turn(

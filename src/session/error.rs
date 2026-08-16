@@ -173,6 +173,8 @@ pub enum TransitionError {
     DurableToolResultWithoutIntent { call_id: CallId },
     #[error("{event_type} can be appended only by the owned recovery lifecycle")]
     DurableRecoveryEventNotAllowed { event_type: &'static str },
+    #[error("{event_type} can be appended only by the owned tool-result pruner")]
+    DurablePruneEventNotAllowed { event_type: &'static str },
     #[error("durable result for call {call_id} does not match approval decision {approval_id}")]
     DurableApprovalResultMismatch {
         approval_id: super::ApprovalRequestId,

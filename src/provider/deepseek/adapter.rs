@@ -8,13 +8,13 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     model::{
-        LlmCallConfig, LlmCallConfigAdapterDefaults, NonNegativeSafeInteger, ReasoningEffortId,
-        StreamChunk, TrueMarker,
+        LlmCallConfig, LlmCallConfigAdapterDefaults, LlmFailure, NonNegativeSafeInteger,
+        ReasoningEffortId, StreamChunk, TrueMarker,
     },
     provider::{
-        MAX_PROVIDER_STREAM_CHUNKS, ModelProvider, PreparedProviderCall, ProviderBinding,
-        ProviderPrepareError, ProviderRequest, ProviderStream, ProviderStreamError, RequestPurpose,
-        StreamValidator,
+        MAX_PROVIDER_STREAM_CHUNKS, ModelProvider, PreparedProviderCall, PreparedRequestPreflight,
+        ProviderBinding, ProviderPreflightError, ProviderPrepareError, ProviderRequest,
+        ProviderRequestDraft, ProviderStream, ProviderStreamError, RequestPurpose, StreamValidator,
     },
 };
 
@@ -22,7 +22,7 @@ use super::{
     config::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekReasoningEffort, DeepSeekThinking},
     credentials::{ApiKey, CredentialLookup, CredentialSource, EnvironmentCredentials},
     error::DeepSeekFailure,
-    request::serialize_request,
+    request::{RequestBuildError, preflight_request_len, serialize_request},
     response::{DONE, DeepSeekTranslator, TranslateError},
     sse::{SseDecoder, SseError, SseItem},
     transport::{
@@ -78,6 +78,14 @@ impl DeepSeekProvider {
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
         <Self as ModelProvider>::prepare_call(self, config)
+    }
+
+    /// Prepare and count one exact DeepSeek wire without credentials or I/O.
+    pub fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        <Self as ModelProvider>::preflight_request(self, draft)
     }
 
     /// Immutable request/connection facts owned by this instance.
@@ -179,6 +187,19 @@ impl ModelProvider for DeepSeekProvider {
         )
     }
 
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        let prepared = self.prepare_call(draft.config().clone())?;
+        let encoded_bytes =
+            match preflight_request_len(&self.inner.config, prepared.config(), draft) {
+                Ok(encoded_bytes) => encoded_bytes,
+                Err(error) => return Err(provider_preflight_error(error, prepared)),
+            };
+        draft.finish(prepared, encoded_bytes)
+    }
+
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderStream {
         let child = cancellation.child_token();
         let cancel_on_drop = child.clone().drop_guard();
@@ -195,6 +216,22 @@ impl ModelProvider for DeepSeekProvider {
         })
         .boxed()
     }
+}
+
+fn provider_preflight_error(
+    error: RequestBuildError,
+    prepared: PreparedProviderCall,
+) -> ProviderPreflightError {
+    if matches!(&error, RequestBuildError::TooLarge { .. }) {
+        return ProviderPreflightError::WireTooLarge {
+            maximum: crate::provider::MAX_PROVIDER_REQUEST_BYTES,
+            prepared,
+        };
+    }
+    let code = error.code();
+    let failure = LlmFailure::new(error.to_string(), code)
+        .expect("bounded DeepSeek encoder errors are valid fixed LLM failures");
+    ProviderPreflightError::InvalidRequest { failure, prepared }
 }
 
 struct DeepSeekInner {
@@ -264,11 +301,26 @@ impl ProviderState {
                     if self.cancellation.is_cancelled() {
                         return self.finish_with(DeepSeekFailure::cancelled());
                     }
-                    let key = match self
+                    let body = match serialize_request(&self.inner.config, &request) {
+                        Ok(body) => body,
+                        Err(error) => {
+                            if self.cancellation.is_cancelled() {
+                                return self.finish_with(DeepSeekFailure::cancelled());
+                            }
+                            return self.finish_with(DeepSeekFailure::from_request(&error));
+                        }
+                    };
+                    if self.cancellation.is_cancelled() {
+                        return self.finish_with(DeepSeekFailure::cancelled());
+                    }
+                    let lookup = self
                         .inner
                         .credentials
-                        .resolve(self.inner.config.credential_ref())
-                    {
+                        .resolve(self.inner.config.credential_ref());
+                    if self.cancellation.is_cancelled() {
+                        return self.finish_with(DeepSeekFailure::cancelled());
+                    }
+                    let key = match lookup {
                         CredentialLookup::Missing => {
                             let message = format!(
                                 "no DeepSeek API key is available; set {}",
@@ -301,12 +353,6 @@ impl ProviderState {
                     if self.cancellation.is_cancelled() {
                         return self.finish_with(DeepSeekFailure::cancelled());
                     }
-                    let body = match serialize_request(&self.inner.config, &request) {
-                        Ok(body) => body,
-                        Err(error) => {
-                            return self.finish_with(DeepSeekFailure::from_request(&error));
-                        }
-                    };
                     let mut http = HttpRequest::new(self.inner.config.endpoint().to_owned(), body);
                     http.insert_header("authorization", format!("Bearer {}", key.expose()), true);
                     http.insert_header("content-type", "application/json", false);

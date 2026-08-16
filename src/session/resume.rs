@@ -510,9 +510,13 @@ fn finish_preparation(
     recovery_time: UnixMillis,
     identity: JournalIdentity,
 ) -> Result<PreparedWork, StoreError> {
-    let (plan, projection) = scan.prepare_recovery(recovery_time)?;
+    let (plan, mut projection) = scan.prepare_recovery(recovery_time)?;
     let report = scan.recovery_report(&plan)?;
-    let suffix = encode_plan(&plan)?;
+    let encoded = encode_plan(&plan, scan.valid_bytes())?;
+    if !projection.bind_recovery_tool_result_rows(encoded.rows.iter().copied()) {
+        return Err(StoreError::Corrupt);
+    }
+    let suffix = encoded.bytes;
     let suffix_len = u64::try_from(suffix.len()).map_err(|_| StoreError::Limit)?;
     let accepted_journal_bytes = scan
         .valid_bytes()
@@ -554,12 +558,20 @@ fn finish_preparation(
     })
 }
 
-fn encode_plan(plan: &RecoveryPlan) -> Result<Vec<u8>, StoreError> {
+struct EncodedRecoveryPlan {
+    bytes: Vec<u8>,
+    rows: Vec<super::journal_row::JournalRowLocator>,
+}
+
+fn encode_plan(plan: &RecoveryPlan, start_offset: u64) -> Result<EncodedRecoveryPlan, StoreError> {
     let maximum =
         usize::try_from(super::DURABLE_REPAIR_RESERVED_BYTES).map_err(|_| StoreError::Limit)?;
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(maximum)
+        .map_err(|_| StoreError::Limit)?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(plan.events().len())
         .map_err(|_| StoreError::Limit)?;
     for event in plan.events() {
         let line = encode_event_line(event).map_err(|_| StoreError::Limit)?;
@@ -570,9 +582,15 @@ fn encode_plan(plan: &RecoveryPlan) -> Result<Vec<u8>, StoreError> {
         if next > maximum {
             return Err(StoreError::Limit);
         }
+        let offset = start_offset
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| StoreError::Limit)?)
+            .ok_or(StoreError::Limit)?;
+        let row = super::journal_row::JournalRowLocator::new(event.seq(), offset, &line)
+            .ok_or(StoreError::Limit)?;
+        rows.push(row);
         bytes.extend_from_slice(&line);
     }
-    Ok(bytes)
+    Ok(EncodedRecoveryPlan { bytes, rows })
 }
 
 fn open_and_lock(root: &Dir, filename: &str) -> Result<File, StoreError> {

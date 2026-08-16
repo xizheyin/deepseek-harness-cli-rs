@@ -19,7 +19,10 @@ use crate::{
         LlmCallConfigAdapterDefaults, Message, MessageSource, NonNegativeSafeInteger,
         ReasoningEffortId, StreamChunk, StreamChunkKind, ToolSchema,
     },
-    provider::{PreparedProviderCall, ProviderPrepareError, ProviderRequest, RequestPurpose},
+    provider::{
+        MAX_PROVIDER_REQUEST_BYTES, PreparedProviderCall, ProviderPreflightError,
+        ProviderPrepareError, ProviderRequest, ProviderRequestDraft, RequestPurpose,
+    },
 };
 
 use super::{
@@ -29,7 +32,7 @@ use super::{
         ApiKey, CredentialLookup, CredentialRef, CredentialSource, SecretValue, StaticCredentials,
     },
     error::DeepSeekFailure,
-    request::{RequestBuildError, request_value},
+    request::{RequestBuildError, request_value, serialize_request},
     response::{
         DONE, DeepSeekTranslator, MAX_DEEPSEEK_EMITTED_BYTES, MAX_DEEPSEEK_OUTPUT_BYTES,
         TranslateError,
@@ -157,13 +160,86 @@ fn bound_simple_request(provider: &DeepSeekProvider) -> ProviderRequest {
 
 #[test]
 fn request_serialization_matches_the_committed_upstream_oracle() {
-    let actual = request_value(&DeepSeekConfig::default(), &full_request()).unwrap();
+    let request = full_request();
+    let actual = request_value(&DeepSeekConfig::default(), &request).unwrap();
     assert_eq!(actual, oracle()["serialize"]["fullRequest"]["value"]);
+    let encoded = serialize_request(&DeepSeekConfig::default(), &request).unwrap();
+    assert_eq!(encoded, serde_json::to_vec(&actual).unwrap());
+    assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), actual);
 
     let title = simple_request().with_purpose(RequestPurpose::SessionTitle);
     let value = request_value(&DeepSeekConfig::default(), &title).unwrap();
     assert_eq!(value["thinking"], json!({ "type": "disabled" }));
     assert!(value.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn preflight_counts_the_exact_wire_without_credentials_or_transport() {
+    let transport = Arc::new(ScriptedTransport::new([]));
+    let credentials = Arc::new(RotatingCredentials::default());
+    let provider = provider_with(
+        DeepSeekConfig::default(),
+        credentials.clone(),
+        transport.clone(),
+    );
+    let config = LlmCallConfig::new(DEEPSEEK_PROVIDER, "deepseek-chat").unwrap();
+    let messages = simple_messages();
+    let draft = ProviderRequestDraft::new(&config, &messages).unwrap();
+    let preflight = provider.preflight_request(draft).unwrap();
+    let encoded_bytes = preflight.encoded_bytes();
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.request_count(), 0);
+
+    let request = draft.into_request(preflight).unwrap();
+    let encoded = serialize_request(&DeepSeekConfig::default(), &request).unwrap();
+    assert_eq!(encoded.len(), encoded_bytes);
+    assert_eq!(request.preflight_encoded_bytes(), Some(encoded_bytes));
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.request_count(), 0);
+}
+
+#[test]
+fn preflight_accepts_the_exact_wire_limit_and_rejects_one_more_byte() {
+    let transport = Arc::new(ScriptedTransport::new([]));
+    let credentials = Arc::new(RotatingCredentials::default());
+    let provider = provider_with(
+        DeepSeekConfig::default(),
+        credentials.clone(),
+        transport.clone(),
+    );
+    let config = LlmCallConfig::new(DEEPSEEK_PROVIDER, "deepseek-chat").unwrap();
+    let messages = simple_messages();
+    let empty = ProviderRequestDraft::new(&config, &messages)
+        .unwrap()
+        .with_system("")
+        .unwrap();
+    let base = provider.preflight_request(empty).unwrap().encoded_bytes();
+    let remaining = MAX_PROVIDER_REQUEST_BYTES - base;
+    let mut exact_system = "\0".repeat(remaining / 6);
+    exact_system.push_str(&"x".repeat(remaining % 6));
+    let exact = ProviderRequestDraft::new(&config, &messages)
+        .unwrap()
+        .with_system(&exact_system)
+        .unwrap();
+    assert_eq!(
+        provider.preflight_request(exact).unwrap().encoded_bytes(),
+        MAX_PROVIDER_REQUEST_BYTES
+    );
+
+    exact_system.push('x');
+    let one_over = ProviderRequestDraft::new(&config, &messages)
+        .unwrap()
+        .with_system(&exact_system)
+        .unwrap();
+    assert!(matches!(
+        provider.preflight_request(one_over),
+        Err(ProviderPreflightError::WireTooLarge {
+            maximum: MAX_PROVIDER_REQUEST_BYTES,
+            ..
+        })
+    ));
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.request_count(), 0);
 }
 
 #[test]
@@ -834,10 +910,11 @@ async fn prepared_call_is_bound_to_the_exact_provider_instance() {
         static_credentials(),
         transport_b.clone(),
     );
-    let prepared = provider_a
-        .prepare_call(LlmCallConfig::new(DEEPSEEK_PROVIDER, "deepseek-chat").unwrap())
-        .unwrap();
-    let request = ProviderRequest::new(prepared, simple_messages()).unwrap();
+    let config = LlmCallConfig::new(DEEPSEEK_PROVIDER, "deepseek-chat").unwrap();
+    let messages = simple_messages();
+    let draft = ProviderRequestDraft::new(&config, &messages).unwrap();
+    let preflight = provider_a.preflight_request(draft).unwrap();
+    let request = draft.into_request(preflight).unwrap();
 
     let chunks = provider_b
         .stream(request, CancellationToken::new())
@@ -1116,6 +1193,105 @@ async fn credential_failures_stop_before_http_without_exposing_the_value() {
         let encoded = serde_json::to_string(&chunks).unwrap();
         assert!(!encoded.contains("secret with spaces"));
     }
+}
+
+#[tokio::test]
+async fn cancellation_latched_by_credential_lookup_overrides_its_failure() {
+    struct CancellingLookup(CancellationToken);
+
+    impl CredentialSource for CancellingLookup {
+        fn resolve(&self, _reference: &CredentialRef) -> CredentialLookup {
+            self.0.cancel();
+            CredentialLookup::Missing
+        }
+    }
+
+    let cancellation = CancellationToken::new();
+    let transport = Arc::new(ScriptedTransport::new([]));
+    let provider = provider_with(
+        DeepSeekConfig::default(),
+        Arc::new(CancellingLookup(cancellation.clone())),
+        transport.clone(),
+    );
+
+    let chunks = collect_chunks(&provider, cancellation).await;
+    assert_eq!(terminal_failure(&chunks).code(), "ABORTED");
+    assert_eq!(transport.request_count(), 0);
+}
+
+#[tokio::test]
+async fn live_encoder_failure_precedes_credentials_and_transport() {
+    let credentials = Arc::new(RotatingCredentials::default());
+    let transport = Arc::new(ScriptedTransport::new([]));
+    let provider = provider_with(
+        DeepSeekConfig::default(),
+        credentials.clone(),
+        transport.clone(),
+    );
+    let image = crate::model::ImageAttachmentRef::new(
+        format!("sha256:{}", "a".repeat(64)),
+        crate::model::ImageMediaType::Png,
+        68,
+        1,
+        1,
+        None,
+    )
+    .unwrap();
+    let message = Message::user(
+        "image-live",
+        vec![ContentBlock::image(image).unwrap()],
+        MessageSource::user().unwrap(),
+    )
+    .unwrap();
+    let prepared = provider
+        .prepare_call(LlmCallConfig::new(DEEPSEEK_PROVIDER, "deepseek-chat").unwrap())
+        .unwrap();
+    let request = ProviderRequest::new(prepared, vec![message]).unwrap();
+
+    let chunks = provider
+        .stream(request, CancellationToken::new())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(terminal_failure(&chunks).code(), "UNSUPPORTED_CONTENT");
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.request_count(), 0);
+}
+
+#[tokio::test]
+async fn live_preflight_recipe_mismatch_fails_before_credentials_and_transport() {
+    let credentials = Arc::new(RotatingCredentials::default());
+    let transport = Arc::new(ScriptedTransport::new([]));
+    let provider = provider_with(
+        DeepSeekConfig::default(),
+        credentials.clone(),
+        transport.clone(),
+    );
+    let config = simple_config();
+    let messages = simple_messages();
+    let preflight_draft = ProviderRequestDraft::new(&config, &messages)
+        .unwrap()
+        .with_system("stable")
+        .unwrap();
+    let preflight = provider.preflight_request(preflight_draft).unwrap();
+    let changed_draft = ProviderRequestDraft::new(&config, &messages)
+        .unwrap()
+        .with_system("stable\0")
+        .unwrap();
+    let request = changed_draft.into_request(preflight).unwrap();
+
+    let chunks = provider
+        .stream(request, CancellationToken::new())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(terminal_failure(&chunks).code(), "INVALID_REQUEST");
+    assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.request_count(), 0);
 }
 
 #[tokio::test]

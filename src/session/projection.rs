@@ -5,16 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::{
-    json_value::json_values_equal,
-    model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger},
-};
+use crate::model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger};
 
 use super::{
     ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionId, CompactionRange,
     CompactionTrigger, EventKind, EventSeq, MAX_SAFE_INTEGER, MAX_SOURCE_EVENT_SEQS, SessionEvent,
     SessionId, StepId, SurfaceOp, TurnId,
-    codec::event_data_value,
     compaction::{
         COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
         ModelVisibleDispatchSnapshot,
@@ -25,7 +21,9 @@ use super::{
     },
     error::{EventValidationError, SurfaceError, TransitionError},
     event::{RECOVERY_TOOL_RESULT_ID_PREFIX, TOOL_NOT_STARTED},
+    journal_row::JournalRowLocator,
     recovery::{RecoveryAdmission, RecoveryCompactionStage},
+    tool_result_pruner::{MaskedToolResultDigest, ToolResultSnapshot, masked_data_sha256},
 };
 
 const MAX_DURABLE_TOOL_CALLS_PER_STEP: usize = 64;
@@ -42,7 +40,15 @@ pub(crate) enum ValidationPolicy {
 enum ValidationAdmission {
     Ordinary,
     CompatibilityReplay,
+    ColdScan,
+    OwnedPrune,
     HistoricalScan,
+}
+
+impl ValidationAdmission {
+    fn is_unprivileged_durable(self) -> bool {
+        matches!(self, Self::Ordinary | Self::ColdScan)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,7 +311,44 @@ struct SurfaceNode {
     message: Option<Message>,
     estimated_tokens: u64,
     tool_delta: i64,
-    tool_result_identity: Option<Arc<serde_json::Value>>,
+    tool_result: Option<ToolResultOrigin>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolResultOrigin {
+    Memory {
+        masked: MaskedToolResultDigest,
+    },
+    PendingDurable {
+        masked: MaskedToolResultDigest,
+    },
+    Durable {
+        masked: MaskedToolResultDigest,
+        row: JournalRowLocator,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum SurfaceRowBinding {
+    Memory,
+    PendingDurable,
+    Durable(JournalRowLocator),
+}
+
+pub(super) struct PreparedDurableProjection {
+    projection: Projection,
+    pending_tool_result: Option<EventSeq>,
+}
+
+impl PreparedDurableProjection {
+    pub(super) fn bind(mut self, row: JournalRowLocator) -> Option<Projection> {
+        if let Some(seq) = self.pending_tool_result {
+            if seq != row.seq() || !self.projection.bind_tool_result_row(seq, row) {
+                return None;
+            }
+        }
+        Some(self.projection)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -369,7 +412,7 @@ impl Projection {
         let mut next = self.clone();
         let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
         next.apply_transition(event, ValidationAdmission::Ordinary)?;
-        next.apply_surface(event)?;
+        next.apply_surface(event, SurfaceRowBinding::Memory)?;
         next.compaction = compaction;
         Ok(next)
     }
@@ -385,7 +428,7 @@ impl Projection {
         let compaction =
             next.next_compaction_state(event, ValidationAdmission::CompatibilityReplay)?;
         next.apply_transition(event, ValidationAdmission::CompatibilityReplay)?;
-        next.apply_surface(event)?;
+        next.apply_surface(event, SurfaceRowBinding::Memory)?;
         next.compaction = compaction;
         Ok(next)
     }
@@ -395,16 +438,63 @@ impl Projection {
     /// A cold scanner discards the entire candidate on a semantic failure, so
     /// it does not need live append's detached rollback clone. This keeps a
     /// long valid journal linear in its event count.
+    pub(super) fn prepare_durable_event(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<PreparedDurableProjection, EventValidationError> {
+        event.kind.validate()?;
+        let mut next = self.clone();
+        let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
+        next.apply_transition(event, ValidationAdmission::Ordinary)?;
+        next.apply_surface(event, SurfaceRowBinding::PendingDurable)?;
+        next.compaction = compaction;
+        Ok(PreparedDurableProjection {
+            projection: next,
+            pending_tool_result: matches!(event.kind(), EventKind::ToolResult { .. })
+                .then_some(event.seq()),
+        })
+    }
+
+    pub(super) fn prepare_owned_prune_event(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<PreparedDurableProjection, EventValidationError> {
+        event.kind.validate()?;
+        let mut next = self.clone();
+        let compaction = next.next_compaction_state(event, ValidationAdmission::OwnedPrune)?;
+        next.apply_transition(event, ValidationAdmission::OwnedPrune)?;
+        next.apply_surface(event, SurfaceRowBinding::PendingDurable)?;
+        next.compaction = compaction;
+        Ok(PreparedDurableProjection {
+            projection: next,
+            pending_tool_result: matches!(event.kind(), EventKind::ToolResult { .. })
+                .then_some(event.seq()),
+        })
+    }
+
+    pub(super) fn apply_scanned_row(
+        &mut self,
+        event: &SessionEvent,
+        row: JournalRowLocator,
+    ) -> Result<(), EventValidationError> {
+        event.kind.validate()?;
+        let compaction = self.next_compaction_state(event, ValidationAdmission::ColdScan)?;
+        self.apply_transition(event, ValidationAdmission::ColdScan)?;
+        self.apply_surface(event, SurfaceRowBinding::Durable(row))?;
+        self.compaction = compaction;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_scanned_event(
         &mut self,
         event: &SessionEvent,
     ) -> Result<(), EventValidationError> {
-        event.kind.validate()?;
-        let compaction = self.next_compaction_state(event, ValidationAdmission::Ordinary)?;
-        self.apply_transition(event, ValidationAdmission::Ordinary)?;
-        self.apply_surface(event)?;
-        self.compaction = compaction;
-        Ok(())
+        let row = super::jsonl::encode_event_line(event)
+            .ok()
+            .and_then(|bytes| JournalRowLocator::new(event.seq(), 0, &bytes))
+            .ok_or(SurfaceError::ToolResultChangedIdentity)?;
+        self.apply_scanned_row(event, row)
     }
 
     /// Apply one event admitted by recovery's private exact-match cursor.
@@ -416,7 +506,11 @@ impl Projection {
         event.kind.validate()?;
         let compaction = self.next_compaction_state(event, ValidationAdmission::HistoricalScan)?;
         self.apply_transition(event, ValidationAdmission::HistoricalScan)?;
-        self.apply_surface(event)?;
+        let binding = admission.row().map_or(
+            SurfaceRowBinding::PendingDurable,
+            SurfaceRowBinding::Durable,
+        );
+        self.apply_surface(event, binding)?;
         self.compaction = compaction;
         Ok(())
     }
@@ -466,6 +560,36 @@ impl Projection {
         }
     }
 
+    pub(super) fn durable_tool_result_snapshot(&self, seq: EventSeq) -> Option<ToolResultSnapshot> {
+        let node = self.surface_nodes.iter().find(|node| node.seq == seq)?;
+        let ToolResultOrigin::Durable { masked, row } = node.tool_result? else {
+            return None;
+        };
+        Some(ToolResultSnapshot::new(
+            seq,
+            node.message.clone()?,
+            node.estimated_tokens,
+            row,
+            masked,
+        ))
+    }
+
+    pub(super) fn durable_tool_result_seqs(&self) -> Result<Vec<EventSeq>, ()> {
+        let candidate_count = self
+            .surface_nodes
+            .iter()
+            .filter(|node| matches!(node.tool_result, Some(ToolResultOrigin::Durable { .. })))
+            .count();
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(candidate_count)
+            .map_err(|_| ())?;
+        candidates.extend(self.surface_nodes.iter().filter_map(|node| {
+            matches!(node.tool_result, Some(ToolResultOrigin::Durable { .. })).then_some(node.seq)
+        }));
+        Ok(candidates)
+    }
+
     pub(crate) fn state(&self) -> SessionState {
         let (open_turn, open_step, pending_calls) = match &self.boundary {
             Boundary::Idle => (None, None, Vec::new()),
@@ -494,6 +618,35 @@ impl Projection {
             .iter()
             .filter_map(|node| node.message.clone())
             .collect()
+    }
+
+    pub(crate) fn try_messages_with(&self, pending: &[Message]) -> Result<Vec<Message>, ()> {
+        let committed = self
+            .surface_nodes
+            .iter()
+            .filter(|node| node.message.is_some())
+            .count();
+        let total = committed.checked_add(pending.len()).ok_or(())?;
+        let mut messages = Vec::new();
+        messages.try_reserve_exact(total).map_err(|_| ())?;
+        messages.extend(
+            self.surface_nodes
+                .iter()
+                .filter_map(|node| node.message.clone()),
+        );
+        messages.extend(pending.iter().cloned());
+        Ok(messages)
+    }
+
+    pub(crate) fn messages_equal(&self, expected: &[Message]) -> bool {
+        self.surface_nodes
+            .iter()
+            .filter_map(|node| node.message.as_ref())
+            .eq(expected.iter())
+    }
+
+    pub(crate) fn surface_generation(&self) -> u64 {
+        self.compaction.surface_generation
     }
 
     pub(crate) fn has_unresolved_surface_tool_calls(&self) -> bool {
@@ -564,6 +717,18 @@ impl Projection {
 
         if self.policy == ValidationPolicy::DurableStrict
             && admission == ValidationAdmission::Ordinary
+            && (matches!(event.kind, EventKind::CompactionPrune { .. })
+                || matches!(event.kind, EventKind::ToolResult { .. })
+                    && matches!(event.surface_op, Some(SurfaceOp::Replace(_))))
+        {
+            return Err(TransitionError::DurablePruneEventNotAllowed {
+                event_type: event.kind.event_type_static(),
+            }
+            .into());
+        }
+
+        if self.policy == ValidationPolicy::DurableStrict
+            && admission.is_unprivileged_durable()
             && next.open.is_some()
             && matches!(event.kind, EventKind::StepEnd { .. })
         {
@@ -574,7 +739,7 @@ impl Projection {
         }
 
         let recovery_only_ordinary = self.policy == ValidationPolicy::DurableStrict
-            && admission == ValidationAdmission::Ordinary
+            && admission.is_unprivileged_durable()
             && (matches!(
                 &event.kind,
                 EventKind::EndSeed
@@ -1146,7 +1311,7 @@ impl Projection {
         admission: ValidationAdmission,
     ) -> Result<(), TransitionError> {
         if self.policy == ValidationPolicy::DurableStrict
-            && admission == ValidationAdmission::Ordinary
+            && admission.is_unprivileged_durable()
             && matches!(
                 &event.kind,
                 EventKind::EndSeed
@@ -1161,7 +1326,7 @@ impl Projection {
             });
         }
         if self.policy == ValidationPolicy::DurableStrict
-            && admission == ValidationAdmission::Ordinary
+            && admission.is_unprivileged_durable()
             && matches!(
                 &event.kind,
                 EventKind::ToolResult { message, .. }
@@ -1435,7 +1600,11 @@ impl Projection {
         Ok(())
     }
 
-    fn apply_surface(&mut self, event: &SessionEvent) -> Result<(), SurfaceError> {
+    fn apply_surface(
+        &mut self,
+        event: &SessionEvent,
+        row_binding: SurfaceRowBinding,
+    ) -> Result<(), SurfaceError> {
         if !event.kind.is_surface_eligible() {
             if event.surface_op.is_some() || event.source_event_seqs.is_some() {
                 return Err(SurfaceError::MetadataOnIneligibleEvent {
@@ -1454,7 +1623,7 @@ impl Projection {
         self.validate_sources(event)?;
         match operation {
             SurfaceOp::Append(_) => {
-                let node = Self::surface_node(event)?;
+                let node = Self::surface_node(event, row_binding)?;
                 let surface_tokens = self
                     .surface_tokens
                     .checked_add(node.estimated_tokens)
@@ -1489,7 +1658,7 @@ impl Projection {
                 if matches!(event.kind, EventKind::ToolResult { .. }) {
                     self.validate_tool_result_rewrite(event, shadowed)?;
                 }
-                let node = Self::surface_node(event)?;
+                let node = Self::surface_node(event, row_binding)?;
                 let removed_tokens = shadowed.iter().try_fold(0_u64, |total, shadowed| {
                     total.checked_add(shadowed.estimated_tokens)
                 });
@@ -1505,7 +1674,10 @@ impl Projection {
         Ok(())
     }
 
-    fn surface_node(event: &SessionEvent) -> Result<SurfaceNode, SurfaceError> {
+    fn surface_node(
+        event: &SessionEvent,
+        row_binding: SurfaceRowBinding,
+    ) -> Result<SurfaceNode, SurfaceError> {
         let (kind, message, tool_delta) = match &event.kind {
             EventKind::UserMessage { message } => (SurfaceNodeKind::User, Some(message.clone()), 0),
             EventKind::ToolResult { message, .. } => {
@@ -1539,13 +1711,19 @@ impl Projection {
             .transpose()
             .map_err(context_budget_surface_error)?
             .unwrap_or(0);
-        let tool_result_identity = if matches!(event.kind, EventKind::ToolResult { .. }) {
-            let mut identity =
-                event_data_value(event).map_err(|_| SurfaceError::ToolResultChangedIdentity)?;
-            if !mask_tool_result_content(&mut identity) {
-                return Err(SurfaceError::ToolResultChangedIdentity);
-            }
-            Some(Arc::new(identity))
+        let tool_result = if matches!(event.kind, EventKind::ToolResult { .. }) {
+            let masked = masked_data_sha256(event.data().as_value())
+                .map_err(|_| SurfaceError::ToolResultChangedIdentity)?;
+            Some(match row_binding {
+                SurfaceRowBinding::Memory => ToolResultOrigin::Memory { masked },
+                SurfaceRowBinding::PendingDurable => ToolResultOrigin::PendingDurable { masked },
+                SurfaceRowBinding::Durable(row) => {
+                    if row.seq() != event.seq() {
+                        return Err(SurfaceError::ToolResultChangedIdentity);
+                    }
+                    ToolResultOrigin::Durable { masked, row }
+                }
+            })
         } else {
             None
         };
@@ -1555,8 +1733,39 @@ impl Projection {
             message,
             estimated_tokens,
             tool_delta,
-            tool_result_identity,
+            tool_result,
         })
+    }
+
+    fn bind_tool_result_row(&mut self, seq: EventSeq, row: JournalRowLocator) -> bool {
+        let Some(nodes) = Arc::get_mut(&mut self.surface_nodes) else {
+            return false;
+        };
+        let Some(node) = nodes.iter_mut().find(|node| node.seq == seq) else {
+            return false;
+        };
+        let Some(ToolResultOrigin::PendingDurable { masked }) = node.tool_result else {
+            return false;
+        };
+        node.tool_result = Some(ToolResultOrigin::Durable { masked, row });
+        true
+    }
+
+    pub(super) fn bind_recovery_tool_result_rows(
+        &mut self,
+        rows: impl IntoIterator<Item = JournalRowLocator>,
+    ) -> bool {
+        for row in rows {
+            let Some(node) = self.surface_nodes.iter().find(|node| node.seq == row.seq()) else {
+                continue;
+            };
+            if matches!(node.kind, SurfaceNodeKind::ToolResult)
+                && !self.bind_tool_result_row(row.seq(), row)
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn register_durable_declarations(&mut self, message: &Message) -> Result<(), TransitionError> {
@@ -1752,7 +1961,7 @@ impl Projection {
                 let canonical_not_started = event.source_event_seqs().is_none()
                     && message.tool_result_is_error()
                     && error.is_some_and(|failure| failure.code == TOOL_NOT_STARTED);
-                if admission == ValidationAdmission::Ordinary && canonical_not_started {
+                if admission.is_unprivileged_durable() && canonical_not_started {
                     return Err(TransitionError::DurableRecoveryEventNotAllowed {
                         event_type: "tool/result",
                     });
@@ -1928,17 +2137,20 @@ impl Projection {
         if shadowed.len() != 1 {
             return Err(SurfaceError::ToolResultMultipleTargets);
         }
-        let Some(original_identity) = shadowed[0].tool_result_identity.as_deref() else {
+        let Some(original_origin) = shadowed[0].tool_result else {
             return Err(SurfaceError::ToolResultWrongTarget);
+        };
+        let original_identity = match original_origin {
+            ToolResultOrigin::Memory { masked }
+            | ToolResultOrigin::PendingDurable { masked }
+            | ToolResultOrigin::Durable { masked, .. } => masked,
         };
         if !matches!(replacement.kind, EventKind::ToolResult { .. }) {
             return Err(SurfaceError::ToolResultWrongTarget);
         }
-        let mut replacement_data =
-            event_data_value(replacement).map_err(|_| SurfaceError::ToolResultChangedIdentity)?;
-        if !mask_tool_result_content(&mut replacement_data)
-            || !json_values_equal(original_identity, &replacement_data)
-        {
+        let replacement_identity = masked_data_sha256(replacement.data().as_value())
+            .map_err(|_| SurfaceError::ToolResultChangedIdentity)?;
+        if original_identity != replacement_identity {
             return Err(SurfaceError::ToolResultChangedIdentity);
         }
         Ok(())
@@ -2099,22 +2311,6 @@ impl EventKind {
     }
 }
 
-fn mask_tool_result_content(data: &mut serde_json::Value) -> bool {
-    let Some(block) = data
-        .as_object_mut()
-        .and_then(|data| data.get_mut("message"))
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|message| message.get_mut("content"))
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|content| (content.len() == 1).then(|| &mut content[0]))
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return false;
-    };
-    block.insert("content".to_owned(), serde_json::Value::Null);
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -2125,7 +2321,7 @@ mod tests {
             ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId, Clock,
             ClockError, EventKind, EventSeq, NewEvent, Session, SessionEvent, SessionId, StepId,
             SurfaceError, SurfaceIntent, TOOL_NOT_STARTED, ToolFailure, TransitionError,
-            TurnEndReason, TurnId, UnixMillis,
+            TurnEndReason, TurnId, UnixMillis, journal_row::JournalRowLocator,
         },
     };
 
@@ -2161,6 +2357,18 @@ mod tests {
     fn append(session: &mut Session, event: NewEvent) -> SessionEvent {
         session.append(event).unwrap();
         session.events().last().unwrap().clone()
+    }
+
+    fn append_owned_prune(
+        projection: &Projection,
+        event: &SessionEvent,
+    ) -> Result<Projection, crate::session::EventValidationError> {
+        let row = crate::session::jsonl::encode_event_line(event).unwrap();
+        let locator = JournalRowLocator::new(event.seq(), 0, &row).unwrap();
+        projection
+            .prepare_owned_prune_event(event)?
+            .bind(locator)
+            .ok_or_else(|| SurfaceError::ToolResultChangedIdentity.into())
     }
 
     fn open_step(session: &mut Session, calls: &[(&str, &str, &str)]) -> Vec<SessionEvent> {
@@ -2829,7 +3037,15 @@ mod tests {
         };
 
         assert!(matches!(
-            projection.with_event(&marker(23)).unwrap_err(),
+            projection.with_event(&marker(24)).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::DurablePruneEventNotAllowed {
+                    event_type: "compaction/prune"
+                }
+            )
+        ));
+        assert!(matches!(
+            append_owned_prune(&projection, &marker(23)).unwrap_err(),
             crate::session::EventValidationError::Surface(
                 SurfaceError::ShadowedTokenCountMismatch {
                     expected: 24,
@@ -2864,8 +3080,16 @@ mod tests {
             Some(vec![4]),
         );
 
-        let mut hot = projection.with_event(&marker(24)).unwrap();
-        hot = hot.with_event(&replacement).unwrap();
+        let mut hot = append_owned_prune(&projection, &marker(24)).unwrap();
+        assert!(matches!(
+            hot.with_event(&replacement).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::DurablePruneEventNotAllowed {
+                    event_type: "tool/result"
+                }
+            )
+        ));
+        hot = append_owned_prune(&hot, &replacement).unwrap();
         assert_eq!(hot.surface_tokens, before_tokens);
         assert_eq!(
             hot.state().surface_nodes(),
@@ -2876,7 +3100,9 @@ mod tests {
         let mut cold = projection.clone();
         cold.apply_scanned_event(&marker(24)).unwrap();
         cold.apply_scanned_event(&replacement).unwrap();
-        assert_eq!(cold, hot);
+        assert_eq!(cold.state(), hot.state());
+        assert_eq!(cold.surface_tokens, hot.surface_tokens);
+        assert_eq!(cold.compaction, hot.compaction);
     }
 
     #[test]

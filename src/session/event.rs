@@ -1799,4 +1799,8 @@ impl SessionEvent {
     pub(crate) fn set_time_for_commit(&mut self, time: UnixMillis) {
         self.time = time;
     }
+
+    pub(crate) fn into_original_data(self) -> serde_json::Value {
+        self.original_data.into_value()
+    }
 }

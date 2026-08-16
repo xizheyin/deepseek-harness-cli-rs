@@ -1,11 +1,16 @@
 //! Provider-neutral messages to DeepSeek chat-completions JSON.
 
-use serde_json::{Map, Value, json};
+use std::io::{self, Write};
+
+use serde::Serialize;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::{Map, json};
 use thiserror::Error;
 
 use crate::{
     model::{ContentBlock, ContentBlockKind, Message, MessageRole},
-    provider::{MAX_PROVIDER_REQUEST_BYTES, ProviderRequest, RequestPurpose},
+    provider::{MAX_PROVIDER_REQUEST_BYTES, ProviderRequest, ProviderRequestDraft, RequestPurpose},
 };
 
 use super::config::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekReasoningEffort, DeepSeekThinking};
@@ -14,18 +19,433 @@ pub(super) fn serialize_request(
     config: &DeepSeekConfig,
     request: &ProviderRequest,
 ) -> Result<Vec<u8>, RequestBuildError> {
-    let value = request_value(config, request)?;
-    let encoded =
-        serde_json::to_vec(&value).map_err(|error| RequestBuildError::Encode(error.to_string()))?;
-    if encoded.len() > MAX_PROVIDER_REQUEST_BYTES {
-        return Err(RequestBuildError::TooLarge {
-            maximum: MAX_PROVIDER_REQUEST_BYTES,
-            actual: encoded.len(),
-        });
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(MAX_PROVIDER_REQUEST_BYTES)
+        .map_err(|_| RequestBuildError::Capacity)?;
+    let encoded_bytes = encode_request(
+        config,
+        WireRequest {
+            config: request.config(),
+            system: request.system(),
+            messages: request.messages(),
+            tools: request.tools(),
+            purpose: request.purpose(),
+        },
+        &mut encoded,
+    )?;
+    if request
+        .preflight_encoded_bytes()
+        .is_some_and(|expected| expected != encoded_bytes)
+    {
+        return Err(RequestBuildError::PreflightMismatch);
     }
     Ok(encoded)
 }
 
+pub(super) fn preflight_request_len(
+    config: &DeepSeekConfig,
+    effective_config: &crate::model::LlmCallConfig,
+    draft: ProviderRequestDraft<'_>,
+) -> Result<usize, RequestBuildError> {
+    encode_request(
+        config,
+        WireRequest {
+            config: effective_config,
+            system: draft.system(),
+            messages: draft.messages(),
+            tools: draft.tools(),
+            purpose: draft.purpose(),
+        },
+        &mut io::sink(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct WireRequest<'a> {
+    config: &'a crate::model::LlmCallConfig,
+    system: Option<&'a str>,
+    messages: &'a [Message],
+    tools: &'a [crate::model::ToolSchema],
+    purpose: RequestPurpose,
+}
+
+fn encode_request(
+    adapter: &DeepSeekConfig,
+    request: WireRequest<'_>,
+    output: &mut impl Write,
+) -> Result<usize, RequestBuildError> {
+    if request.config.provider() != DEEPSEEK_PROVIDER {
+        return Err(RequestBuildError::WrongProvider);
+    }
+    if request
+        .messages
+        .iter()
+        .any(|message| content_has_image_without_allocation(message.content()))
+    {
+        return Err(RequestBuildError::UnsupportedContent);
+    }
+    let (thinking, effort) = resolve_thinking_parts(adapter, request.config, request.purpose)?;
+    let max_tokens = request
+        .config
+        .max_tokens()
+        .ok_or(RequestBuildError::UnpreparedConfig)?
+        .get();
+    if max_tokens == 0 {
+        return Err(RequestBuildError::InvalidMaxTokens);
+    }
+
+    let mut writer = WireWriter::new(output);
+    writer.raw(b"{")?;
+    writer.raw(b"\"max_tokens\":")?;
+    writer.json(&max_tokens)?;
+    writer.raw(b",\"messages\":[")?;
+    write_messages(&mut writer, request.system, request.messages)?;
+    writer.raw(b"],\"model\":")?;
+    writer.json(&request.config.model())?;
+    if let Some(effort) = effort {
+        writer.raw(b",\"reasoning_effort\":")?;
+        writer.json(&match effort {
+            DeepSeekReasoningEffort::High => "high",
+            DeepSeekReasoningEffort::Max => "max",
+            DeepSeekReasoningEffort::Off => {
+                return Err(RequestBuildError::InvalidResolvedThinking);
+            }
+        })?;
+    }
+    if let Some(stop) = request.config.stop() {
+        writer.raw(b",\"stop\":")?;
+        writer.json(&stop)?;
+    }
+    writer.raw(b",\"stream\":true,\"stream_options\":{\"include_usage\":true}")?;
+    if let Some(temperature) = request.config.temperature() {
+        writer.raw(b",\"temperature\":")?;
+        writer.json(&temperature)?;
+    }
+    writer.raw(b",\"thinking\":{\"type\":")?;
+    writer.json(&match thinking {
+        DeepSeekThinking::Enabled => "enabled",
+        DeepSeekThinking::Disabled => "disabled",
+    })?;
+    writer.raw(b"}")?;
+    if !request.tools.is_empty() {
+        writer.raw(b",\"tools\":[")?;
+        for (index, tool) in request.tools.iter().enumerate() {
+            if index > 0 {
+                writer.raw(b",")?;
+            }
+            writer.raw(b"{\"function\":{\"description\":")?;
+            writer.json(&tool.description())?;
+            writer.raw(b",\"name\":")?;
+            writer.json(&tool.name())?;
+            writer.raw(b",\"parameters\":")?;
+            writer.json(tool.parameters().as_value())?;
+            writer.raw(b"},\"type\":\"function\"}")?;
+        }
+        writer.raw(b"]")?;
+    }
+    writer.raw(b"}")?;
+    let written = writer.written();
+    if written > MAX_PROVIDER_REQUEST_BYTES {
+        return Err(RequestBuildError::TooLarge {
+            maximum: MAX_PROVIDER_REQUEST_BYTES,
+            actual: written,
+        });
+    }
+    Ok(written)
+}
+
+fn write_messages(
+    writer: &mut WireWriter<'_, impl Write>,
+    system: Option<&str>,
+    messages: &[Message],
+) -> Result<(), RequestBuildError> {
+    let mut first = true;
+    let mut scratch = String::new();
+    if let Some(system) = system {
+        write_simple_message(writer, &mut first, "system", system)?;
+    }
+    for message in messages {
+        match message.role() {
+            MessageRole::System => {
+                concat_strings_into(
+                    &mut scratch,
+                    message
+                        .content()
+                        .iter()
+                        .filter_map(|block| match block.kind() {
+                            ContentBlockKind::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        }),
+                )?;
+                write_simple_message(writer, &mut first, "system", &scratch)?;
+            }
+            MessageRole::Assistant => {
+                write_assistant_message(writer, &mut first, message, &mut scratch)?;
+            }
+            MessageRole::User => {
+                write_user_messages(writer, &mut first, message, &mut scratch)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_separator(
+    writer: &mut WireWriter<'_, impl Write>,
+    first: &mut bool,
+) -> Result<(), RequestBuildError> {
+    if *first {
+        *first = false;
+        Ok(())
+    } else {
+        writer.raw(b",")
+    }
+}
+
+fn write_simple_message(
+    writer: &mut WireWriter<'_, impl Write>,
+    first: &mut bool,
+    role: &str,
+    content: &str,
+) -> Result<(), RequestBuildError> {
+    write_separator(writer, first)?;
+    writer.raw(b"{\"content\":")?;
+    writer.json(&content)?;
+    writer.raw(b",\"role\":")?;
+    writer.json(&role)?;
+    writer.raw(b"}")
+}
+
+fn write_assistant_message(
+    writer: &mut WireWriter<'_, impl Write>,
+    first: &mut bool,
+    message: &Message,
+    scratch: &mut String,
+) -> Result<(), RequestBuildError> {
+    let has_tool_calls = message
+        .content()
+        .iter()
+        .any(|block| matches!(block.kind(), ContentBlockKind::ToolCall { .. }));
+    concat_strings_into(
+        scratch,
+        message
+            .content()
+            .iter()
+            .filter_map(|block| match block.kind() {
+                ContentBlockKind::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+    )?;
+
+    write_separator(writer, first)?;
+    writer.raw(b"{\"content\":")?;
+    writer.json(&scratch.as_str())?;
+    if has_tool_calls {
+        concat_strings_into(
+            scratch,
+            message
+                .content()
+                .iter()
+                .filter_map(|block| match block.kind() {
+                    ContentBlockKind::Reasoning { text } => Some(text.as_str()),
+                    _ => None,
+                }),
+        )?;
+        if !scratch.is_empty() {
+            writer.raw(b",\"reasoning_content\":")?;
+            writer.json(&scratch.as_str())?;
+        }
+    }
+    writer.raw(b",\"role\":\"assistant\"")?;
+    if has_tool_calls {
+        writer.raw(b",\"tool_calls\":[")?;
+        for (index, block) in message
+            .content()
+            .iter()
+            .filter(|block| matches!(block.kind(), ContentBlockKind::ToolCall { .. }))
+            .enumerate()
+        {
+            let ContentBlockKind::ToolCall {
+                id,
+                name,
+                arguments,
+            } = block.kind()
+            else {
+                continue;
+            };
+            if index > 0 {
+                writer.raw(b",")?;
+            }
+            writer.raw(b"{\"function\":{\"arguments\":")?;
+            writer.json(&arguments.as_str())?;
+            writer.raw(b",\"name\":")?;
+            writer.json(&name.as_str())?;
+            writer.raw(b"},\"id\":")?;
+            writer.json(&id.as_str())?;
+            writer.raw(b",\"type\":\"function\"}")?;
+        }
+        writer.raw(b"]")?;
+    }
+    writer.raw(b"}")
+}
+
+fn write_user_messages(
+    writer: &mut WireWriter<'_, impl Write>,
+    first: &mut bool,
+    message: &Message,
+    scratch: &mut String,
+) -> Result<(), RequestBuildError> {
+    let has_tool_results = message
+        .content()
+        .iter()
+        .any(|block| matches!(block.kind(), ContentBlockKind::ToolResult { .. }));
+    concat_strings_into(
+        scratch,
+        message
+            .content()
+            .iter()
+            .filter_map(|block| match block.kind() {
+                ContentBlockKind::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+    )?;
+    if !scratch.is_empty() || !has_tool_results {
+        write_simple_message(writer, first, "user", scratch)?;
+    }
+    for result in message
+        .content()
+        .iter()
+        .filter(|block| matches!(block.kind(), ContentBlockKind::ToolResult { .. }))
+    {
+        let ContentBlockKind::ToolResult { tool_call_id, .. } = result.kind() else {
+            continue;
+        };
+        concat_strings_into(
+            scratch,
+            result
+                .tool_result_content()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|block| {
+                    let fields = block.as_object()?;
+                    (fields.get("type")?.as_str()? == "text")
+                        .then(|| fields.get("text")?.as_str())?
+                }),
+        )?;
+        write_separator(writer, first)?;
+        writer.raw(b"{\"content\":")?;
+        writer.json(&if scratch.is_empty() {
+            "(no output)"
+        } else {
+            scratch.as_str()
+        })?;
+        writer.raw(b",\"role\":\"tool\",\"tool_call_id\":")?;
+        writer.json(&tool_call_id.as_str())?;
+        writer.raw(b"}")?;
+    }
+    Ok(())
+}
+
+fn concat_strings_into<'a>(
+    output: &mut String,
+    values: impl Clone + Iterator<Item = &'a str>,
+) -> Result<(), RequestBuildError> {
+    let length = values
+        .clone()
+        .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+        .ok_or(RequestBuildError::Capacity)?;
+    if length > MAX_PROVIDER_REQUEST_BYTES {
+        return Err(RequestBuildError::TooLarge {
+            maximum: MAX_PROVIDER_REQUEST_BYTES,
+            actual: length,
+        });
+    }
+    output.clear();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| RequestBuildError::Capacity)?;
+    for value in values {
+        output.push_str(value);
+    }
+    Ok(())
+}
+
+fn content_has_image_without_allocation(blocks: &[ContentBlock]) -> bool {
+    blocks
+        .iter()
+        .any(|block| raw_value_has_image(block.raw().as_value()))
+}
+
+fn raw_value_has_image(value: &Value) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    match fields.get("type").and_then(Value::as_str) {
+        Some("image") => true,
+        Some("tool-result") => fields
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| content.iter().any(raw_value_has_image)),
+        _ => false,
+    }
+}
+
+struct WireWriter<'a, W> {
+    output: &'a mut W,
+    written: usize,
+    stored: usize,
+}
+
+impl<'a, W: Write> WireWriter<'a, W> {
+    fn new(output: &'a mut W) -> Self {
+        Self {
+            output,
+            written: 0,
+            stored: 0,
+        }
+    }
+
+    fn written(&self) -> usize {
+        self.written
+    }
+
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), RequestBuildError> {
+        self.write_all(bytes)
+            .map_err(|error| RequestBuildError::Encode(error.to_string()))
+    }
+
+    fn json(&mut self, value: &impl Serialize) -> Result<(), RequestBuildError> {
+        serde_json::to_writer(&mut *self, value)
+            .map_err(|error| RequestBuildError::Encode(error.to_string()))
+    }
+}
+
+impl<W: Write> Write for WireWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("DeepSeek request byte count overflow"))?;
+        let remaining = MAX_PROVIDER_REQUEST_BYTES.saturating_sub(self.stored);
+        let retained = remaining.min(bytes.len());
+        if retained > 0 {
+            self.output.write_all(&bytes[..retained])?;
+            self.stored = self
+                .stored
+                .checked_add(retained)
+                .ok_or_else(|| io::Error::other("DeepSeek request storage count overflow"))?;
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+#[cfg(test)]
 pub(super) fn request_value(
     config: &DeepSeekConfig,
     request: &ProviderRequest,
@@ -121,6 +541,7 @@ pub(super) fn request_value(
     Ok(Value::Object(root))
 }
 
+#[cfg(test)]
 fn serialize_message(message: &Message, output: &mut Vec<Value>) {
     match message.role() {
         MessageRole::System => output.push(json!({
@@ -132,6 +553,7 @@ fn serialize_message(message: &Message, output: &mut Vec<Value>) {
     }
 }
 
+#[cfg(test)]
 fn serialize_assistant(message: &Message, output: &mut Vec<Value>) {
     let text = flatten_text(message.content());
     let reasoning = message
@@ -170,6 +592,7 @@ fn serialize_assistant(message: &Message, output: &mut Vec<Value>) {
     output.push(Value::Object(wire));
 }
 
+#[cfg(test)]
 fn serialize_user(message: &Message, output: &mut Vec<Value>) {
     let tool_results = message
         .content()
@@ -193,6 +616,7 @@ fn serialize_user(message: &Message, output: &mut Vec<Value>) {
     }
 }
 
+#[cfg(test)]
 fn flatten_text(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -203,6 +627,7 @@ fn flatten_text(blocks: &[ContentBlock]) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn flatten_raw_text(blocks: &[Value]) -> String {
     blocks
         .iter()
@@ -213,6 +638,7 @@ fn flatten_raw_text(blocks: &[Value]) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn content_has_image(blocks: &[ContentBlock]) -> bool {
     let mut pending = blocks
         .iter()
@@ -235,14 +661,23 @@ fn content_has_image(blocks: &[ContentBlock]) -> bool {
     false
 }
 
+#[cfg(test)]
 fn resolve_thinking(
     config: &DeepSeekConfig,
     request: &ProviderRequest,
 ) -> Result<(DeepSeekThinking, Option<DeepSeekReasoningEffort>), RequestBuildError> {
-    if request.purpose() == RequestPurpose::SessionTitle {
+    resolve_thinking_parts(config, request.config(), request.purpose())
+}
+
+fn resolve_thinking_parts(
+    config: &DeepSeekConfig,
+    call_config: &crate::model::LlmCallConfig,
+    purpose: RequestPurpose,
+) -> Result<(DeepSeekThinking, Option<DeepSeekReasoningEffort>), RequestBuildError> {
+    if purpose == RequestPurpose::SessionTitle {
         return Ok((DeepSeekThinking::Disabled, None));
     }
-    let effort = match request.config().reasoning_effort() {
+    let effort = match call_config.reasoning_effort() {
         None => return Err(RequestBuildError::UnpreparedConfig),
         Some(value) => match value.as_str() {
             "off" => DeepSeekReasoningEffort::Off,
@@ -286,6 +721,10 @@ pub(super) enum RequestBuildError {
     InvalidResolvedThinking,
     #[error("DeepSeek request is {actual} bytes; maximum is {maximum}")]
     TooLarge { maximum: usize, actual: usize },
+    #[error("failed to reserve bounded DeepSeek request capacity")]
+    Capacity,
+    #[error("DeepSeek request changed after its wire preflight")]
+    PreflightMismatch,
     #[error("failed to serialize DeepSeek request: {0}")]
     Encode(String),
 }
@@ -302,6 +741,8 @@ impl RequestBuildError {
             | Self::InvalidMaxTokens
             | Self::UnpreparedConfig
             | Self::InvalidResolvedThinking
+            | Self::Capacity
+            | Self::PreflightMismatch
             | Self::Encode(_) => "INVALID_REQUEST",
         }
     }

@@ -171,6 +171,17 @@ Rust deliberately differs in these physical and safety details:
     its repair helper ignores it; the Rust CLI has no legitimate producer for
     that state. Rejecting it prevents a model-visible declaration and an
     externally executed intent from silently disagreeing.
+16. The fixed upstream tool-result pruner walks one synchronous surface
+    snapshot and has no inner cancellation check. Rust reads potentially large
+    source rows through its single journal owner, so it checks cancellation
+    before the pass and between complete candidates. It also checks an owned
+    cancellation token every 64 KiB while reading one candidate. Once a
+    marker/replacement pair begins, Rust does not split it with cancellation.
+    A cancellation after one pair may therefore leave fewer complete pairs
+    than upstream, but never a cancellation-created marker-only row; a later
+    uncancelled pass can prune the remaining current results. This difference
+    avoids starting new disk work after a terminal user stop while preserving
+    append-only recovery.
 
 These differences will be recorded and tested in `docs/compatibility.md` before
 Phase 8 is marked complete.
@@ -1485,8 +1496,10 @@ ordinary pressure on the committed old surface and hard limits on a virtual
 surface that includes the claimed input; run any needed compaction; build a
 borrowed `ProviderRequestDraft` for that exact virtual generation and invoke the
 provider-specific wire preflight; only then settle `step/start` and the user
-messages. A wire-too-large result re-enters the bounded `hard-limit` compaction
-loop and preflights the new generation again. The final successful result keeps
+messages. A wire-too-large result, or a provider preparation whose materialized
+defaults push the provider-neutral request over its retained
+message/tool/byte limits, re-enters the bounded `hard-limit` compaction loop and
+preflights the new generation again. The final successful result keeps
 its exact `PreparedProviderCall`, encoded byte count, and virtual generation;
 after claims settle, request-header/context logging and the mandatory barrier,
 Agent constructs and dispatches that same request. Any generation/config drift
@@ -1600,8 +1613,9 @@ The default pruner matches the fixed upstream configuration:
 - keep the first 4,096 and last 1,024 code points and insert the exact 39-code-
   point marker `\n\n[... tool result middle pruned ...]\n\n` once;
 - treat all text blocks as one continuous stream, while preserving every
-  non-text block and its relative order; a text block made empty disappears
-  unless it owns the marker;
+  non-text block and its relative order; whenever pruning triggers, every text
+  block whose rebuilt text is empty disappears, including a block that was
+  already empty, unless it owns the marker;
 - count code points like JavaScript `Array.from`, so one non-BMP character such
   as an emoji is never split. Grapheme clusters made from multiple code points
   are not promised atomic in either implementation.
@@ -1643,13 +1657,15 @@ marker remains committed and the surface still points to the full original.
 Cold recovery does not invent a replacement; its next closer or end-seed expires
 an orphan claim. A later pass may safely retry the still-current original.
 
-The pruner makes no model request and has no inner cancellation point. The Agent
-checks cancellation before the pass and between candidates; once a pair starts,
-it commits both rows or reaches the specified marker-only failure before
-observing cancellation. A writer settlement may occur between complete pairs,
-never inside one. All committed pairs reach the ordinary pre-provider/turn-end
-barrier. A hard crash may therefore leave neither row, a marker-only prefix, or
-the full pair, exactly as the append-only upstream protocol permits.
+The pruner makes no model request. Fixed upstream performs its snapshot loop
+synchronously without an inner signal check. As intentional difference 16,
+Rust checks cancellation before the pass, between candidates, and every 64 KiB
+while authenticating a source row; once a pair starts, it commits both rows or
+reaches the specified marker-only failure before observing cancellation. A
+writer settlement may occur between complete pairs, never inside one. All
+committed pairs reach the ordinary pre-provider/turn-end barrier. A hard crash
+may therefore leave neither row, a marker-only prefix, or the full pair,
+exactly as the append-only upstream protocol permits.
 
 Selection takes the oldest surface prefix while retaining the newest tail. A
 `shadowedRange` is defined by the two endpoints' positions in the current
@@ -2234,9 +2250,9 @@ of a packed physical row as a Rust journal.
   but exceeds DeepSeek's exact 8 MiB escaped wire. Provider preflight returns
   too-large before `step/start`, runs the bounded hard-limit path or produces
   `AGENT_CONTEXT_LIMIT`, and the fake stream/network counters remain zero.
-  Exact wire/one-over, preflight preparation failure, and a final-generation
-  mismatch are also fixed without moving ordinary prepare failures outside the
-  eventual step;
+  Exact wire/one-over, prepared-default retained-size one-over, preflight
+  preparation failure, and a final-generation mismatch are also fixed without
+  moving ordinary prepare failures outside the eventual step;
 - tool call/result boundary adjustment and no safe-range case;
 - ranges use current-surface positions rather than numeric seq ordering; two
   successive replacements exercise a valid later range with numeric
@@ -2257,6 +2273,11 @@ of a packed physical row as a Rust journal.
   turn/step/end claims in one `SessionReservation`, awaits the specialized row
   read, and then settles those same claims without releasing or recreating the
   reservation;
+- cancellation before a pruning pass performs zero row reads; cancellation in
+  a row read stops at a 64 KiB boundary and commits no marker; cancellation
+  after the first complete pair prevents the next candidate from starting,
+  while a later uncancelled pass converges. The committed first pair remains
+  adjacent and a cancellation observed inside its writer wait cannot split it;
 - empty, image, tool-call, max-token, provider-error, timeout, cancellation,
   whitespace-only text, multi-text-plus-reasoning block preservation,
   nonshrinking summary, changed surface, and failed

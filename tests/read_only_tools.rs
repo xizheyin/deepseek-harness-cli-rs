@@ -16,8 +16,9 @@ use deepseek_harness_cli::{
         LlmCallConfigAdapterDefaults, Message, MessageSource, NonNegativeSafeInteger, StreamChunk,
     },
     provider::{
-        ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
-        RetryBackoff, RetryPolicy,
+        ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
+        ProviderPrepareError, ProviderRequest, ProviderRequestDraft, ProviderStream, RetryBackoff,
+        RetryPolicy,
     },
     session::{EventKind, Session, ToolFailure, TurnEndReason},
     tools::ReadOnlyToolRegistry,
@@ -117,6 +118,14 @@ impl ModelProvider for ScriptedProvider {
             )
             .unwrap(),
         ))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        let prepared = self.prepare_call(draft.config().clone())?;
+        draft.finish(prepared, 1)
     }
 
     fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {

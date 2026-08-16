@@ -7,6 +7,7 @@ mod context_budget;
 mod error;
 mod event;
 mod journal;
+mod journal_row;
 mod jsonl;
 mod observer;
 mod path_policy;
@@ -18,8 +19,10 @@ mod projection;
 mod recovery;
 mod resume;
 mod store;
+mod tool_result_pruner;
 
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub use clock::{Clock, SystemClock};
 pub use codec::{MAX_SESSION_EVENTS, MAX_SESSION_RETAINED_JSON_BYTES, MAX_SESSION_SNAPSHOT_BYTES};
@@ -56,18 +59,24 @@ pub(crate) use recovery::{RecoveryCallReport, RecoveryCompactionStage, RecoveryR
 #[cfg(test)]
 pub(crate) use resume::PreparingResume;
 pub(crate) use resume::RecoveredSession;
+pub(crate) use tool_result_pruner::{
+    ToolResultPruneConfig, ToolResultPruneError, ToolResultPruneOutcome, ValidatedRawReplacement,
+    ValidatedRawRow,
+};
 
-use crate::model::{JsonValue, Message};
+use crate::model::{JsonValue, Message, NonNegativeSafeInteger};
 
 use self::{
     codec::decode_snapshot,
-    journal::JournalError,
+    journal::{JournalError, JournalReadError, MAX_PRUNE_PREFIX_BYTES},
+    journal_row::JournalRowLocator,
     jsonl::{
         DurableTimestamp, EventLineTemplate, MAX_JOURNAL_EVENT_LINE_BYTES,
         prepared_event_line_upper_bound,
     },
     projection::{Projection, ValidationPolicy},
     store::{DeferredJournal, SessionStorage},
+    tool_result_pruner::masked_data_sha256,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,10 +91,35 @@ const DURABLE_REPAIR_RESERVED_BYTES: u64 = 1024 * 1024;
 const MAX_DURABLE_LOGICAL_EVENTS: u64 = 1_000_000;
 const DURABLE_REPAIR_RESERVED_EVENTS: u64 = 68;
 
-#[derive(Default)]
 struct PendingDurableBatch {
     bytes: Vec<u8>,
     event_count: usize,
+    state: PendingDurableBatchState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PendingDurableBatchState {
+    #[default]
+    Empty,
+    Ordinary,
+    PruneMarker {
+        target: EventSeq,
+        marker_seq: EventSeq,
+    },
+    PrunePair {
+        target: EventSeq,
+        marker_seq: EventSeq,
+    },
+}
+
+impl Default for PendingDurableBatch {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            event_count: 0,
+            state: PendingDurableBatchState::Empty,
+        }
+    }
 }
 
 struct PendingDurableOperation {
@@ -101,6 +135,18 @@ enum DurableOperationOwner {
         reservation: Arc<()>,
         token: u64,
         kind: ClaimOperationKind,
+    },
+    OwnedPrune(OwnedPrunePhase),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnedPrunePhase {
+    Marker {
+        target: EventSeq,
+    },
+    Replacement {
+        target: EventSeq,
+        marker_seq: EventSeq,
     },
 }
 
@@ -157,6 +203,118 @@ pub enum SessionIoError {
     Append(#[from] AppendError),
     #[error(transparent)]
     Storage(#[from] StoreError),
+}
+
+/// A bounded read of one already-durable surface row failed.
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub(crate) enum SessionReadError {
+    #[error(transparent)]
+    Append(#[from] AppendError),
+    #[error(transparent)]
+    Storage(#[from] StoreError),
+    #[error("the durable surface row no longer matches the active session facts")]
+    Corrupt,
+    #[error("the durable surface row is no longer current")]
+    Changed,
+    #[error("the durable surface row read was cancelled")]
+    Cancelled,
+}
+
+/// A private prune pair can fail before its marker or after that marker became
+/// an append-only fact. The latter must never masquerade as an atomic failure.
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub(crate) enum PrunePairAppendError {
+    #[error(transparent)]
+    BeforeMarker(#[from] AppendError),
+    #[error("the prune marker committed before the replacement failed: {source}")]
+    MarkerCommitted {
+        marker: AppendReceipt,
+        source: AppendError,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrunePairReceipt {
+    marker: AppendReceipt,
+    replacement: AppendReceipt,
+    outcome: ToolResultPruneOutcome,
+}
+
+impl PrunePairReceipt {
+    #[cfg(test)]
+    pub(crate) fn marker(&self) -> &AppendReceipt {
+        &self.marker
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replacement(&self) -> &AppendReceipt {
+        &self.replacement
+    }
+
+    pub(crate) fn outcome(&self) -> ToolResultPruneOutcome {
+        self.outcome
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ToolResultPrunePass {
+    replacements: usize,
+    original_code_points: usize,
+    pruned_code_points: usize,
+}
+
+impl ToolResultPrunePass {
+    pub(crate) fn replacements(self) -> usize {
+        self.replacements
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_code_points(self) -> usize {
+        self.original_code_points
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pruned_code_points(self) -> usize {
+        self.pruned_code_points
+    }
+}
+
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+#[error("{source}")]
+pub(crate) struct ToolResultPrunePassError {
+    progress: ToolResultPrunePass,
+    #[source]
+    source: ToolResultPrunePassCause,
+}
+
+impl ToolResultPrunePassError {
+    fn new(progress: ToolResultPrunePass, source: ToolResultPrunePassCause) -> Self {
+        Self { progress, source }
+    }
+
+    pub(crate) fn progress(&self) -> ToolResultPrunePass {
+        self.progress
+    }
+
+    pub(crate) fn cause(&self) -> &ToolResultPrunePassCause {
+        &self.source
+    }
+}
+
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub(crate) enum ToolResultPrunePassCause {
+    #[error("the tool-result pruning pass was cancelled")]
+    Cancelled,
+    #[error("the tool-result pruning pass could not reserve bounded bookkeeping")]
+    Capacity,
+    #[error(transparent)]
+    Read(SessionReadError),
+    #[error(transparent)]
+    Transform(ToolResultPruneError),
+    #[error(transparent)]
+    Pair(PrunePairAppendError),
+    #[error(transparent)]
+    Barrier(BarrierError),
 }
 
 /// Capacity still available before taking any active reservation into account.
@@ -549,9 +707,11 @@ impl Session {
             }) if Arc::ptr_eq(pending_reservation, reservation) && *pending == token => {
                 Ok(Some(*kind))
             }
-            Some(DurableOperationOwner::Ordinary | DurableOperationOwner::Claim { .. }) => {
-                Err(AppendError::NeedsAppendSettle)
-            }
+            Some(
+                DurableOperationOwner::Ordinary
+                | DurableOperationOwner::Claim { .. }
+                | DurableOperationOwner::OwnedPrune(_),
+            ) => Err(AppendError::NeedsAppendSettle),
         }
     }
 
@@ -703,7 +863,7 @@ impl Session {
             .get()
             .checked_add(1)
             .and_then(|next| EventSeq::new(next).ok());
-        let next_logical_event_count = match &self.mode {
+        let (next_logical_event_count, next_batch_state) = match &self.mode {
             SessionMode::Memory { .. } => {
                 return DurableAppendAttempt::Failed(AppendError::DurableAsyncRequired);
             }
@@ -722,14 +882,56 @@ impl Session {
                         SessionStorage::Active(_) => AppendError::DurableWriter,
                     });
                 };
-                if writer.ensure_stageable().is_err() || pending_batch.event_count != 0 {
-                    return DurableAppendAttempt::NeedsStorageSettle(PendingDurableOperation {
-                        prepared,
-                        protected_events,
-                        protected_row_bytes,
-                        owner,
-                    });
-                }
+                let stageable = writer.ensure_stageable().is_ok();
+                let next_batch_state = match &owner {
+                    DurableOperationOwner::Ordinary | DurableOperationOwner::Claim { .. } => {
+                        if !stageable
+                            || pending_batch.event_count != 0
+                            || pending_batch.state != PendingDurableBatchState::Empty
+                        {
+                            return DurableAppendAttempt::NeedsStorageSettle(
+                                PendingDurableOperation {
+                                    prepared,
+                                    protected_events,
+                                    protected_row_bytes,
+                                    owner,
+                                },
+                            );
+                        }
+                        PendingDurableBatchState::Ordinary
+                    }
+                    DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Marker { target }) => {
+                        if !stageable
+                            || pending_batch.event_count != 0
+                            || pending_batch.state != PendingDurableBatchState::Empty
+                        {
+                            return DurableAppendAttempt::Failed(AppendError::NeedsAppendSettle);
+                        }
+                        PendingDurableBatchState::PruneMarker {
+                            target: *target,
+                            marker_seq: seq,
+                        }
+                    }
+                    DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Replacement {
+                        target,
+                        marker_seq,
+                    }) => {
+                        if !stageable
+                            || pending_batch.event_count != 1
+                            || pending_batch.state
+                                != (PendingDurableBatchState::PruneMarker {
+                                    target: *target,
+                                    marker_seq: *marker_seq,
+                                })
+                        {
+                            return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+                        }
+                        PendingDurableBatchState::PrunePair {
+                            target: *target,
+                            marker_seq: *marker_seq,
+                        }
+                    }
+                };
                 let Some(logical) = logical_event_count
                     .checked_add(1)
                     .and_then(|value| value.checked_add(protected_events))
@@ -742,7 +944,7 @@ impl Session {
                         maximum: ordinary_max,
                     });
                 }
-                logical - protected_events
+                (logical - protected_events, next_batch_state)
             }
         };
         let PreparedEvent {
@@ -761,7 +963,15 @@ impl Session {
         let Some(event_type) = event.kind().live_event_type() else {
             return DurableAppendAttempt::Failed(EventValidationError::UnknownLiveEvent.into());
         };
-        let projection = match self.projection.with_event(&event) {
+        let prepared_projection = match &owner {
+            DurableOperationOwner::OwnedPrune(_) => {
+                self.projection.prepare_owned_prune_event(&event)
+            }
+            DurableOperationOwner::Ordinary | DurableOperationOwner::Claim { .. } => {
+                self.projection.prepare_durable_event(&event)
+            }
+        };
+        let prepared_projection = match prepared_projection {
             Ok(projection) => projection,
             Err(error) => return DurableAppendAttempt::Failed(error.into()),
         };
@@ -781,7 +991,7 @@ impl Session {
             Err(_) => return DurableAppendAttempt::Failed(AppendError::DurableRecord),
         };
         let ordinary_byte_max = MAX_DURABLE_JOURNAL_BYTES - DURABLE_REPAIR_RESERVED_BYTES;
-        let next_accepted_upper_bound = match &mut self.mode {
+        let (next_accepted_upper_bound, row_offset) = match &mut self.mode {
             SessionMode::Durable {
                 accepted_journal_bytes,
                 pending_batch,
@@ -807,7 +1017,7 @@ impl Session {
                 {
                     return DurableAppendAttempt::Failed(AppendError::Capacity);
                 }
-                next
+                (next, *accepted_journal_bytes)
             }
             SessionMode::Memory { .. } => {
                 return DurableAppendAttempt::Failed(AppendError::DurableAsyncRequired);
@@ -832,6 +1042,18 @@ impl Session {
         };
         event.set_time_for_commit(time);
         let row = row_template.finish(timestamp);
+        let Some(row_locator) = JournalRowLocator::new(seq, row_offset, &row) else {
+            if let SessionMode::Durable { storage, .. } = &mut self.mode {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+            }
+            return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+        };
+        let Some(projection) = prepared_projection.bind(row_locator) else {
+            if let SessionMode::Durable { storage, .. } = &mut self.mode {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+            }
+            return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+        };
         let Some(unused_timestamp_bytes) = row_template_len.checked_sub(row.len()) else {
             if let SessionMode::Durable { storage, .. } = &mut self.mode {
                 *storage = SessionStorage::Failed(StoreError::Poisoned);
@@ -867,6 +1089,7 @@ impl Session {
         };
         pending_batch.bytes.extend_from_slice(&row);
         pending_batch.event_count += 1;
+        pending_batch.state = next_batch_state;
         *logical_event_count = next_logical_event_count;
         *accepted_journal_bytes = next_accepted_journal_bytes;
         self.next_seq = next_seq;
@@ -900,21 +1123,27 @@ impl Session {
             return Err(map_journal_append_error(error));
         }
 
-        let bytes = match &mut self.mode {
+        let batch = match &mut self.mode {
             SessionMode::Durable { pending_batch, .. } if pending_batch.event_count != 0 => {
-                pending_batch.event_count = 0;
-                Some(std::mem::take(&mut pending_batch.bytes))
+                Some(std::mem::take(pending_batch))
             }
             SessionMode::Durable { .. } | SessionMode::Memory { .. } => None,
         };
-        let Some(bytes) = bytes else {
+        let Some(batch) = batch else {
             return Ok(());
         };
         let result = match &mut self.mode {
             SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 ..
-            } => match writer.stage(bytes) {
+            } => match match batch.state {
+                PendingDurableBatchState::Ordinary => writer.stage(batch.bytes),
+                PendingDurableBatchState::PruneMarker { .. }
+                | PendingDurableBatchState::PrunePair { .. } => {
+                    writer.stage_prune_prefix(batch.bytes, batch.event_count)
+                }
+                PendingDurableBatchState::Empty => Err(JournalError::Poisoned),
+            } {
                 Ok(()) => writer.flush_staged().await,
                 Err(error) => Err(error),
             },
@@ -1199,6 +1428,17 @@ impl Session {
         }
     }
 
+    fn latch_durable_corruption(&mut self) {
+        if let SessionMode::Durable {
+            storage: SessionStorage::Active(writer),
+            ..
+        } = &mut self.mode
+        {
+            writer.latch_poison();
+        }
+        self.remember_barrier_error(AppendError::DurablePoisoned);
+    }
+
     fn take_barrier_error(&mut self) -> Option<AppendError> {
         match &mut self.mode {
             SessionMode::Durable { barrier_error, .. } => barrier_error.take(),
@@ -1250,6 +1490,28 @@ impl Session {
         let retained_json_bytes = original_data.encoded_len();
         Ok(PreparedEvent {
             event,
+            original_data,
+            retained_json_bytes,
+        })
+    }
+
+    fn prepare_raw_tool_result_replacement(
+        data: serde_json::Value,
+        target: EventSeq,
+    ) -> Result<PreparedEvent, AppendError> {
+        let original_data = JsonValue::new(data)
+            .map_err(crate::model::ModelError::from)
+            .map_err(EventValidationError::from)?;
+        let kind = codec::decode_raw_tool_result_kind(&original_data).map_err(|error| {
+            EventValidationError::from(crate::model::ModelError::InvalidShape {
+                subject: "raw tool-result replacement",
+                detail: error.to_string(),
+            })
+        })?;
+        kind.validate()?;
+        let retained_json_bytes = original_data.encoded_len();
+        Ok(PreparedEvent {
+            event: NewEvent::surface(kind, SurfaceIntent::replace(target, target, vec![target])),
             original_data,
             retained_json_bytes,
         })
@@ -1599,6 +1861,18 @@ impl Session {
     #[must_use]
     pub fn messages(&self) -> Vec<Message> {
         self.projection.messages()
+    }
+
+    pub(crate) fn try_messages_with(&self, pending: &[Message]) -> Result<Vec<Message>, ()> {
+        self.projection.try_messages_with(pending)
+    }
+
+    pub(crate) fn messages_equal(&self, expected: &[Message]) -> bool {
+        self.projection.messages_equal(expected)
+    }
+
+    pub(crate) fn surface_generation(&self) -> u64 {
+        self.projection.surface_generation()
     }
 
     /// Latest canonical model-request header, or `None` before one is logged.
@@ -2009,6 +2283,355 @@ impl SessionReservation<'_> {
         self.session
     }
 
+    /// Prune every oversized current durable tool result in surface order.
+    ///
+    /// Cancellation is observed before a row read and between complete pairs;
+    /// once a pair starts, its marker and replacement remain one synchronous
+    /// append-only critical section.
+    pub(crate) async fn prune_oversized_tool_results(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolResultPrunePass, ToolResultPrunePassError> {
+        let mut report = ToolResultPrunePass::default();
+        if cancellation.is_cancelled() {
+            return Err(ToolResultPrunePassError::new(
+                report,
+                ToolResultPrunePassCause::Cancelled,
+            ));
+        }
+        if !self.session.is_durable() {
+            return Ok(report);
+        }
+        let candidates = self
+            .session
+            .projection
+            .durable_tool_result_seqs()
+            .map_err(|()| {
+                ToolResultPrunePassError::new(report, ToolResultPrunePassCause::Capacity)
+            })?;
+        for seq in candidates {
+            if cancellation.is_cancelled() {
+                return Err(ToolResultPrunePassError::new(
+                    report,
+                    ToolResultPrunePassCause::Cancelled,
+                ));
+            }
+            let row = match self
+                .read_validated_surface_row(seq, cancellation.clone())
+                .await
+            {
+                Ok(row) => row,
+                Err(SessionReadError::Changed) => continue,
+                Err(SessionReadError::Cancelled) => {
+                    return Err(ToolResultPrunePassError::new(
+                        report,
+                        ToolResultPrunePassCause::Cancelled,
+                    ));
+                }
+                Err(error) => {
+                    return Err(ToolResultPrunePassError::new(
+                        report,
+                        ToolResultPrunePassCause::Read(error),
+                    ));
+                }
+            };
+            let Some(replacement) =
+                row.prune(ToolResultPruneConfig::default())
+                    .map_err(|error| {
+                        ToolResultPrunePassError::new(
+                            report,
+                            ToolResultPrunePassCause::Transform(error),
+                        )
+                    })?
+            else {
+                continue;
+            };
+            // The row read and CPU-only transform may take long enough for the
+            // caller to cancel. Do not start a fresh durable pair after that
+            // signal; once append_prune_pair starts, the pair itself is atomic.
+            if cancellation.is_cancelled() {
+                return Err(ToolResultPrunePassError::new(
+                    report,
+                    ToolResultPrunePassCause::Cancelled,
+                ));
+            }
+            let receipt = match self.append_prune_pair(replacement) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    if matches!(error, PrunePairAppendError::MarkerCommitted { .. }) {
+                        self.flush_barrier().await.map_err(|barrier| {
+                            ToolResultPrunePassError::new(
+                                report,
+                                ToolResultPrunePassCause::Barrier(barrier),
+                            )
+                        })?;
+                    }
+                    return Err(ToolResultPrunePassError::new(
+                        report,
+                        ToolResultPrunePassCause::Pair(error),
+                    ));
+                }
+            };
+            self.flush_barrier().await.map_err(|error| {
+                ToolResultPrunePassError::new(report, ToolResultPrunePassCause::Barrier(error))
+            })?;
+            let outcome = receipt.outcome();
+            report.replacements = report.replacements.checked_add(1).ok_or_else(|| {
+                ToolResultPrunePassError::new(report, ToolResultPrunePassCause::Capacity)
+            })?;
+            report.original_code_points = report
+                .original_code_points
+                .checked_add(outcome.original_code_points)
+                .ok_or_else(|| {
+                    ToolResultPrunePassError::new(report, ToolResultPrunePassCause::Capacity)
+                })?;
+            report.pruned_code_points = report
+                .pruned_code_points
+                .checked_add(outcome.pruned_code_points)
+                .ok_or_else(|| {
+                    ToolResultPrunePassError::new(report, ToolResultPrunePassCause::Capacity)
+                })?;
+        }
+        Ok(report)
+    }
+
+    /// Read and authenticate one current durable tool-result row while all
+    /// existing closure claims stay protected by this reservation.
+    pub(crate) async fn read_validated_surface_row(
+        &mut self,
+        seq: EventSeq,
+        cancellation: CancellationToken,
+    ) -> Result<ValidatedRawRow, SessionReadError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionReadError::Cancelled);
+        }
+        self.session.ensure_durable_active()?;
+        if self.session.has_pending_durable_operation() {
+            return Err(AppendError::NeedsAppendSettle.into());
+        }
+        let expected = self
+            .session
+            .projection
+            .durable_tool_result_snapshot(seq)
+            .ok_or(SessionReadError::Changed)?;
+        let has_pending_batch = matches!(
+            &self.session.mode,
+            SessionMode::Durable { pending_batch, .. } if pending_batch.event_count > 0
+        );
+        if has_pending_batch {
+            self.session.flush_committed_batch().await?;
+        }
+        let read = match &mut self.session.mode {
+            SessionMode::Durable {
+                storage: SessionStorage::Active(writer),
+                ..
+            } => writer
+                .read_durable_row(expected.row(), cancellation)
+                .await
+                .map_err(map_journal_read_error),
+            SessionMode::Durable { .. } => return Err(StoreError::WriterStopped.into()),
+            SessionMode::Memory { .. } => return Err(AppendError::DurableAsyncRequired.into()),
+        };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if error != SessionReadError::Cancelled {
+                    self.session.latch_durable_corruption();
+                }
+                return Err(error);
+            }
+        };
+        let decoded = (|| {
+            let payload = bytes.strip_suffix(b"\n").ok_or(SessionReadError::Corrupt)?;
+            let value = serde_json::from_slice(payload).map_err(|_| SessionReadError::Corrupt)?;
+            let index = usize::try_from(seq.get()).map_err(|_| SessionReadError::Corrupt)?;
+            let event = codec::decode_event(value, index).map_err(|_| SessionReadError::Corrupt)?;
+            let EventKind::ToolResult { message, .. } = event.kind() else {
+                return Err(SessionReadError::Corrupt);
+            };
+            if event.seq() != seq
+                || message != expected.message()
+                || masked_data_sha256(event.data().as_value())
+                    .map_err(|_| SessionReadError::Corrupt)?
+                    != expected.masked()
+            {
+                return Err(SessionReadError::Corrupt);
+            }
+            if self
+                .session
+                .projection
+                .durable_tool_result_snapshot(seq)
+                .as_ref()
+                != Some(&expected)
+            {
+                return Err(SessionReadError::Changed);
+            }
+            Ok(event.into_original_data())
+        })();
+        match decoded {
+            Ok(data) => Ok(ValidatedRawRow::new(self.owner.clone(), expected, data)),
+            Err(SessionReadError::Corrupt) => {
+                self.session.latch_durable_corruption();
+                Err(SessionReadError::Corrupt)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Append one source-verified prune marker and its raw-preserving
+    /// replacement without an await or cancellation point between them.
+    pub(crate) fn append_prune_pair(
+        &mut self,
+        replacement: ValidatedRawReplacement,
+    ) -> Result<PrunePairReceipt, PrunePairAppendError> {
+        self.session.ensure_durable_active()?;
+        if self.session.has_pending_durable_operation() {
+            return Err(AppendError::NeedsAppendSettle.into());
+        }
+        let (owner, snapshot, data, outcome) = replacement.into_parts();
+        if !Arc::ptr_eq(&owner, &self.owner) {
+            return Err(AppendError::InvalidClaim.into());
+        }
+        let target = snapshot.seq();
+        if self
+            .session
+            .projection
+            .durable_tool_result_snapshot(target)
+            .as_ref()
+            != Some(&snapshot)
+        {
+            return Err(
+                AppendError::Validation(SurfaceError::ToolResultChangedIdentity.into()).into(),
+            );
+        }
+
+        let replacement = Session::prepare_raw_tool_result_replacement(data, target)?;
+        let token_count = NonNegativeSafeInteger::new(snapshot.estimated_tokens())
+            .map_err(crate::model::ModelError::from)
+            .map_err(EventValidationError::from)
+            .map_err(AppendError::from)?;
+        let marker = Session::prepare_event(NewEvent::log(EventKind::compaction_prune(
+            CompactionPruneEvent::new(
+                CompactionRange::new(target, target),
+                vec![target],
+                token_count,
+            )
+            .map_err(AppendError::from)?,
+        )))?;
+        let marker_upper = Session::durable_row_upper_bound(&marker)?;
+        let replacement_upper = Session::durable_row_upper_bound(&replacement)?;
+        let pair_upper = marker_upper
+            .checked_add(replacement_upper)
+            .ok_or(AppendError::Capacity)?;
+        if pair_upper > u64::try_from(MAX_PRUNE_PREFIX_BYTES).map_err(|_| AppendError::Capacity)? {
+            return Err(AppendError::DurableRecord.into());
+        }
+        let reserved_events =
+            u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
+        let marker_protected_events = reserved_events
+            .checked_add(1)
+            .ok_or(AppendError::SequenceExhausted)?;
+        let marker_protected_rows = self
+            .reserved_row_bytes
+            .checked_add(replacement_upper)
+            .ok_or(AppendError::Capacity)?;
+        let pair_capacity = usize::try_from(pair_upper).map_err(|_| AppendError::Capacity)?;
+        let replacement_seq = self
+            .session
+            .next_seq
+            .and_then(|seq| seq.get().checked_add(1))
+            .and_then(|seq| EventSeq::new(seq).ok())
+            .ok_or(AppendError::SequenceExhausted)?;
+
+        let SessionMode::Durable {
+            storage: SessionStorage::Active(writer),
+            logical_event_count,
+            accepted_journal_bytes,
+            pending_batch,
+            ..
+        } = &mut self.session.mode
+        else {
+            return Err(AppendError::DurablePoisoned.into());
+        };
+        if writer.ensure_stageable().is_err()
+            || pending_batch.event_count != 0
+            || pending_batch.state != PendingDurableBatchState::Empty
+        {
+            return Err(AppendError::NeedsAppendSettle.into());
+        }
+        let ordinary_event_max = MAX_DURABLE_LOGICAL_EVENTS - DURABLE_REPAIR_RESERVED_EVENTS;
+        if logical_event_count
+            .checked_add(2)
+            .and_then(|count| count.checked_add(reserved_events))
+            .is_none_or(|count| count > ordinary_event_max)
+        {
+            return Err(AppendError::DurableEventLimit {
+                maximum: ordinary_event_max,
+            }
+            .into());
+        }
+        let ordinary_byte_max = MAX_DURABLE_JOURNAL_BYTES - DURABLE_REPAIR_RESERVED_BYTES;
+        if accepted_journal_bytes
+            .checked_add(pair_upper)
+            .and_then(|bytes| bytes.checked_add(self.reserved_row_bytes))
+            .is_none_or(|bytes| bytes > ordinary_byte_max)
+        {
+            return Err(AppendError::DurableByteLimit {
+                maximum: ordinary_byte_max,
+            }
+            .into());
+        }
+        pending_batch
+            .bytes
+            .try_reserve_exact(pair_capacity)
+            .map_err(|_| AppendError::Capacity)?;
+
+        let marker_operation = PendingDurableOperation {
+            prepared: marker,
+            protected_events: marker_protected_events,
+            protected_row_bytes: marker_protected_rows,
+            owner: DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Marker { target }),
+        };
+        let marker = match self.session.try_commit_durable(marker_operation) {
+            DurableAppendAttempt::Committed(receipt) => receipt,
+            DurableAppendAttempt::Failed(error) => return Err(error.into()),
+            DurableAppendAttempt::NeedsStorageSettle(_) => {
+                return Err(AppendError::NeedsAppendSettle.into());
+            }
+        };
+        debug_assert_eq!(
+            marker.seq().get().checked_add(1),
+            Some(replacement_seq.get())
+        );
+
+        let replacement_operation = PendingDurableOperation {
+            prepared: replacement,
+            protected_events: reserved_events,
+            protected_row_bytes: self.reserved_row_bytes,
+            owner: DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Replacement {
+                target,
+                marker_seq: marker.seq(),
+            }),
+        };
+        let replacement = match self.session.try_commit_durable(replacement_operation) {
+            DurableAppendAttempt::Committed(receipt) => receipt,
+            DurableAppendAttempt::Failed(source) => {
+                return Err(PrunePairAppendError::MarkerCommitted { marker, source });
+            }
+            DurableAppendAttempt::NeedsStorageSettle(_) => {
+                let source = AppendError::DurablePoisoned;
+                self.session.remember_barrier_error(source.clone());
+                return Err(PrunePairAppendError::MarkerCommitted { marker, source });
+            }
+        };
+        debug_assert_eq!(replacement.seq(), replacement_seq);
+        Ok(PrunePairReceipt {
+            marker,
+            replacement,
+            outcome,
+        })
+    }
+
     /// Synchronize all committed facts while retaining the reservation and
     /// its protected closure capacity.
     pub(crate) async fn flush_barrier(&mut self) -> Result<(), BarrierError> {
@@ -2312,6 +2935,14 @@ fn map_journal_append_error(error: JournalError) -> AppendError {
         | JournalError::NothingStaged
         | JournalError::AlreadyStaged
         | JournalError::FlightInProgress => AppendError::DurableWriter,
+    }
+}
+
+fn map_journal_read_error(error: JournalReadError) -> SessionReadError {
+    match error {
+        JournalReadError::NotDurable => SessionReadError::Corrupt,
+        JournalReadError::Cancelled => SessionReadError::Cancelled,
+        JournalReadError::Writer(error) => SessionReadError::Storage(StoreError::from(error)),
     }
 }
 

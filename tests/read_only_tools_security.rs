@@ -19,8 +19,9 @@ use deepseek_harness_cli::{
         Message, MessageSource, NonNegativeSafeInteger, StreamChunk,
     },
     provider::{
-        ModelProvider, PreparedProviderCall, ProviderPrepareError, ProviderRequest, ProviderStream,
-        RetryBackoff, RetryPolicy,
+        ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
+        ProviderPrepareError, ProviderRequest, ProviderRequestDraft, ProviderStream, RetryBackoff,
+        RetryPolicy,
     },
     session::{EventKind, Session, TurnEndReason},
     tools::ReadOnlyToolRegistry,
@@ -122,6 +123,14 @@ impl ModelProvider for ScriptedProvider {
             )
             .expect("the fixed retry policy is valid"),
         ))
+    }
+
+    fn preflight_request(
+        &self,
+        draft: ProviderRequestDraft<'_>,
+    ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
+        let prepared = self.prepare_call(draft.config().clone())?;
+        draft.finish(prepared, 1)
     }
 
     fn stream(

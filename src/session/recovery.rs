@@ -20,6 +20,7 @@ use super::{
     StoreError, SurfaceIntent, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, ToolFailure,
     TransitionError, TurnEndReason, UnixMillis,
     codec::{decode_event, kind_data_value},
+    journal_row::JournalRowLocator,
     jsonl::{MAX_JOURNAL_EVENT_LINE_BYTES, MAX_JOURNAL_HEADER_LINE_BYTES},
     projection::{Projection, RecoveryApproval, ValidationPolicy},
 };
@@ -53,15 +54,27 @@ pub(crate) struct RecoveryPlan {
 /// hatch for an arbitrary event.
 pub(super) struct RecoveryAdmission<'a> {
     event: &'a SessionEvent,
+    row: Option<JournalRowLocator>,
 }
 
 impl<'a> RecoveryAdmission<'a> {
     fn new(event: &'a SessionEvent) -> Self {
-        Self { event }
+        Self { event, row: None }
+    }
+
+    fn new_scanned(event: &'a SessionEvent, row: JournalRowLocator) -> Self {
+        Self {
+            event,
+            row: Some(row),
+        }
     }
 
     pub(super) fn event(&self) -> &'a SessionEvent {
         self.event
+    }
+
+    pub(super) fn row(&self) -> Option<JournalRowLocator> {
+        self.row
     }
 }
 
@@ -78,6 +91,7 @@ struct ColdEventContext<'a> {
     previous_time: Option<UnixMillis>,
     logical_events: u64,
     previous_ends_with_seed: bool,
+    row: JournalRowLocator,
 }
 
 /// Compact, non-secret description of an interrupted basic compaction bracket.
@@ -804,6 +818,11 @@ pub(crate) fn scan_jsonl_validating_header(
                             start = end;
                             continue;
                         }
+                        let row_offset = line_end
+                            .checked_sub(u64::try_from(line.len()).map_err(|_| StoreError::Limit)?)
+                            .ok_or(StoreError::Corrupt)?;
+                        let row = JournalRowLocator::new(event.seq(), row_offset, &line)
+                            .ok_or(StoreError::Corrupt)?;
                         apply_cold_event(
                             &mut projection,
                             &event,
@@ -813,6 +832,7 @@ pub(crate) fn scan_jsonl_validating_header(
                                 previous_time: last_event_time,
                                 logical_events,
                                 previous_ends_with_seed: ends_with_seed,
+                                row,
                             },
                             &mut recovery_cursor,
                         )?;
@@ -887,7 +907,7 @@ fn apply_cold_event(
             context.logical_events,
         )? {
             projection
-                .apply_recovery_admission(RecoveryAdmission::new(event))
+                .apply_recovery_admission(RecoveryAdmission::new_scanned(event, context.row))
                 .map_err(|_| StoreError::Corrupt)?;
             if matches!(event.kind(), EventKind::EndSeed) {
                 *recovery_cursor = None;
@@ -909,7 +929,7 @@ fn apply_cold_event(
         // path. In particular, do not give a reserved recovery result a second
         // chance with `event.seq() - 1` as a fresh anchor: that would let two
         // separately forged repair prefixes be stitched together.
-        return match projection.apply_scanned_event(event) {
+        return match projection.apply_scanned_row(event, context.row) {
             Ok(()) => {
                 *recovery_cursor = None;
                 Ok(())
@@ -935,7 +955,7 @@ fn apply_cold_event(
         )?
     {
         projection
-            .apply_scanned_event(event)
+            .apply_scanned_row(event, context.row)
             .map_err(|_| StoreError::Corrupt)?;
         *recovery_cursor = Some(RecoveryCursor {
             root_last_real_seq,
@@ -944,7 +964,7 @@ fn apply_cold_event(
         return Ok(());
     }
 
-    match projection.apply_scanned_event(event) {
+    match projection.apply_scanned_row(event, context.row) {
         Ok(()) => Ok(()),
         Err(EventValidationError::Transition(
             TransitionError::DurableRecoveryEventNotAllowed { .. },
@@ -961,7 +981,7 @@ fn apply_cold_event(
                 return Err(StoreError::Corrupt);
             }
             projection
-                .apply_recovery_admission(RecoveryAdmission::new(event))
+                .apply_recovery_admission(RecoveryAdmission::new_scanned(event, context.row))
                 .map_err(|_| StoreError::Corrupt)?;
             if !matches!(event.kind(), EventKind::EndSeed) {
                 *recovery_cursor = Some(RecoveryCursor {

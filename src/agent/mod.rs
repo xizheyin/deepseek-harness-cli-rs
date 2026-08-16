@@ -27,14 +27,17 @@ use crate::{
         CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
         LlmFailure, Message, MessageRole, MessageSource, StreamChunkKind, ToolSchema,
     },
-    provider::{ModelProvider, ProviderRequest, RetryMode, StreamValidator},
+    provider::{
+        ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
+        ProviderRequest, ProviderRequestDraft, ProviderRequestError, RetryMode, StreamValidator,
+    },
     session::{
         AppendError, AppendReceipt, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome,
         ApprovalRequestId, BarrierError, ClaimedAppend, EpochHeader, EventClaim, EventKind,
         EventSeq, LlmRetryEvent, LlmRetryStartedEvent, NewEvent, RequestContext,
-        RequestHeaderReason, RetryId, RetryNumber, Session, SessionReservation, StepId,
-        SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, TurnEndCancelCause, TurnEndReason,
-        TurnId,
+        RequestHeaderReason, RetryId, RetryNumber, Session, SessionReadError, SessionReservation,
+        StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause,
+        TurnEndCancelCause, TurnEndReason, TurnId,
     },
 };
 
@@ -820,6 +823,104 @@ enum StepOutcome {
     Error(LlmFailure),
 }
 
+struct UnstartedStepClaims {
+    start: EventClaim,
+    inputs: Vec<EventClaim>,
+    end: EventClaim,
+}
+
+impl UnstartedStepClaims {
+    fn new(mut claims: Vec<EventClaim>) -> Result<Self, AgentLoopError> {
+        if claims.len() < 2 {
+            return Err(AgentLoopError::Invariant(
+                "step reservation did not return its closure claims",
+            ));
+        }
+        let start = claims.remove(0);
+        let end = claims.pop().ok_or(AgentLoopError::Invariant(
+            "step reservation omitted its end claim",
+        ))?;
+        Ok(Self {
+            start,
+            inputs: claims,
+            end,
+        })
+    }
+
+    async fn enter(
+        mut self,
+        reservation: &mut SessionReservation<'_>,
+    ) -> Result<EventClaim, AgentLoopError> {
+        reservation.settle_exact_settled(&mut self.start).await?;
+        for input in &mut self.inputs {
+            reservation.settle_exact_settled(input).await?;
+        }
+        Ok(self.end)
+    }
+
+    fn release(mut self, reservation: &mut SessionReservation<'_>) -> Result<(), AgentLoopError> {
+        reservation.release(&mut self.start)?;
+        for input in &mut self.inputs {
+            reservation.release(input)?;
+        }
+        reservation.release(&mut self.end)?;
+        Ok(())
+    }
+}
+
+enum AttemptPreparation {
+    Ready(PreflightedRequest),
+    PreparedFailure {
+        prepared: PreparedProviderCall,
+        failure: LlmFailure,
+    },
+    DeferredFailure(LlmFailure),
+    HardLimit {
+        prepared: Option<PreparedProviderCall>,
+    },
+}
+
+enum HardLimitPruneOutcome {
+    Progress,
+    NoProgress,
+    Cancelled,
+    TurnError(LlmFailure),
+}
+
+struct PreflightedRequest {
+    proposed: LlmCallConfig,
+    messages: Vec<Message>,
+    expected_surface_generation: u64,
+    preflight: PreparedRequestPreflight,
+}
+
+impl PreflightedRequest {
+    fn prepared_call(&self) -> &crate::provider::PreparedProviderCall {
+        self.preflight.prepared_call()
+    }
+
+    fn matches_surface(&self, session: &Session) -> bool {
+        session.surface_generation() == self.expected_surface_generation
+            && session.messages_equal(&self.messages)
+    }
+
+    fn into_request(
+        self,
+        session: &Session,
+        config: &AgentLoopConfig,
+    ) -> Result<ProviderRequest, ProviderRequestError> {
+        let mut draft = ProviderRequestDraft::new(&self.proposed, &self.messages)?;
+        if let Some(system) = &config.system {
+            draft = draft.with_system(system)?;
+        }
+        if !config.tools.is_empty() {
+            draft = draft.with_tools(&config.tools)?;
+        }
+        draft = draft.with_session_id(session.id())?;
+        draft.into_request(self.preflight)
+    }
+}
+
 struct StepResolution {
     outcome: StepOutcome,
     latched_turn_stop: ToolActionTurnStop,
@@ -1039,7 +1140,7 @@ async fn run_entered_turn(
             NewEvent::surface(EventKind::user_message(message), SurfaceIntent::append())
         }));
         exact.push(NewEvent::log(EventKind::step_end(turn, step)));
-        let mut claims = match reservation.claim_batch(exact) {
+        let claims = match reservation.claim_batch(exact) {
             Ok(claims) => claims,
             Err(error) if is_budget_error(&error) => {
                 return Ok(TurnEndReason::Error {
@@ -1048,13 +1149,64 @@ async fn run_entered_turn(
             }
             Err(error) => return Err(error.into()),
         };
-        let mut step_start = claims.remove(0);
-        reservation.settle_exact_settled(&mut step_start).await?;
-        for _ in 0..messages.len() {
-            let mut message = claims.remove(0);
-            reservation.settle_exact_settled(&mut message).await?;
-        }
-        let mut step_end = claims.remove(0);
+        let unstarted = UnstartedStepClaims::new(claims)?;
+        let first_preparation = if driver.counters.attempts
+            >= driver.config.limits.max_attempts_per_turn
+        {
+            None
+        } else {
+            let mut preparation =
+                prepare_conversation_request(reservation.session(), driver, messages.as_slice())?;
+            if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                unstarted.release(reservation)?;
+                return Ok(reason);
+            }
+            if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+                let prune_outcome =
+                    prune_hard_limited_request(reservation, driver, cancellation, budget_failure)
+                        .await?;
+                if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                    unstarted.release(reservation)?;
+                    return Ok(reason);
+                }
+                match prune_outcome {
+                    HardLimitPruneOutcome::Progress => {
+                        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                            unstarted.release(reservation)?;
+                            return Ok(reason);
+                        }
+                        preparation = prepare_conversation_request(
+                            reservation.session(),
+                            driver,
+                            messages.as_slice(),
+                        )?;
+                        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                            unstarted.release(reservation)?;
+                            return Ok(reason);
+                        }
+                    }
+                    HardLimitPruneOutcome::Cancelled => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Aborted {
+                            reason: TurnEndCancelCause::User,
+                        });
+                    }
+                    HardLimitPruneOutcome::TurnError(error) => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error { error });
+                    }
+                    HardLimitPruneOutcome::NoProgress => {}
+                }
+                if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+                    unstarted.release(reservation)?;
+                    return Ok(TurnEndReason::Error {
+                        error: context_limit_failure()?,
+                    });
+                }
+            }
+            Some(preparation)
+        };
+        let mut step_end = unstarted.enter(reservation).await?;
         messages.clear();
         driver.counters.steps += 1;
 
@@ -1065,6 +1217,7 @@ async fn run_entered_turn(
             step,
             cancellation,
             budget_failure,
+            first_preparation,
         ))
         .catch_unwind()
         .await
@@ -1123,6 +1276,219 @@ async fn run_entered_turn(
     }
 }
 
+fn pre_step_stop(
+    driver: &Driver<'_>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if driver.durable_limit.is_some() {
+        return Ok(Some(TurnEndReason::Error {
+            error: driver.session_limit_failure.clone(),
+        }));
+    }
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }));
+    }
+    if Instant::now() >= driver.deadline {
+        return Ok(Some(TurnEndReason::Error {
+            error: failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")?,
+        }));
+    }
+    Ok(None)
+}
+
+async fn prune_hard_limited_request(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    cancellation: &CancellationToken,
+    budget_failure: &LlmFailure,
+) -> Result<HardLimitPruneOutcome, AgentLoopError> {
+    let result = reservation.prune_oversized_tool_results(cancellation).await;
+    match result {
+        Ok(report) if report.replacements() > 0 => Ok(HardLimitPruneOutcome::Progress),
+        Ok(_) => Ok(HardLimitPruneOutcome::NoProgress),
+        Err(error) => {
+            let progress = error.progress().replacements() > 0;
+            match error.cause() {
+                ToolResultPrunePassCause::Cancelled
+                | ToolResultPrunePassCause::Read(SessionReadError::Cancelled) => {
+                    Ok(HardLimitPruneOutcome::Cancelled)
+                }
+                ToolResultPrunePassCause::Read(SessionReadError::Storage(error)) => {
+                    Err((*error).into())
+                }
+                ToolResultPrunePassCause::Read(SessionReadError::Corrupt) => {
+                    Err(AppendError::DurablePoisoned.into())
+                }
+                ToolResultPrunePassCause::Barrier(BarrierError::ObserverUnavailable) => {
+                    driver.observer_unavailable = true;
+                    Ok(HardLimitPruneOutcome::TurnError(
+                        observer_unavailable_failure()?,
+                    ))
+                }
+                ToolResultPrunePassCause::Barrier(error) => Err(error.clone().into()),
+                ToolResultPrunePassCause::Read(SessionReadError::Append(error)) => {
+                    classify_prune_append_error(driver, error, budget_failure, progress)
+                }
+                ToolResultPrunePassCause::Pair(error) => {
+                    let source = match error {
+                        crate::session::PrunePairAppendError::BeforeMarker(source)
+                        | crate::session::PrunePairAppendError::MarkerCommitted {
+                            source, ..
+                        } => source,
+                    };
+                    classify_prune_append_error(driver, source, budget_failure, progress)
+                }
+                ToolResultPrunePassCause::Capacity
+                | ToolResultPrunePassCause::Transform(_)
+                | ToolResultPrunePassCause::Read(SessionReadError::Changed) => Ok(if progress {
+                    HardLimitPruneOutcome::Progress
+                } else {
+                    HardLimitPruneOutcome::NoProgress
+                }),
+            }
+        }
+    }
+}
+
+fn classify_prune_append_error(
+    driver: &mut Driver<'_>,
+    error: &AppendError,
+    budget_failure: &LlmFailure,
+    progress: bool,
+) -> Result<HardLimitPruneOutcome, AgentLoopError> {
+    if is_budget_error(error) {
+        return Ok(HardLimitPruneOutcome::TurnError(
+            driver.failure_for_budget(error, budget_failure),
+        ));
+    }
+    let loop_error = AgentLoopError::Session(error.clone());
+    if is_fatal_loop_error(&loop_error) {
+        return Err(loop_error);
+    }
+    Ok(if progress {
+        HardLimitPruneOutcome::Progress
+    } else {
+        HardLimitPruneOutcome::NoProgress
+    })
+}
+
+fn prepare_conversation_request(
+    session: &Session,
+    driver: &Driver<'_>,
+    pending_messages: &[Message],
+) -> Result<AttemptPreparation, AgentLoopError> {
+    let source_surface_generation = session.surface_generation();
+    let pending_generation = u64::try_from(pending_messages.len())
+        .map_err(|_| AgentLoopError::Invariant("pending message count exceeded u64"))?;
+    let expected_surface_generation = source_surface_generation
+        .checked_add(pending_generation)
+        .ok_or(AgentLoopError::Invariant("surface generation exhausted"))?;
+    let proposed = match proposed_config(
+        driver.config,
+        session.request_header(),
+        *driver.request_header_logged,
+    ) {
+        Ok(proposed) => proposed,
+        Err(_) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_INTERNAL",
+                "the agent stopped after an internal failure",
+            )?));
+        }
+    };
+    let messages = match session.try_messages_with(pending_messages) {
+        Ok(messages) => messages,
+        Err(()) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_REQUEST",
+                "model request construction failed",
+            )?));
+        }
+    };
+    let draft = match conversation_request_draft(&proposed, &messages, driver.config, session) {
+        Ok(draft) => draft,
+        Err(error) if is_hard_request_limit(&error) => {
+            return Ok(AttemptPreparation::HardLimit { prepared: None });
+        }
+        Err(error) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_from_display(
+                "AGENT_REQUEST",
+                "model request construction failed",
+                &error,
+            )?));
+        }
+    };
+    let preflight = match catch_unwind(AssertUnwindSafe(|| {
+        driver.provider.preflight_request(draft)
+    })) {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(
+            ProviderPreflightError::WireTooLarge { prepared, .. }
+            | ProviderPreflightError::RequestLimit { prepared },
+        )) => {
+            return Ok(AttemptPreparation::HardLimit {
+                prepared: Some(prepared),
+            });
+        }
+        Ok(Err(ProviderPreflightError::Preparation(error))) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_from_display(
+                "AGENT_PROVIDER_PREPARE",
+                "provider preparation failed",
+                &error,
+            )?));
+        }
+        Ok(Err(ProviderPreflightError::InvalidRequest { failure, prepared })) => {
+            return Ok(AttemptPreparation::PreparedFailure { prepared, failure });
+        }
+        Err(_) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_PROVIDER_PANIC",
+                "the provider panicked while preparing a request",
+            )?));
+        }
+    };
+    Ok(AttemptPreparation::Ready(PreflightedRequest {
+        proposed,
+        messages,
+        expected_surface_generation,
+        preflight,
+    }))
+}
+
+fn conversation_request_draft<'a>(
+    proposed: &'a LlmCallConfig,
+    messages: &'a [Message],
+    config: &'a AgentLoopConfig,
+    session: &'a Session,
+) -> Result<ProviderRequestDraft<'a>, ProviderRequestError> {
+    let mut draft = ProviderRequestDraft::new(proposed, messages)?;
+    if let Some(system) = &config.system {
+        draft = draft.with_system(system)?;
+    }
+    if !config.tools.is_empty() {
+        draft = draft.with_tools(&config.tools)?;
+    }
+    draft.with_session_id(session.id())
+}
+
+fn is_hard_request_limit(error: &ProviderRequestError) -> bool {
+    matches!(
+        error,
+        ProviderRequestError::TooManyMessages { .. }
+            | ProviderRequestError::TooLarge { .. }
+            | ProviderRequestError::SizeOverflow
+    )
+}
+
+fn context_limit_failure() -> Result<LlmFailure, AgentLoopError> {
+    failure_reason(
+        "AGENT_CONTEXT_LIMIT",
+        "the conversation cannot be reduced to fit the model request limits",
+    )
+}
+
 async fn run_step(
     reservation: &mut SessionReservation<'_>,
     driver: &mut Driver<'_>,
@@ -1130,6 +1496,7 @@ async fn run_step(
     step: StepId,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
+    mut first_preparation: Option<AttemptPreparation>,
 ) -> Result<StepResolution, AgentLoopError> {
     let mut retry_chains: BTreeMap<(String, String), (RetryId, usize)> = BTreeMap::new();
     let mut retries_in_step = 0_usize;
@@ -1151,31 +1518,51 @@ async fn run_step(
         }
         driver.counters.attempts += 1;
 
-        let proposed = proposed_config(
-            driver.config,
-            reservation.session().request_header(),
-            *driver.request_header_logged,
-        )?;
-        let prepared =
-            match catch_unwind(AssertUnwindSafe(|| driver.provider.prepare_call(proposed))) {
-                Ok(Ok(prepared)) => prepared,
-                Ok(Err(error)) => {
-                    return Ok(StepResolution::new(StepOutcome::Error(
-                        failure_from_display(
-                            "AGENT_PROVIDER_PREPARE",
-                            "provider preparation failed",
-                            &error,
-                        )?,
-                    )));
-                }
-                Err(_) => {
-                    return Ok(StepResolution::new(StepOutcome::Error(failure_reason(
-                        "AGENT_PROVIDER_PANIC",
-                        "the provider panicked while preparing a request",
-                    )?)));
-                }
-            };
-        let effective_config = prepared.config().clone();
+        let preparation = match first_preparation.take() {
+            Some(preparation) => preparation,
+            None => prepare_conversation_request(reservation.session(), driver, &[])?,
+        };
+        let (
+            preflighted,
+            effective_config,
+            retry_policy,
+            adapter_defaults,
+            context_window,
+            prepared_failure,
+        ) = match preparation {
+            AttemptPreparation::Ready(preflighted) => {
+                let prepared = preflighted.prepared_call();
+                let effective_config = prepared.config().clone();
+                let retry_policy = prepared.retry_policy().clone();
+                let adapter_defaults = prepared.adapter_defaults().clone();
+                let context_window = prepared.context_window();
+                (
+                    Some(preflighted),
+                    effective_config,
+                    retry_policy,
+                    adapter_defaults,
+                    context_window,
+                    None,
+                )
+            }
+            AttemptPreparation::PreparedFailure { prepared, failure } => (
+                None,
+                prepared.config().clone(),
+                prepared.retry_policy().clone(),
+                prepared.adapter_defaults().clone(),
+                prepared.context_window(),
+                Some(failure),
+            ),
+            AttemptPreparation::DeferredFailure(failure) => {
+                return Ok(StepResolution::new(StepOutcome::Error(failure)));
+            }
+            AttemptPreparation::HardLimit { prepared } => {
+                let _context_window = prepared.and_then(|prepared| prepared.context_window());
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    context_limit_failure()?,
+                )));
+            }
+        };
         if !effective_config.max_tokens().is_some_and(|maximum| {
             maximum.get() > 0 && maximum.get() <= driver.config.limits.max_output_tokens_per_request
         }) {
@@ -1184,9 +1571,6 @@ async fn run_step(
                 "the prepared model request exceeds the agent output-token limit",
             )?)));
         }
-        let retry_policy = prepared.retry_policy().clone();
-        let adapter_defaults = prepared.adapter_defaults().clone();
-        let context_window = prepared.context_window();
         let header = EpochHeader {
             config: effective_config.clone(),
             adapter_defaults: Some(adapter_defaults),
@@ -1252,17 +1636,19 @@ async fn run_step(
             }
         }
 
-        let request_result = (|| {
-            let mut request = ProviderRequest::new(prepared, reservation.session().messages())?;
-            if let Some(system) = &driver.config.system {
-                request = request.with_system(system.clone())?;
-            }
-            if !driver.config.tools.is_empty() {
-                request = request.with_tools(driver.config.tools.clone())?;
-            }
-            request.with_session_id(reservation.session().id().clone())
-        })();
-        let request = match request_result {
+        if let Some(failure) = prepared_failure {
+            return Ok(StepResolution::new(StepOutcome::Error(failure)));
+        }
+        let preflighted = preflighted.ok_or(AgentLoopError::Invariant(
+            "a prepared request disappeared before dispatch",
+        ))?;
+
+        if !preflighted.matches_surface(reservation.session()) {
+            return Err(AgentLoopError::Invariant(
+                "model-visible surface changed after provider preflight",
+            ));
+        }
+        let request = match preflighted.into_request(reservation.session(), driver.config) {
             Ok(request) => request,
             Err(error) => {
                 return Ok(StepResolution::new(StepOutcome::Error(
