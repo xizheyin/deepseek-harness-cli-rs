@@ -72,7 +72,7 @@ pub(crate) use tool_result_pruner::{
 
 use crate::{
     model::{JsonValue, Message, NonNegativeSafeInteger, StreamChunk},
-    resident_credit::{ChargedBytes, ChargedBytesError, ResidentCreditPool},
+    resident_credit::{ChargedBytes, ChargedBytesError, ResidentCreditLease, ResidentCreditPool},
 };
 
 use self::{
@@ -88,21 +88,24 @@ use self::{
     tool_result_pruner::masked_data_sha256,
 };
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct PreparedEvent {
     event: NewEvent,
     original_data: JsonValue,
     retained_json_bytes: usize,
+    resident_credit: Option<ResidentCreditLease>,
 }
 
 impl PreparedEvent {
     /// Memory-mode reservations retain their fallback while a synchronous
     /// candidate is tested. Durable paths must move the original instead.
     fn clone_for_memory_mode(&self) -> Self {
+        debug_assert!(self.resident_credit.is_none());
         Self {
             event: self.event.clone(),
             original_data: self.original_data.clone(),
             retained_json_bytes: self.retained_json_bytes,
+            resident_credit: None,
         }
     }
 }
@@ -145,6 +148,7 @@ impl Default for PendingDurableBatch {
 
 struct PendingDurableOperation {
     prepared: PreparedEvent,
+    reserved_row: Option<ChargedBytes>,
     protected_events: u64,
     protected_row_bytes: u64,
     owner: DurableOperationOwner,
@@ -246,6 +250,9 @@ enum PendingAppendOutcome {
 
 struct PendingDurableCommit {
     retained_json_bytes: usize,
+    resident_credit: Option<ResidentCreditLease>,
+    reserved_row: Option<ChargedBytes>,
+    encoded_row: Option<ChargedEventLineTemplate>,
     protected_events: u64,
     protected_row_bytes: u64,
     owner: DurableOperationOwner,
@@ -254,12 +261,18 @@ struct PendingDurableCommit {
 impl PendingDurableCommit {
     fn into_operation(self, event: SessionEvent) -> PendingDurableOperation {
         let (event, original_data) = event.into_new();
+        let reserved_row = self.reserved_row.or_else(|| {
+            self.encoded_row
+                .map(ChargedEventLineTemplate::into_empty_reserved)
+        });
         PendingDurableOperation {
             prepared: PreparedEvent {
                 event,
                 original_data,
                 retained_json_bytes: self.retained_json_bytes,
+                resident_credit: self.resident_credit,
             },
+            reserved_row,
             protected_events: self.protected_events,
             protected_row_bytes: self.protected_row_bytes,
             owner: self.owner,
@@ -489,11 +502,26 @@ pub struct EventClaim {
     reserved_row_bytes: u64,
 }
 
+struct ClaimFallback {
+    prepared: PreparedEvent,
+    reserved_row: Option<ChargedBytes>,
+}
+
+impl std::fmt::Debug for ClaimFallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClaimFallback")
+            .field("prepared", &self.prepared)
+            .field("has_reserved_row", &self.reserved_row.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 enum EventClaimState {
-    Ready(PreparedEvent),
+    Ready(ClaimFallback),
     PendingFallback,
-    PendingPreferred(PreparedEvent),
+    PendingPreferred(ClaimFallback),
     Settled,
 }
 
@@ -523,7 +551,7 @@ struct ClaimBookkeeping {
 }
 
 impl EventClaim {
-    fn ready_fallback(&self) -> Result<&PreparedEvent, AppendError> {
+    fn ready_fallback_bundle(&self) -> Result<&ClaimFallback, AppendError> {
         match &self.state {
             EventClaimState::Ready(fallback) => Ok(fallback),
             EventClaimState::PendingFallback
@@ -532,7 +560,7 @@ impl EventClaim {
         }
     }
 
-    fn ready_fallback_mut(&mut self) -> Result<&mut PreparedEvent, AppendError> {
+    fn ready_fallback_bundle_mut(&mut self) -> Result<&mut ClaimFallback, AppendError> {
         match &mut self.state {
             EventClaimState::Ready(fallback) => Ok(fallback),
             EventClaimState::PendingFallback
@@ -541,7 +569,15 @@ impl EventClaim {
         }
     }
 
-    fn begin_fallback_pending(&mut self) -> Result<PreparedEvent, AppendError> {
+    fn ready_fallback(&self) -> Result<&PreparedEvent, AppendError> {
+        Ok(&self.ready_fallback_bundle()?.prepared)
+    }
+
+    fn ready_fallback_mut(&mut self) -> Result<&mut PreparedEvent, AppendError> {
+        Ok(&mut self.ready_fallback_bundle_mut()?.prepared)
+    }
+
+    fn begin_fallback_pending(&mut self) -> Result<ClaimFallback, AppendError> {
         let state = std::mem::replace(&mut self.state, EventClaimState::Settled);
         match state {
             EventClaimState::Ready(fallback) => {
@@ -569,18 +605,43 @@ impl EventClaim {
         }
     }
 
+    fn begin_preferred_only_pending(&mut self) -> Result<ChargedBytes, AppendError> {
+        let state = std::mem::replace(&mut self.state, EventClaimState::Settled);
+        match state {
+            EventClaimState::Ready(mut fallback) => {
+                let Some(reserved_row) = fallback.reserved_row.take() else {
+                    self.state = EventClaimState::Ready(fallback);
+                    return Err(AppendError::InvalidClaim);
+                };
+                self.state = EventClaimState::PendingPreferred(fallback);
+                Ok(reserved_row)
+            }
+            other => {
+                self.state = other;
+                Err(AppendError::InvalidClaim)
+            }
+        }
+    }
+
     fn restore_rejected(
         &mut self,
         prepared: PreparedEvent,
+        reserved_row: Option<ChargedBytes>,
         operation_owned_fallback: bool,
     ) -> Result<(), AppendError> {
         let state = std::mem::replace(&mut self.state, EventClaimState::Settled);
         match (state, operation_owned_fallback) {
             (EventClaimState::PendingFallback, true) => {
-                self.state = EventClaimState::Ready(prepared);
+                self.state = EventClaimState::Ready(ClaimFallback {
+                    prepared,
+                    reserved_row,
+                });
                 Ok(())
             }
-            (EventClaimState::PendingPreferred(fallback), false) => {
+            (EventClaimState::PendingPreferred(mut fallback), false) => {
+                if fallback.reserved_row.is_none() {
+                    fallback.reserved_row = reserved_row;
+                }
                 self.state = EventClaimState::Ready(fallback);
                 Ok(())
             }
@@ -936,6 +997,7 @@ impl Session {
         if self.has_pending_durable_operation() {
             return Err(AppendError::NeedsAppendSettle);
         }
+        let prepared = self.charge_prepared_event(prepared)?;
         let SessionMode::Durable {
             pending_operation, ..
         } = &mut self.mode
@@ -944,6 +1006,7 @@ impl Session {
         };
         *pending_operation = Some(PendingDurableOperation {
             prepared,
+            reserved_row: None,
             protected_events,
             protected_row_bytes,
             owner: DurableOperationOwner::Ordinary,
@@ -1466,6 +1529,7 @@ impl Session {
         };
         let PendingDurableOperation {
             prepared,
+            reserved_row,
             protected_events,
             protected_row_bytes,
             owner,
@@ -1474,9 +1538,13 @@ impl Session {
             event: new_event,
             original_data,
             retained_json_bytes,
+            resident_credit,
         } = prepared;
-        let commit = PendingDurableCommit {
+        let mut commit = PendingDurableCommit {
             retained_json_bytes,
+            resident_credit,
+            reserved_row,
+            encoded_row: None,
             protected_events,
             protected_row_bytes,
             owner,
@@ -1494,7 +1562,9 @@ impl Session {
                             event: new_event,
                             original_data,
                             retained_json_bytes: commit.retained_json_bytes,
+                            resident_credit: commit.resident_credit,
                         },
+                        reserved_row: commit.reserved_row,
                         protected_events: commit.protected_events,
                         protected_row_bytes: commit.protected_row_bytes,
                         owner: commit.owner,
@@ -1541,24 +1611,49 @@ impl Session {
             Some(pool) => pool,
             None => return commit.reject(event, AppendError::DurablePoisoned),
         };
-        let row_template = match ChargedEventLineTemplate::new(&event, resident_pool) {
-            Ok(template) => template,
-            Err(ChargedEventLineError::Resident(error)) => {
-                return commit.reject(
-                    event,
-                    AppendError::DurableResidentLimit {
-                        maximum: error.maximum(),
-                    },
-                );
-            }
-            Err(ChargedEventLineError::Capacity) => {
-                return commit.reject(event, AppendError::Capacity);
-            }
-            Err(ChargedEventLineError::Encode) => {
-                return commit.reject(event, AppendError::DurableRecord);
-            }
-        };
-        let row_template_len = row_template.encoded_len();
+        if commit.encoded_row.is_none() {
+            let encoded = match commit.reserved_row.take() {
+                Some(bytes) => match ChargedEventLineTemplate::in_reserved(&event, bytes) {
+                    Ok(template) => template,
+                    Err((error, bytes)) => {
+                        commit.reserved_row = Some(bytes);
+                        let error = match error {
+                            ChargedEventLineError::Resident(error) => {
+                                AppendError::DurableResidentLimit {
+                                    maximum: error.maximum(),
+                                }
+                            }
+                            ChargedEventLineError::Capacity => AppendError::Capacity,
+                            ChargedEventLineError::Encode => AppendError::DurableRecord,
+                        };
+                        return commit.reject(event, error);
+                    }
+                },
+                None => match ChargedEventLineTemplate::new(&event, resident_pool) {
+                    Ok(template) => template,
+                    Err(ChargedEventLineError::Resident(error)) => {
+                        return commit.reject(
+                            event,
+                            AppendError::DurableResidentLimit {
+                                maximum: error.maximum(),
+                            },
+                        );
+                    }
+                    Err(ChargedEventLineError::Capacity) => {
+                        return commit.reject(event, AppendError::Capacity);
+                    }
+                    Err(ChargedEventLineError::Encode) => {
+                        return commit.reject(event, AppendError::DurableRecord);
+                    }
+                },
+            };
+            commit.encoded_row = Some(encoded);
+        }
+        let row_template_len = commit
+            .encoded_row
+            .as_ref()
+            .expect("a charged row was installed before the clock boundary")
+            .encoded_len();
         let row_bytes = match u64::try_from(row_template_len) {
             Ok(bytes) => bytes,
             Err(_) => return commit.reject(event, AppendError::DurableRecord),
@@ -1617,6 +1712,10 @@ impl Session {
             );
         };
         event.set_time_for_commit(time);
+        let row_template = commit
+            .encoded_row
+            .take()
+            .expect("the validated row remains owned through the clock boundary");
         let row = row_template.finish(timestamp);
         let Some(row_locator) = JournalRowLocator::new(seq, row_offset, &row) else {
             if let SessionMode::Durable { storage, .. } = &mut self.mode {
@@ -2144,7 +2243,37 @@ impl Session {
             event,
             original_data,
             retained_json_bytes,
+            resident_credit: None,
         })
+    }
+
+    /// Charge the independently retained raw JSON tree before a durable
+    /// operation can own the candidate across an await. Typed event payloads
+    /// and attempt-retained values join this same owner in later Phase 8
+    /// slices; keeping this lease on `PreparedEvent` already makes rejection
+    /// and cancellation transfer the exact raw allocation without recharging.
+    fn charge_prepared_event(
+        &self,
+        mut prepared: PreparedEvent,
+    ) -> Result<PreparedEvent, AppendError> {
+        if !matches!(self.mode, SessionMode::Durable { .. }) {
+            return Ok(prepared);
+        }
+        if let Some(credit) = &prepared.resident_credit {
+            debug_assert_eq!(credit.bytes(), prepared.original_data.resident_bytes());
+            return Ok(prepared);
+        }
+        let pool = self
+            .resident_pool
+            .as_ref()
+            .ok_or(AppendError::DurablePoisoned)?;
+        let credit = pool
+            .try_acquire(prepared.original_data.resident_bytes())
+            .map_err(|error| AppendError::DurableResidentLimit {
+                maximum: error.maximum(),
+            })?;
+        prepared.resident_credit = Some(credit);
+        Ok(prepared)
     }
 
     fn prepare_original_data(kind: &EventKind) -> Result<JsonValue, AppendError> {
@@ -2178,6 +2307,7 @@ impl Session {
             event: NewEvent::surface(kind, SurfaceIntent::replace(target, target, vec![target])),
             original_data,
             retained_json_bytes,
+            resident_credit: None,
         })
     }
 
@@ -2414,6 +2544,7 @@ impl Session {
             event,
             original_data,
             retained_json_bytes,
+            resident_credit,
         } = prepared;
         let candidate = SessionEvent::from_new(seq, time, event, original_data);
         self.projection.with_event(&candidate)?;
@@ -2422,6 +2553,7 @@ impl Session {
             event,
             original_data,
             retained_json_bytes,
+            resident_credit,
         })
     }
 
@@ -2641,7 +2773,7 @@ impl SessionReservation<'_> {
                 return Err(AppendError::NeedsAppendSettle);
             }
         }
-        let prepared = fallbacks
+        let mut prepared = fallbacks
             .into_iter()
             .map(Session::prepare_event)
             .collect::<Result<Vec<_>, _>>()?;
@@ -2759,12 +2891,53 @@ impl SessionReservation<'_> {
             }
         }
 
+        if matches!(&self.session.mode, SessionMode::Durable { .. }) {
+            let mut charged = Vec::new();
+            charged
+                .try_reserve(prepared.len())
+                .map_err(|_| AppendError::Capacity)?;
+            for fallback in prepared {
+                charged.push(self.session.charge_prepared_event(fallback)?);
+            }
+            prepared = charged;
+        }
+
+        let reserved_rows = if matches!(&self.session.mode, SessionMode::Durable { .. }) {
+            let pool = self
+                .session
+                .resident_pool
+                .as_ref()
+                .ok_or(AppendError::DurablePoisoned)?;
+            let mut rows = Vec::new();
+            rows.try_reserve(added_events)
+                .map_err(|_| AppendError::Capacity)?;
+            for row_bytes in &row_bytes {
+                let capacity = usize::try_from(*row_bytes).map_err(|_| AppendError::Capacity)?;
+                let row =
+                    ChargedBytes::try_with_capacity(capacity, pool).map_err(
+                        |error| match error {
+                            ChargedBytesError::Limit(error) => AppendError::DurableResidentLimit {
+                                maximum: error.maximum(),
+                            },
+                            ChargedBytesError::Capacity => AppendError::Capacity,
+                        },
+                    )?;
+                rows.push(Some(row));
+            }
+            rows
+        } else {
+            std::iter::repeat_with(|| None).take(added_events).collect()
+        };
+
         let mut claims = Vec::new();
         claims
             .try_reserve(added_events)
             .map_err(|_| AppendError::Capacity)?;
-        for (index, (fallback, reserved_row_bytes)) in
-            prepared.into_iter().zip(row_bytes).enumerate()
+        for (index, ((fallback, reserved_row_bytes), reserved_row)) in prepared
+            .into_iter()
+            .zip(row_bytes)
+            .zip(reserved_rows)
+            .enumerate()
         {
             let token = first_claim_token
                 .checked_add(u64::try_from(index).map_err(|_| AppendError::SequenceExhausted)?)
@@ -2775,7 +2948,10 @@ impl SessionReservation<'_> {
                 fallback_identity: ClaimFallbackIdentity::from_prepared(&fallback),
                 reserved_retained_json_bytes: fallback.retained_json_bytes,
                 reserved_row_bytes,
-                state: EventClaimState::Ready(fallback),
+                state: EventClaimState::Ready(ClaimFallback {
+                    prepared: fallback,
+                    reserved_row,
+                }),
             });
         }
         self.reserved_events = next_reserved_events;
@@ -2824,7 +3000,10 @@ impl SessionReservation<'_> {
             ClaimOperationKind::Fallback | ClaimOperationKind::Exact
         );
         let PendingDurableOperation {
-            prepared, owner, ..
+            prepared,
+            reserved_row,
+            owner,
+            ..
         } = operation;
         match owner {
             DurableOperationOwner::Claim {
@@ -2835,7 +3014,7 @@ impl SessionReservation<'_> {
                 && token == claim.token
                 && kind == expected_kind =>
             {
-                claim.restore_rejected(prepared, operation_owned_fallback)
+                claim.restore_rejected(prepared, reserved_row, operation_owned_fallback)
             }
             _ => Err(AppendError::InvalidClaim),
         }
@@ -2849,7 +3028,10 @@ impl SessionReservation<'_> {
         operation: PendingDurableOperation,
     ) -> Result<(), AppendError> {
         let PendingDurableOperation {
-            prepared, owner, ..
+            prepared,
+            reserved_row,
+            owner,
+            ..
         } = operation;
         match owner {
             DurableOperationOwner::Attempt {
@@ -2869,7 +3051,7 @@ impl SessionReservation<'_> {
                 && Arc::ptr_eq(&claim_reservation, &self.owner)
                 && claim_token == claim.token =>
             {
-                claim.restore_rejected(prepared, true)
+                claim.restore_rejected(prepared, reserved_row, true)
             }
             _ => Err(AppendError::InvalidClaim),
         }
@@ -3008,7 +3190,9 @@ impl SessionReservation<'_> {
                 .ok_or(AppendError::DurableWriter);
         }
         self.session.ensure_durable_active()?;
-        let prepared = Session::prepare_event(event)?;
+        let prepared = self
+            .session
+            .charge_prepared_event(Session::prepare_event(event)?)?;
         let protected_events =
             u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
         let SessionMode::Durable {
@@ -3019,6 +3203,7 @@ impl SessionReservation<'_> {
         };
         *pending_operation = Some(PendingDurableOperation {
             prepared,
+            reserved_row: None,
             protected_events,
             protected_row_bytes: self.reserved_row_bytes,
             owner: DurableOperationOwner::Attempt {
@@ -3083,7 +3268,9 @@ impl SessionReservation<'_> {
             return Ok(receipt);
         }
         self.session.ensure_durable_active()?;
-        let prepared = Session::prepare_event(event)?;
+        let prepared = self
+            .session
+            .charge_prepared_event(Session::prepare_event(event)?)?;
         let protected_events =
             u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
         let SessionMode::Durable {
@@ -3094,6 +3281,7 @@ impl SessionReservation<'_> {
         };
         *pending_operation = Some(PendingDurableOperation {
             prepared,
+            reserved_row: None,
             protected_events,
             protected_row_bytes: self.reserved_row_bytes,
             owner: DurableOperationOwner::Attempt {
@@ -3162,9 +3350,13 @@ impl SessionReservation<'_> {
 
         let protected_events = u64::try_from(bookkeeping.reserved_events)
             .map_err(|_| AppendError::SequenceExhausted)?;
-        let prepared = claim.begin_fallback_pending()?;
+        let ClaimFallback {
+            prepared,
+            reserved_row,
+        } = claim.begin_fallback_pending()?;
         let operation = PendingDurableOperation {
             prepared,
+            reserved_row,
             protected_events,
             protected_row_bytes: bookkeeping.reserved_row_bytes,
             owner: DurableOperationOwner::Attempt {
@@ -3355,24 +3547,50 @@ impl SessionReservation<'_> {
         // effect must fit inside the claim's own pre-reserved ceiling.
         let protected_events = u64::try_from(bookkeeping.reserved_events)
             .map_err(|_| AppendError::SequenceExhausted)?;
-        let preferred_fits = Session::durable_row_upper_bound(&preferred).is_ok_and(|row_bytes| {
-            self.session.durable_candidate_fits(
-                row_bytes,
-                protected_events,
-                bookkeeping.reserved_row_bytes,
-            )
-        });
-        let (selected, kind) = if preferred_fits {
-            claim.begin_preferred_pending()?;
-            (preferred, ClaimOperationKind::Preferred)
+        let preferred_row = Session::durable_row_upper_bound(&preferred)
+            .ok()
+            .filter(|row_bytes| {
+                self.session.durable_candidate_fits(
+                    *row_bytes,
+                    protected_events,
+                    bookkeeping.reserved_row_bytes,
+                )
+            });
+        let preferred = if let Some(preferred_row) = preferred_row {
+            match self.session.charge_prepared_event(preferred) {
+                Ok(preferred) => {
+                    let capacity =
+                        usize::try_from(preferred_row).map_err(|_| AppendError::Capacity)?;
+                    let pool = self
+                        .session
+                        .resident_pool
+                        .as_ref()
+                        .ok_or(AppendError::DurablePoisoned)?;
+                    match ChargedBytes::try_with_capacity(capacity, pool) {
+                        Ok(row) => Some((preferred, row)),
+                        Err(ChargedBytesError::Limit(_)) => None,
+                        Err(ChargedBytesError::Capacity) => return Err(AppendError::Capacity),
+                    }
+                }
+                Err(AppendError::DurableResidentLimit { .. }) => None,
+                Err(error) => return Err(error),
+            }
         } else {
-            (
-                claim.begin_fallback_pending()?,
-                ClaimOperationKind::Fallback,
-            )
+            None
+        };
+        let (selected, reserved_row, kind) = if let Some((preferred, reserved_row)) = preferred {
+            claim.begin_preferred_pending()?;
+            (preferred, Some(reserved_row), ClaimOperationKind::Preferred)
+        } else {
+            let ClaimFallback {
+                prepared,
+                reserved_row,
+            } = claim.begin_fallback_pending()?;
+            (prepared, reserved_row, ClaimOperationKind::Fallback)
         };
         let operation = PendingDurableOperation {
             prepared: selected,
+            reserved_row,
             protected_events,
             protected_row_bytes: bookkeeping.reserved_row_bytes,
             owner: DurableOperationOwner::Claim {
@@ -3436,9 +3654,13 @@ impl SessionReservation<'_> {
         let protected_events = u64::try_from(bookkeeping.reserved_events)
             .map_err(|_| AppendError::SequenceExhausted)?;
         let kind = ClaimOperationKind::Exact;
-        let prepared = claim.begin_fallback_pending()?;
+        let ClaimFallback {
+            prepared,
+            reserved_row,
+        } = claim.begin_fallback_pending()?;
         let operation = PendingDurableOperation {
             prepared,
+            reserved_row,
             protected_events,
             protected_row_bytes: bookkeeping.reserved_row_bytes,
             owner: DurableOperationOwner::Claim {
@@ -3769,44 +3991,48 @@ impl SessionReservation<'_> {
             .and_then(|seq| EventSeq::new(seq).ok())
             .ok_or(AppendError::SequenceExhausted)?;
 
-        let SessionMode::Durable {
-            storage: SessionStorage::Active(writer),
-            logical_event_count,
-            accepted_journal_bytes,
-            pending_batch,
-            ..
-        } = &mut self.session.mode
-        else {
-            return Err(AppendError::DurablePoisoned.into());
-        };
-        if writer.ensure_stageable().is_err()
-            || pending_batch.event_count != 0
-            || pending_batch.state != PendingDurableBatchState::Empty
         {
-            return Err(AppendError::NeedsAppendSettle.into());
-        }
-        let ordinary_event_max = MAX_DURABLE_LOGICAL_EVENTS - DURABLE_REPAIR_RESERVED_EVENTS;
-        if logical_event_count
-            .checked_add(2)
-            .and_then(|count| count.checked_add(reserved_events))
-            .is_none_or(|count| count > ordinary_event_max)
-        {
-            return Err(AppendError::DurableEventLimit {
-                maximum: ordinary_event_max,
+            let SessionMode::Durable {
+                storage: SessionStorage::Active(writer),
+                logical_event_count,
+                accepted_journal_bytes,
+                pending_batch,
+                ..
+            } = &self.session.mode
+            else {
+                return Err(AppendError::DurablePoisoned.into());
+            };
+            if writer.ensure_stageable().is_err()
+                || pending_batch.event_count != 0
+                || pending_batch.state != PendingDurableBatchState::Empty
+            {
+                return Err(AppendError::NeedsAppendSettle.into());
             }
-            .into());
-        }
-        let ordinary_byte_max = MAX_DURABLE_JOURNAL_BYTES - DURABLE_REPAIR_RESERVED_BYTES;
-        if accepted_journal_bytes
-            .checked_add(pair_upper)
-            .and_then(|bytes| bytes.checked_add(self.reserved_row_bytes))
-            .is_none_or(|bytes| bytes > ordinary_byte_max)
-        {
-            return Err(AppendError::DurableByteLimit {
-                maximum: ordinary_byte_max,
+            let ordinary_event_max = MAX_DURABLE_LOGICAL_EVENTS - DURABLE_REPAIR_RESERVED_EVENTS;
+            if logical_event_count
+                .checked_add(2)
+                .and_then(|count| count.checked_add(reserved_events))
+                .is_none_or(|count| count > ordinary_event_max)
+            {
+                return Err(AppendError::DurableEventLimit {
+                    maximum: ordinary_event_max,
+                }
+                .into());
             }
-            .into());
+            let ordinary_byte_max = MAX_DURABLE_JOURNAL_BYTES - DURABLE_REPAIR_RESERVED_BYTES;
+            if accepted_journal_bytes
+                .checked_add(pair_upper)
+                .and_then(|bytes| bytes.checked_add(self.reserved_row_bytes))
+                .is_none_or(|bytes| bytes > ordinary_byte_max)
+            {
+                return Err(AppendError::DurableByteLimit {
+                    maximum: ordinary_byte_max,
+                }
+                .into());
+            }
         }
+        let replacement = self.session.charge_prepared_event(replacement)?;
+        let marker = self.session.charge_prepared_event(marker)?;
         let pair_bytes =
             ChargedBytes::try_with_capacity(pair_capacity, &resident_pool).map_err(|error| {
                 match error {
@@ -3816,6 +4042,9 @@ impl SessionReservation<'_> {
                     ChargedBytesError::Capacity => AppendError::Capacity,
                 }
             })?;
+        let SessionMode::Durable { pending_batch, .. } = &mut self.session.mode else {
+            return Err(AppendError::DurablePoisoned.into());
+        };
         pending_batch.bytes = Some(pair_bytes);
 
         let marker_owner = match overflow_attempt {
@@ -3829,6 +4058,7 @@ impl SessionReservation<'_> {
         };
         let marker_operation = PendingDurableOperation {
             prepared: marker,
+            reserved_row: None,
             protected_events: marker_protected_events,
             protected_row_bytes: marker_protected_rows,
             owner: marker_owner,
@@ -3867,6 +4097,7 @@ impl SessionReservation<'_> {
 
         let replacement_operation = PendingDurableOperation {
             prepared: replacement,
+            reserved_row: None,
             protected_events: reserved_events,
             protected_row_bytes: self.reserved_row_bytes,
             owner: DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Replacement {
@@ -3948,6 +4179,7 @@ impl SessionReservation<'_> {
                     maximum: MAX_SESSION_RETAINED_JSON_BYTES,
                     reserved: usize::MAX,
                 })?;
+        let mut durable_row_update = None;
         match &self.session.mode {
             SessionMode::Memory {
                 retained_json_bytes,
@@ -4004,9 +4236,43 @@ impl SessionReservation<'_> {
                         maximum: ordinary_max,
                     });
                 }
-                claim.reserved_row_bytes = next_claim_row;
-                self.reserved_row_bytes = next_reserved_rows;
+                let next_capacity =
+                    usize::try_from(next_claim_row).map_err(|_| AppendError::Capacity)?;
+                let fallback = claim.ready_fallback_bundle()?;
+                let current_row = fallback
+                    .reserved_row
+                    .as_ref()
+                    .ok_or(AppendError::InvalidClaim)?;
+                let replacement = if current_row.capacity() >= next_capacity {
+                    None
+                } else {
+                    let pool = self
+                        .session
+                        .resident_pool
+                        .as_ref()
+                        .ok_or(AppendError::DurablePoisoned)?;
+                    Some(
+                        ChargedBytes::try_with_capacity(next_capacity, pool).map_err(|error| {
+                            match error {
+                                ChargedBytesError::Limit(error) => {
+                                    AppendError::DurableResidentLimit {
+                                        maximum: error.maximum(),
+                                    }
+                                }
+                                ChargedBytesError::Capacity => AppendError::Capacity,
+                            }
+                        })?,
+                    )
+                };
+                durable_row_update = Some((next_claim_row, next_reserved_rows, replacement));
             }
+        }
+        if let Some((next_claim_row, next_reserved_rows, replacement)) = durable_row_update {
+            if let Some(replacement) = replacement {
+                claim.ready_fallback_bundle_mut()?.reserved_row = Some(replacement);
+            }
+            claim.reserved_row_bytes = next_claim_row;
+            self.reserved_row_bytes = next_reserved_rows;
         }
         claim.reserved_retained_json_bytes = requested;
         self.reserved_retained_json_bytes = next_reserved_bytes;
@@ -4045,6 +4311,10 @@ impl SessionReservation<'_> {
                     actual,
                 });
             }
+            let fallback = self.session.charge_prepared_event(fallback)?;
+            claim.fallback_identity = ClaimFallbackIdentity::from_prepared(&fallback);
+            *claim.ready_fallback_mut()? = fallback;
+            return Ok(());
         }
         claim.fallback_identity = ClaimFallbackIdentity::from_prepared(&fallback);
         *claim.ready_fallback_mut()? = fallback;
@@ -4119,12 +4389,14 @@ impl SessionReservation<'_> {
                 actual: actual_row,
             });
         }
+        let preferred = self.session.charge_prepared_event(preferred)?;
         let protected_events = u64::try_from(bookkeeping.reserved_events)
             .map_err(|_| AppendError::SequenceExhausted)?;
         let kind = ClaimOperationKind::PreferredOnly;
-        claim.begin_preferred_pending()?;
+        let reserved_row = claim.begin_preferred_only_pending()?;
         let operation = PendingDurableOperation {
             prepared: preferred,
+            reserved_row: Some(reserved_row),
             protected_events,
             protected_row_bytes: bookkeeping.reserved_row_bytes,
             owner: DurableOperationOwner::Claim {

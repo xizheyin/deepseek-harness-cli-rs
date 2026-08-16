@@ -77,7 +77,7 @@ impl EventLineTemplate {
 
     #[cfg(test)]
     pub(crate) fn finish(mut self, timestamp: DurableTimestamp) -> Vec<u8> {
-        let new_len = replace_timestamp(&mut self.bytes, self.timestamp_start, timestamp);
+        let new_len = replace_number(&mut self.bytes, self.timestamp_start, timestamp.0);
         self.bytes.truncate(new_len);
         self.bytes
     }
@@ -101,18 +101,33 @@ impl ChargedEventLineTemplate {
             .bytes
             .checked_add(1)
             .ok_or(ChargedEventLineError::Capacity)?;
-        let mut bytes =
+        let bytes =
             ChargedBytes::try_with_capacity(complete, pool).map_err(|error| match error {
                 ChargedBytesError::Limit(error) => ChargedEventLineError::Resident(error),
                 ChargedBytesError::Capacity => ChargedEventLineError::Capacity,
             })?;
-        serde_json::to_writer(&mut bytes, event)
-            .map_err(JsonlEncodeError::Encode)
-            .map_err(|_| ChargedEventLineError::Encode)?;
-        if !bytes.push_in_place(b'\n') || bytes.len() != complete {
-            return Err(ChargedEventLineError::Capacity);
+        Self::in_reserved(event, bytes).map_err(|(error, _)| error)
+    }
+
+    /// Encode into a claim-owned empty buffer whose allocation was obtained
+    /// before the operation that the claim must eventually close.
+    pub(crate) fn in_reserved(
+        event: &SessionEvent,
+        mut bytes: ChargedBytes,
+    ) -> Result<Self, (ChargedEventLineError, ChargedBytes)> {
+        bytes.truncate(0);
+        if serde_json::to_writer(&mut bytes, event).is_err() {
+            bytes.truncate(0);
+            return Err((ChargedEventLineError::Encode, bytes));
         }
-        let timestamp_start = timestamp_start(&bytes).ok_or(ChargedEventLineError::Encode)?;
+        if !bytes.push_in_place(b'\n') {
+            bytes.truncate(0);
+            return Err((ChargedEventLineError::Capacity, bytes));
+        }
+        let Some(timestamp_start) = timestamp_start(&bytes) else {
+            bytes.truncate(0);
+            return Err((ChargedEventLineError::Encode, bytes));
+        };
         Ok(Self {
             bytes,
             timestamp_start,
@@ -120,8 +135,13 @@ impl ChargedEventLineTemplate {
     }
 
     pub(crate) fn finish(mut self, timestamp: DurableTimestamp) -> ChargedBytes {
-        let new_len = replace_timestamp(self.bytes.as_mut_slice(), self.timestamp_start, timestamp);
+        let new_len = replace_number(self.bytes.as_mut_slice(), self.timestamp_start, timestamp.0);
         self.bytes.truncate(new_len);
+        self.bytes
+    }
+
+    pub(crate) fn into_empty_reserved(mut self) -> ChargedBytes {
+        self.bytes.truncate(0);
         self.bytes
     }
 
@@ -138,27 +158,22 @@ fn timestamp_start(bytes: &[u8]) -> Option<usize> {
         .map(|marker_start| marker_start + b"\"time\":".len())
 }
 
-fn replace_timestamp(
-    bytes: &mut [u8],
-    timestamp_start: usize,
-    timestamp: DurableTimestamp,
-) -> usize {
-    let mut value = timestamp.0;
+fn replace_number(bytes: &mut [u8], start: usize, mut value: u64) -> usize {
     let mut digits = [0_u8; MAX_TIMESTAMP_DIGITS.len()];
-    let mut start = digits.len();
+    let mut digits_start = digits.len();
     loop {
-        start -= 1;
-        digits[start] = decimal_digit(value % 10);
+        digits_start -= 1;
+        digits[digits_start] = decimal_digit(value % 10);
         value /= 10;
         if value == 0 {
             break;
         }
     }
-    let actual = &digits[start..];
-    let old_end = timestamp_start + MAX_TIMESTAMP_DIGITS.len();
-    bytes[timestamp_start..timestamp_start + actual.len()].copy_from_slice(actual);
+    let actual = &digits[digits_start..];
+    let old_end = start + MAX_TIMESTAMP_DIGITS.len();
+    bytes[start..start + actual.len()].copy_from_slice(actual);
     if actual.len() < MAX_TIMESTAMP_DIGITS.len() {
-        let new_end = timestamp_start + actual.len();
+        let new_end = start + actual.len();
         let old_len = bytes.len();
         bytes.copy_within(old_end..old_len, new_end);
         old_len - (MAX_TIMESTAMP_DIGITS.len() - actual.len())
@@ -217,28 +232,7 @@ pub(super) fn prepared_event_line_upper_bound(
     prepared: &PreparedEvent,
 ) -> Result<u64, JsonlEncodeError> {
     let mut counter = CountingWriter::default();
-    {
-        let mut serializer = serde_json::Serializer::new(&mut counter);
-        let surface = prepared.event.surface.as_ref();
-        let mut map = serializer.serialize_map(Some(
-            4 + usize::from(
-                surface
-                    .and_then(|intent| intent.source_event_seqs.as_ref())
-                    .is_some(),
-            ) + usize::from(surface.is_some()),
-        ))?;
-        map.serialize_entry("type", prepared.event.kind.event_type())?;
-        map.serialize_entry("seq", &MAX_SAFE_INTEGER)?;
-        map.serialize_entry("time", &MAX_SAFE_INTEGER)?;
-        map.serialize_entry("data", prepared.original_data.as_value())?;
-        if let Some(sources) = surface.and_then(|intent| intent.source_event_seqs.as_ref()) {
-            map.serialize_entry("sourceEventSeqs", sources)?;
-        }
-        if let Some(intent) = surface {
-            map.serialize_entry("surfaceOp", &intent.operation)?;
-        }
-        map.end()?;
-    }
+    write_prepared_event(&mut counter, prepared)?;
     if counter.overflowed || counter.bytes >= MAX_JOURNAL_EVENT_LINE_BYTES {
         return Err(JsonlEncodeError::EventTooLarge);
     }
@@ -247,6 +241,32 @@ pub(super) fn prepared_event_line_upper_bound(
         .checked_add(1)
         .ok_or(JsonlEncodeError::EventTooLarge)?;
     u64::try_from(complete).map_err(|_| JsonlEncodeError::EventTooLarge)
+}
+
+fn write_prepared_event(
+    writer: &mut impl io::Write,
+    prepared: &PreparedEvent,
+) -> Result<(), serde_json::Error> {
+    let mut serializer = serde_json::Serializer::new(writer);
+    let surface = prepared.event.surface.as_ref();
+    let mut map = serializer.serialize_map(Some(
+        4 + usize::from(
+            surface
+                .and_then(|intent| intent.source_event_seqs.as_ref())
+                .is_some(),
+        ) + usize::from(surface.is_some()),
+    ))?;
+    map.serialize_entry("type", prepared.event.kind.event_type())?;
+    map.serialize_entry("seq", &MAX_SAFE_INTEGER)?;
+    map.serialize_entry("time", &MAX_SAFE_INTEGER)?;
+    map.serialize_entry("data", prepared.original_data.as_value())?;
+    if let Some(sources) = surface.and_then(|intent| intent.source_event_seqs.as_ref()) {
+        map.serialize_entry("sourceEventSeqs", sources)?;
+    }
+    if let Some(intent) = surface {
+        map.serialize_entry("surfaceOp", &intent.operation)?;
+    }
+    map.end()
 }
 
 #[derive(Default)]

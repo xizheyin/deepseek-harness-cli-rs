@@ -1,7 +1,8 @@
 //! Deterministic resident-memory credits shared across model and Session owners.
 
 use std::{
-    io,
+    fmt, io,
+    mem::{align_of, size_of},
     ops::Deref,
     sync::{
         Arc,
@@ -31,6 +32,15 @@ struct ResidentCreditPoolInner {
 pub(super) struct ResidentCreditLease {
     pool: Arc<ResidentCreditPoolInner>,
     bytes: usize,
+}
+
+impl fmt::Debug for ResidentCreditLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResidentCreditLease")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,7 +103,6 @@ impl ResidentCreditPool {
 }
 
 impl ResidentCreditLease {
-    #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -208,6 +217,11 @@ impl ChargedBytes {
         self._lease.bytes()
     }
 
+    #[cfg(test)]
+    pub(super) fn allocation_for_test(&self) -> (*const u8, usize, usize) {
+        (self.bytes.as_ptr(), self.capacity(), self.charge())
+    }
+
     /// Append only when the existing charged allocation is already large enough.
     pub(super) fn extend_from_slice_in_place(&mut self, source: &[u8]) -> bool {
         if self.capacity().saturating_sub(self.len()) < source.len() {
@@ -268,14 +282,34 @@ pub(super) fn byte_buffer_charge(capacity: usize) -> Option<usize> {
     heap_allocation_charge(capacity, 1)
 }
 
-/// Deterministic charge for one heap allocation with `capacity` payload bytes.
+/// Conservative charge for one `String` backing allocation.
+pub(super) fn string_backing_charge(capacity: usize) -> Option<usize> {
+    heap_allocation_charge(capacity, 1)
+}
+
+/// Conservative charge for one `Vec<T>` backing allocation.
+pub(super) fn vec_backing_charge<T>(capacity: usize) -> Option<usize> {
+    if size_of::<T>() == 0 {
+        return Some(0);
+    }
+    let bytes = capacity.checked_mul(size_of::<T>())?;
+    heap_allocation_charge(bytes, align_of::<T>())
+}
+
+/// Conservative charge for the allocation that stores one `Arc<T>` inner.
+pub(super) fn arc_inner_charge<T>() -> Option<usize> {
+    let value_offset = round_up(2_usize.checked_mul(size_of::<usize>())?, align_of::<T>())?;
+    let allocation = value_offset.checked_add(size_of::<T>())?;
+    heap_allocation_charge(allocation, align_of::<T>().max(align_of::<usize>()))
+}
+
 /// Deterministic product charge for one allocation.
 ///
 /// Stable Rust does not expose an allocator's actual size class. This policy
 /// therefore rounds by at least the common heap alignment and adds one fixed
 /// allowance for allocator metadata. It is deliberately conservative and is
 /// shared by every owner that participates in the 32 MiB Session budget.
-fn heap_allocation_charge(size: usize, align: usize) -> Option<usize> {
+pub(super) fn heap_allocation_charge(size: usize, align: usize) -> Option<usize> {
     if size == 0 {
         return Some(0);
     }
@@ -293,7 +327,10 @@ fn round_up(value: usize, align: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChargedBytes, ResidentCreditPool, byte_buffer_charge};
+    use super::{
+        ChargedBytes, ResidentCreditPool, arc_inner_charge, byte_buffer_charge,
+        string_backing_charge, vec_backing_charge,
+    };
 
     #[test]
     fn resident_credit_exact_one_over_and_drop_are_atomic() {
@@ -322,6 +359,16 @@ mod tests {
         assert_eq!(byte_buffer_charge(16), Some(48));
         assert_eq!(byte_buffer_charge(17), Some(64));
         assert_eq!(byte_buffer_charge(usize::MAX), None);
+    }
+
+    #[test]
+    fn typed_allocation_charges_use_capacity_and_alignment() {
+        assert_eq!(string_backing_charge(17), Some(64));
+        assert_eq!(vec_backing_charge::<u32>(4), Some(48));
+        assert_eq!(vec_backing_charge::<u32>(5), Some(64));
+        assert_eq!(vec_backing_charge::<()>(usize::MAX), Some(0));
+        assert!(arc_inner_charge::<u64>().is_some_and(|charge| charge >= 48));
+        assert_eq!(vec_backing_charge::<u64>(usize::MAX), None);
     }
 
     #[test]

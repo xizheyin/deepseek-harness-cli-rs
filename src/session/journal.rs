@@ -979,7 +979,7 @@ mod tests {
     use crate::session::projection::{Projection, ValidationPolicy};
     use crate::session::{
         AppendError, AttemptDisposition, BarrierError, ClaimedAppend, Clock, ClockError,
-        EpochHeader, EventKind, EventSeq, EventValidationError, LlmRetryEvent,
+        EpochHeader, EventClaim, EventKind, EventSeq, EventValidationError, LlmRetryEvent,
         LlmRetryStartedEvent, NewEvent, PreparedAttempt, PrunePairAppendError, RequestHeaderReason,
         RetryId, RetryNumber, Session, SessionMode, SessionStorage, StepId, SurfaceIntent,
         SystemClock, TodoItem, TodoStatus, ToolResultPruneConfig, TransitionError, TurnEndReason,
@@ -3009,6 +3009,9 @@ mod tests {
     #[tokio::test]
     async fn resident_row_limit_is_exact_and_fails_before_clock_or_session_commit() {
         let event = NewEvent::log(EventKind::turn_start(TurnId::new(1).unwrap()));
+        let prepared = Session::prepare_event(event.clone()).unwrap();
+        let payload_charge = prepared.original_data.resident_bytes();
+        assert!(payload_charge > 0);
 
         let (probe_path, probe_file) = test_file("session-resident-row-probe");
         let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
@@ -3021,8 +3024,9 @@ mod tests {
         .unwrap();
         let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
         probe.append_settled(event.clone()).await.unwrap();
-        let exact = probe_pool.used_for_test();
-        assert!(exact > 0);
+        let row_charge = probe_pool.used_for_test();
+        let exact = row_charge.checked_add(payload_charge).unwrap();
+        assert!(row_charge > 0);
         probe.flush_barrier().await.unwrap();
         assert_eq!(probe_pool.used_for_test(), 0);
         probe.shutdown().await.unwrap();
@@ -3039,7 +3043,7 @@ mod tests {
         .unwrap();
         let exact_pool = exact_session.set_resident_limit_for_test(exact);
         exact_session.append_settled(event.clone()).await.unwrap();
-        assert_eq!(exact_pool.used_for_test(), exact);
+        assert_eq!(exact_pool.used_for_test(), row_charge);
         exact_session.flush_barrier().await.unwrap();
         assert_eq!(exact_pool.used_for_test(), 0);
         exact_session.shutdown().await.unwrap();
@@ -3068,6 +3072,317 @@ mod tests {
         assert_eq!(over_pool.used_for_test(), 0);
         over.shutdown().await.unwrap();
         assert_eq!(std::fs::metadata(&over_path).unwrap().len(), 0);
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_batch_resident_one_over_rolls_back_every_candidate() {
+        let fallbacks = || {
+            [
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "first resident claim".repeat(32),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "second resident claim".repeat(32),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            ]
+        };
+
+        let (probe_path, probe_file) = test_file("claim-batch-resident-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let mut probe =
+            Session::new_active_for_test("claim-batch-resident-probe", SystemClock, probe_writer)
+                .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut probe_reservation = probe.reservation();
+        let mut claims = probe_reservation.claim_batch(fallbacks()).unwrap();
+        let exact = probe_pool.used_for_test();
+        assert!(exact > 1);
+        for claim in &mut claims {
+            probe_reservation.release(claim).unwrap();
+        }
+        assert_eq!(probe_pool.used_for_test(), 0);
+        drop(probe_reservation);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (over_path, over_file) = test_file("claim-batch-resident-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let mut over =
+            Session::new_active_for_test("claim-batch-resident-one-over", SystemClock, over_writer)
+                .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact - 1);
+        let mut reservation = over.reservation();
+        let counters_before = (
+            reservation.reserved_events,
+            reservation.reserved_retained_json_bytes,
+            reservation.reserved_row_bytes,
+            reservation.next_claim_token,
+        );
+        assert_eq!(
+            reservation.claim_batch(fallbacks()).unwrap_err(),
+            AppendError::DurableResidentLimit { maximum: exact - 1 }
+        );
+        assert_eq!(
+            (
+                reservation.reserved_events,
+                reservation.reserved_retained_json_bytes,
+                reservation.reserved_row_bytes,
+                reservation.next_claim_token,
+            ),
+            counters_before
+        );
+        assert_eq!(over_pool.used_for_test(), 0);
+        drop(reservation);
+        over.shutdown().await.unwrap();
+        assert_eq!(std::fs::metadata(&over_path).unwrap().len(), 0);
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn growing_a_claim_row_is_charged_before_an_atomic_swap() {
+        let requested_growth = 4 * 1024;
+        let fallback = || NewEvent::log(EventKind::EndSeed);
+
+        let (probe_path, probe_file) = test_file("claim-row-grow-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let mut probe =
+            Session::new_active_for_test("claim-row-grow-probe", SystemClock, probe_writer)
+                .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut probe_reservation = probe.reservation();
+        let mut probe_claim = probe_reservation
+            .claim_batch([fallback()])
+            .unwrap()
+            .remove(0);
+        let baseline = probe_pool.used_for_test();
+        let old_row = claim_row_allocation(&probe_claim);
+        let requested = probe_claim
+            .reserved_retained_json_bytes
+            .checked_add(requested_growth)
+            .unwrap();
+        probe_reservation
+            .reserve_claim_retained_json_bytes(&mut probe_claim, requested)
+            .unwrap();
+        let new_row = claim_row_allocation(&probe_claim);
+        assert_ne!(new_row.0, old_row.0);
+        assert!(new_row.1 > old_row.1);
+        let final_used = probe_pool.used_for_test();
+        assert_eq!(final_used, baseline - old_row.2 + new_row.2);
+        let exact_peak = baseline.checked_add(new_row.2).unwrap();
+        probe_reservation
+            .rebind_claim_fallback(
+                &mut probe_claim,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "the grown row survives fallback rebinding".to_owned(),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            )
+            .unwrap();
+        assert_eq!(claim_row_allocation(&probe_claim), new_row);
+        probe_reservation.release(&mut probe_claim).unwrap();
+        assert_eq!(probe_pool.used_for_test(), 0);
+        drop(probe_reservation);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("claim-row-grow-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let mut exact_session =
+            Session::new_active_for_test("claim-row-grow-exact", SystemClock, exact_writer)
+                .unwrap();
+        let exact_pool = exact_session.set_resident_limit_for_test(exact_peak);
+        let mut exact_reservation = exact_session.reservation();
+        let mut exact_claim = exact_reservation
+            .claim_batch([fallback()])
+            .unwrap()
+            .remove(0);
+        exact_reservation
+            .reserve_claim_retained_json_bytes(&mut exact_claim, requested)
+            .unwrap();
+        assert_eq!(exact_pool.used_for_test(), final_used);
+        exact_reservation.release(&mut exact_claim).unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        drop(exact_reservation);
+        exact_session.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+
+        let (over_path, over_file) = test_file("claim-row-grow-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let mut over =
+            Session::new_active_for_test("claim-row-grow-one-over", SystemClock, over_writer)
+                .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact_peak - 1);
+        let mut over_reservation = over.reservation();
+        let mut over_claim = over_reservation
+            .claim_batch([fallback()])
+            .unwrap()
+            .remove(0);
+        let row_before = claim_row_allocation(&over_claim);
+        let claim_before = (
+            over_claim.reserved_retained_json_bytes,
+            over_claim.reserved_row_bytes,
+        );
+        let reservation_before = (
+            over_reservation.reserved_retained_json_bytes,
+            over_reservation.reserved_row_bytes,
+        );
+        let used_before = over_pool.used_for_test();
+        assert_eq!(
+            over_reservation.reserve_claim_retained_json_bytes(&mut over_claim, requested),
+            Err(AppendError::DurableResidentLimit {
+                maximum: exact_peak - 1,
+            })
+        );
+        assert_eq!(claim_row_allocation(&over_claim), row_before);
+        assert_eq!(
+            (
+                over_claim.reserved_retained_json_bytes,
+                over_claim.reserved_row_bytes,
+            ),
+            claim_before
+        );
+        assert_eq!(
+            (
+                over_reservation.reserved_retained_json_bytes,
+                over_reservation.reserved_row_bytes,
+            ),
+            reservation_before
+        );
+        assert_eq!(over_pool.used_for_test(), used_before);
+        assert!(matches!(
+            &over_claim.ready_fallback().unwrap().event.kind,
+            EventKind::EndSeed
+        ));
+        over_reservation.release(&mut over_claim).unwrap();
+        assert_eq!(over_pool.used_for_test(), 0);
+        drop(over_reservation);
+        over.shutdown().await.unwrap();
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebinding_a_claim_charges_the_new_json_before_an_atomic_swap() {
+        let initial = || {
+            NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "initial fallback keeps the larger reserved row".repeat(64),
+                    status: TodoStatus::Pending,
+                }],
+            })
+        };
+        let replacement = || {
+            NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "replacement fallback owns a distinct JSON tree".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })
+        };
+        let replacement_charge = Session::prepare_event(replacement())
+            .unwrap()
+            .original_data
+            .resident_bytes();
+
+        let (probe_path, probe_file) = test_file("claim-rebind-resident-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let mut probe =
+            Session::new_active_for_test("claim-rebind-resident-probe", SystemClock, probe_writer)
+                .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        let mut probe_reservation = probe.reservation();
+        let mut probe_claim = probe_reservation
+            .claim_batch([initial()])
+            .unwrap()
+            .remove(0);
+        let baseline = probe_pool.used_for_test();
+        let exact_peak = baseline.checked_add(replacement_charge).unwrap();
+        probe_reservation.release(&mut probe_claim).unwrap();
+        assert_eq!(probe_pool.used_for_test(), 0);
+        drop(probe_reservation);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("claim-rebind-resident-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let mut exact_session =
+            Session::new_active_for_test("claim-rebind-resident-exact", SystemClock, exact_writer)
+                .unwrap();
+        let exact_pool = exact_session.set_resident_limit_for_test(exact_peak);
+        let mut exact_reservation = exact_session.reservation();
+        let mut exact_claim = exact_reservation
+            .claim_batch([initial()])
+            .unwrap()
+            .remove(0);
+        let exact_row = claim_row_allocation(&exact_claim);
+        exact_reservation
+            .rebind_claim_fallback(&mut exact_claim, replacement())
+            .unwrap();
+        assert_eq!(claim_row_allocation(&exact_claim), exact_row);
+        let EventKind::TodoWrite { todos } = &exact_claim.ready_fallback().unwrap().event.kind
+        else {
+            panic!("the replacement todo fallback must be installed");
+        };
+        assert!(todos[0].content.starts_with("replacement fallback"));
+        exact_reservation.release(&mut exact_claim).unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        drop(exact_reservation);
+        exact_session.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+
+        let (over_path, over_file) = test_file("claim-rebind-resident-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let mut over = Session::new_active_for_test(
+            "claim-rebind-resident-one-over",
+            SystemClock,
+            over_writer,
+        )
+        .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact_peak - 1);
+        let mut over_reservation = over.reservation();
+        let mut over_claim = over_reservation.claim_batch([initial()]).unwrap().remove(0);
+        let row_before = claim_row_allocation(&over_claim);
+        let counters_before = (
+            over_claim.reserved_retained_json_bytes,
+            over_claim.reserved_row_bytes,
+            over_reservation.reserved_retained_json_bytes,
+            over_reservation.reserved_row_bytes,
+        );
+        let used_before = over_pool.used_for_test();
+        assert_eq!(
+            over_reservation.rebind_claim_fallback(&mut over_claim, replacement()),
+            Err(AppendError::DurableResidentLimit {
+                maximum: exact_peak - 1,
+            })
+        );
+        let EventKind::TodoWrite { todos } = &over_claim.ready_fallback().unwrap().event.kind
+        else {
+            panic!("the original todo fallback must survive");
+        };
+        assert!(todos[0].content.starts_with("initial fallback"));
+        assert_eq!(claim_row_allocation(&over_claim), row_before);
+        assert_eq!(
+            (
+                over_claim.reserved_retained_json_bytes,
+                over_claim.reserved_row_bytes,
+                over_reservation.reserved_retained_json_bytes,
+                over_reservation.reserved_row_bytes,
+            ),
+            counters_before
+        );
+        assert_eq!(over_pool.used_for_test(), used_before);
+        over_reservation.release(&mut over_claim).unwrap();
+        assert_eq!(over_pool.used_for_test(), 0);
+        drop(over_reservation);
+        over.shutdown().await.unwrap();
         std::fs::remove_file(over_path).unwrap();
     }
 
@@ -3143,6 +3458,7 @@ mod tests {
                 .event
                 .kind,
         );
+        let row_before = claim_row_allocation(&claim);
         let next_before = reservation.session().next_seq();
         clock.fail_after(0);
 
@@ -3163,6 +3479,7 @@ mod tests {
             (after_pointer, after_capacity),
             (before_pointer, before_capacity)
         );
+        assert_eq!(claim_row_allocation(&claim), row_before);
 
         reservation.settle_exact_settled(&mut claim).await.unwrap();
         reservation
@@ -3214,10 +3531,11 @@ mod tests {
             }],
         });
 
-        assert!(matches!(
-            reservation.settle_settled(&mut claim, preferred).await,
-            Err(AppendError::Clock(_))
-        ));
+        let rejected = reservation.settle_settled(&mut claim, preferred).await;
+        assert!(
+            matches!(rejected, Err(AppendError::Clock(_))),
+            "unexpected preferred rejection: {rejected:?}"
+        );
         let receipt = reservation.settle_exact_settled(&mut claim).await.unwrap();
         assert_eq!(receipt.event_type(), "todo/write");
         reservation
@@ -3302,6 +3620,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_preferred_uses_precharged_fallback_when_resident_pool_is_full() {
+        let (path, file) = test_file("session-preferred-resident-fallback");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut session = Session::new_active_for_test(
+            "session-preferred-resident-fallback",
+            CountingClock(Arc::clone(&calls)),
+            writer,
+        )
+        .unwrap();
+        let resident_limit = 1024 * 1024;
+        let pool = session.set_resident_limit_for_test(resident_limit);
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "precharged resident fallback".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let used = pool.used_for_test();
+        assert!(used < resident_limit);
+        let filler = pool.try_acquire(resident_limit - used).unwrap();
+        assert_eq!(pool.used_for_test(), resident_limit);
+        let calls_before = calls.load(Ordering::SeqCst);
+
+        let settlement = reservation
+            .settle_settled(
+                &mut claim,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "preferred needs fresh resident credit".to_owned(),
+                        status: TodoStatus::InProgress,
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(settlement, ClaimedAppend::Fallback(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before + 1);
+
+        drop(filler);
+        reservation.flush_barrier().await.unwrap();
+
+        let mut row_limited_claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "fallback when only the payload fits".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let row_limited_preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "preferred payload fits but its row does not".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        });
+        let preferred_charge = Session::prepare_event(row_limited_preferred.clone())
+            .unwrap()
+            .original_data
+            .resident_bytes();
+        let used = pool.used_for_test();
+        assert!(used + preferred_charge < resident_limit);
+        let row_filler = pool
+            .try_acquire(resident_limit - used - preferred_charge)
+            .unwrap();
+        assert_eq!(pool.used_for_test() + preferred_charge, resident_limit);
+        let calls_before = calls.load(Ordering::SeqCst);
+
+        let settlement = reservation
+            .settle_settled(&mut row_limited_claim, row_limited_preferred)
+            .await
+            .unwrap();
+        assert!(matches!(settlement, ClaimedAppend::Fallback(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), calls_before + 1);
+
+        drop(row_filler);
+        reservation.flush_barrier().await.unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let rows = std::fs::read(&path).unwrap();
+        let todos = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .filter(|row| row["type"] == "todo/write")
+            .map(|row| row["data"]["todos"][0]["content"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            todos,
+            vec![
+                serde_json::Value::String("precharged resident fallback".to_owned()),
+                serde_json::Value::String("fallback when only the payload fits".to_owned()),
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_rejected_preferred_only_candidate_remains_session_owned() {
         let (path, file) = test_file("session-preferred-only-clock-rejection");
         let writer = JournalWriter::start(file, 0).unwrap();
@@ -3371,6 +3809,106 @@ mod tests {
         assert_eq!(
             todo["data"]["todos"][0]["content"],
             "preferred-only candidate"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preferred_only_reuses_its_claim_row_when_the_pool_is_full() {
+        let (path, file) = test_file("session-preferred-only-reserved-row");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-preferred-only-reserved-row",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let resident_limit = 1024 * 1024;
+        let pool = session.set_resident_limit_for_test(resident_limit);
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let mut claim = reservation
+            .claim_batch([NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "fallback row is deliberately larger than the truth".repeat(32),
+                    status: TodoStatus::Pending,
+                }],
+            })])
+            .unwrap()
+            .remove(0);
+        let row_before = claim_row_allocation(&claim);
+        let preferred = NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "truthful preferred-only result".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        });
+        let preferred_charge = Session::prepare_event(preferred.clone())
+            .unwrap()
+            .original_data
+            .resident_bytes();
+        let used = pool.used_for_test();
+        let filler = pool
+            .try_acquire(resident_limit - used - preferred_charge)
+            .unwrap();
+        assert_eq!(pool.used_for_test() + preferred_charge, resident_limit);
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation
+                .settle_preferred_only_settled(&mut claim, preferred)
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        let SessionMode::Durable {
+            pending_operation: Some(operation),
+            ..
+        } = &reservation.session.mode
+        else {
+            panic!("the truthful preferred-only candidate must remain Session-owned");
+        };
+        assert_eq!(
+            operation
+                .reserved_row
+                .as_ref()
+                .expect("the exact result must own the reserved row")
+                .allocation_for_test(),
+            row_before
+        );
+        reservation
+            .resume_preferred_only_settled(&mut claim)
+            .await
+            .unwrap();
+        drop(filler);
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+
+        let rows = std::fs::read(&path).unwrap();
+        let todo = rows
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "todo/write")
+            .expect("the truthful preferred-only result must be durable");
+        assert_eq!(
+            todo["data"]["todos"][0]["content"],
+            "truthful preferred-only result"
         );
         std::fs::remove_file(path).unwrap();
     }
@@ -3728,6 +4266,16 @@ mod tests {
         (content.as_ptr(), content.capacity())
     }
 
+    fn claim_row_allocation(claim: &EventClaim) -> (*const u8, usize, usize) {
+        claim
+            .ready_fallback_bundle()
+            .expect("the claim must own its ready fallback")
+            .reserved_row
+            .as_ref()
+            .expect("a durable claim must own its empty reserved row")
+            .allocation_for_test()
+    }
+
     #[tokio::test]
     async fn durable_settlement_uses_unclaimed_global_space_for_a_preferred_result() {
         let (path, file) = test_file("session-preferred-global-space");
@@ -4004,6 +4552,7 @@ mod tests {
         };
         *pending_operation = Some(crate::session::PendingDurableOperation {
             prepared: invalid,
+            reserved_row: None,
             protected_events: 0,
             protected_row_bytes: 0,
             owner: crate::session::DurableOperationOwner::Ordinary,

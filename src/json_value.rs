@@ -1,10 +1,18 @@
 //! Bounded, lossless JSON values shared by model and session boundaries.
 
-use std::{fmt, io, mem::ManuallyDrop, sync::Arc};
+use std::{
+    fmt, io,
+    mem::{ManuallyDrop, size_of},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, de::Visitor};
 use serde_json::{Number, Value};
 use thiserror::Error;
+
+use crate::resident_credit::{
+    arc_inner_charge, heap_allocation_charge, string_backing_charge, vec_backing_charge,
+};
 
 /// Largest integer that JavaScript can represent without rounding.
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -16,10 +24,11 @@ pub const MAX_JSON_NODES: usize = 1_000_000;
 pub const MAX_JSON_VALUE_BYTES: usize = 8 * 1024 * 1024;
 
 /// A bounded JSON value that is safe to retain in the session core.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JsonValue {
     value: Arc<Value>,
     encoded_len: usize,
+    resident_bytes: usize,
 }
 
 impl JsonValue {
@@ -28,10 +37,15 @@ impl JsonValue {
         // A caller can build a `serde_json::Value` far deeper than serde's parser accepts.
         // Keep it out of automatic recursive Drop until the depth check has succeeded.
         let guarded = ManuallyDrop::new(value);
-        if let Err(error) = inspect_json(&guarded) {
-            drop_json_iteratively(ManuallyDrop::into_inner(guarded));
-            return Err(error);
-        }
+        let resident_bytes = match inspect_json(&guarded) {
+            Ok(dynamic_bytes) => arc_inner_charge::<Value>()
+                .and_then(|root| root.checked_add(dynamic_bytes))
+                .unwrap_or(usize::MAX),
+            Err(error) => {
+                drop_json_iteratively(ManuallyDrop::into_inner(guarded));
+                return Err(error);
+            }
+        };
 
         let mut value = ManuallyDrop::into_inner(guarded);
         normalize_numbers(&mut value);
@@ -53,6 +67,7 @@ impl JsonValue {
         Ok(Self {
             value: Arc::new(value),
             encoded_len,
+            resident_bytes,
         })
     }
 
@@ -62,6 +77,7 @@ impl JsonValue {
         Self {
             value: Arc::new(Value::Null),
             encoded_len: 4,
+            resident_bytes: arc_inner_charge::<Value>().unwrap_or(usize::MAX),
         }
     }
 
@@ -77,6 +93,22 @@ impl JsonValue {
         self.encoded_len
     }
 
+    /// Deterministic charge for the retained JSON allocation graph.
+    ///
+    /// This is a product accounting value, not an allocator-specific RSS
+    /// measurement. Clones share the same graph and therefore the same value.
+    #[must_use]
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    /// Process-local identity of the shared JSON allocation.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn resident_allocation_id(&self) -> usize {
+        Arc::as_ptr(&self.value) as usize
+    }
+
     /// Consume the wrapper and return the owned JSON tree.
     #[must_use]
     pub fn into_value(self) -> Value {
@@ -87,6 +119,16 @@ impl JsonValue {
     #[must_use]
     pub(crate) fn semantically_equals(&self, other: &Self) -> bool {
         json_values_equal(&self.value, &other.value)
+    }
+}
+
+impl fmt::Debug for JsonValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JsonValue")
+            .field("value", &self.value)
+            .field("encoded_len", &self.encoded_len)
+            .finish()
     }
 }
 
@@ -443,7 +485,7 @@ fn json_values_equal_at(first: &Value, second: &Value, depth: usize) -> bool {
     }
 }
 
-fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
+fn inspect_json(value: &Value) -> Result<usize, JsonValueError> {
     enum Children<'a> {
         Array(std::slice::Iter<'a, Value>),
         Object(serde_json::map::Values<'a>),
@@ -461,6 +503,7 @@ fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
     let mut current = Some((value, 0_usize));
     let mut parents: Vec<(Children<'_>, usize)> = Vec::new();
     let mut nodes = 0_usize;
+    let mut resident_bytes = 0_usize;
     while let Some((node, depth)) = current.take() {
         nodes = nodes.saturating_add(1);
         if nodes > MAX_JSON_NODES {
@@ -474,6 +517,9 @@ fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
             });
         }
         match node {
+            Value::String(value) => {
+                add_resident_charge(&mut resident_bytes, string_backing_charge(value.capacity()));
+            }
             Value::Number(number) => {
                 let Some(number) = number.as_f64() else {
                     return Err(JsonValueError::InvalidNumber);
@@ -486,18 +532,29 @@ fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
                 }
             }
             Value::Array(items) => {
+                add_resident_charge(
+                    &mut resident_bytes,
+                    vec_backing_charge::<Value>(items.capacity()),
+                );
                 let child_depth = depth.saturating_add(1);
                 let mut children = Children::Array(items.iter());
                 current = children.next().map(|child| (child, child_depth));
                 parents.push((children, child_depth));
             }
             Value::Object(fields) => {
+                add_resident_charge(
+                    &mut resident_bytes,
+                    json_object_backing_charge(fields.len()),
+                );
+                for key in fields.keys() {
+                    add_resident_charge(&mut resident_bytes, string_backing_charge(key.capacity()));
+                }
                 let child_depth = depth.saturating_add(1);
                 let mut children = Children::Object(fields.values());
                 current = children.next().map(|child| (child, child_depth));
                 parents.push((children, child_depth));
             }
-            Value::Null | Value::Bool(_) | Value::String(_) => {}
+            Value::Null | Value::Bool(_) => {}
         }
 
         while current.is_none() {
@@ -511,7 +568,36 @@ fn inspect_json(value: &Value) -> Result<(), JsonValueError> {
             }
         }
     }
-    Ok(())
+    Ok(resident_bytes)
+}
+
+fn add_resident_charge(total: &mut usize, charge: Option<usize>) {
+    *total = total
+        .checked_add(charge.unwrap_or(usize::MAX))
+        .unwrap_or(usize::MAX);
+}
+
+fn json_object_backing_charge(entries: usize) -> Option<usize> {
+    // `serde_json::Map` uses `BTreeMap` without the optional
+    // `preserve_order` feature. Removing its final entry may retain one empty
+    // root leaf, and a non-root node may be only half full, so charge at least
+    // one conservative maximum-sized node plus one per five later entries.
+    const NODE_CAPACITY: usize = 11;
+    const MIN_ENTRIES_PER_NODE: usize = 5;
+    let nodes = if entries == 0 {
+        1
+    } else {
+        entries
+            .checked_sub(1)?
+            .checked_add(MIN_ENTRIES_PER_NODE - 1)?
+            .checked_div(MIN_ENTRIES_PER_NODE)?
+            .checked_add(1)?
+    };
+    let slots = NODE_CAPACITY.checked_mul(size_of::<String>().checked_add(size_of::<Value>())?)?;
+    let edges = (NODE_CAPACITY + 1).checked_mul(size_of::<usize>())?;
+    let node_bytes = 16_usize.checked_add(slots)?.checked_add(edges)?;
+    let one_node = heap_allocation_charge(node_bytes, 16)?;
+    nodes.checked_mul(one_node)
 }
 
 fn encoded_len(value: &Value) -> Result<usize, JsonValueError> {
@@ -618,6 +704,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::JsonValue;
+    use crate::resident_credit::{arc_inner_charge, string_backing_charge, vec_backing_charge};
 
     #[test]
     fn encoded_length_matches_compact_json_for_escape_and_unicode_shapes() {
@@ -643,5 +730,61 @@ mod tests {
         different[99_999] = Value::Bool(false);
         let different = JsonValue::new(Value::Array(different)).unwrap();
         assert_ne!(left, different);
+    }
+
+    #[test]
+    fn resident_charge_uses_capacity_and_clones_share_one_graph() {
+        let mut text = String::with_capacity(4_096);
+        text.push('x');
+        let text_capacity = text.capacity();
+        let value = JsonValue::new(Value::String(text)).unwrap();
+        assert_eq!(
+            value.resident_bytes(),
+            arc_inner_charge::<Value>().unwrap() + string_backing_charge(text_capacity).unwrap()
+        );
+        assert!(value.resident_bytes() > value.encoded_len());
+
+        let clone = value.clone();
+        assert_eq!(
+            clone.resident_allocation_id(),
+            value.resident_allocation_id()
+        );
+        assert_eq!(clone.resident_bytes(), value.resident_bytes());
+
+        let independent = JsonValue::new(Value::String("x".to_owned())).unwrap();
+        assert_ne!(
+            independent.resident_allocation_id(),
+            value.resident_allocation_id()
+        );
+    }
+
+    #[test]
+    fn resident_charge_includes_wide_container_backing_and_small_allocations() {
+        let mut items = Vec::with_capacity(64);
+        for _ in 0..32 {
+            items.push(Value::String(String::from("x")));
+        }
+        let array_capacity = items.capacity();
+        let value = JsonValue::new(Value::Array(items)).unwrap();
+        let structural_floor = arc_inner_charge::<Value>().unwrap()
+            + vec_backing_charge::<Value>(array_capacity).unwrap();
+        assert!(value.resident_bytes() > structural_floor);
+        assert!(value.resident_bytes() > value.encoded_len());
+
+        let object = JsonValue::new(json!({"key": true})).unwrap();
+        assert!(
+            object.resident_bytes()
+                > arc_inner_charge::<Value>().unwrap()
+                    + string_backing_charge("key".len()).unwrap()
+        );
+
+        let empty = JsonValue::new(Value::Object(serde_json::Map::new())).unwrap();
+        let mut retained_empty = serde_json::Map::new();
+        retained_empty.insert("removed".to_owned(), Value::Null);
+        retained_empty.remove("removed");
+        let retained_empty = JsonValue::new(Value::Object(retained_empty)).unwrap();
+        let root_only = arc_inner_charge::<Value>().unwrap();
+        assert!(empty.resident_bytes() > root_only);
+        assert!(retained_empty.resident_bytes() >= empty.resident_bytes());
     }
 }

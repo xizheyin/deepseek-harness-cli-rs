@@ -941,14 +941,24 @@ Claim settlement has matching `settle_settled`/`settle_exact_settled` helpers;
 the claim remains unsettled across a control outcome. It never regenerates an
 ID/time-bearing payload and never deep-clones a large row merely to retry
 storage. A durable claim is a closed four-state owner:
-`Ready(PreparedEvent)`, `PendingFallback`,
-`PendingPreferred(PreparedEvent)`, or `Settled`. Selecting the fallback moves
-the exact value into the Session-owned pending operation; selecting a preferred
-value leaves the fallback in the claim. A pre-commit rejection moves the same
-owner back to `Ready` when fallback remains legal. `PreferredOnly`, used after
-an irreversible tool side effect, instead keeps the exact preferred result in
-the Session-owned pending operation; it can never substitute the fallback. A
-transient durable clock rejection is retried once from that exact owner.
+`Ready(ClaimFallback { PreparedEvent, empty_reserved_row })`,
+`PendingFallback`, `PendingPreferred(ClaimFallback)`, or `Settled`. The current
+partial resident implementation charges the independently materialized
+`original_data` JSON tree on each durable `PreparedEvent` and preallocates the
+empty row at claim creation. Selecting the fallback moves both owners into the
+Session-owned pending operation; selecting an ordinary preferred value leaves
+the fallback and its row in the claim while separately charging the preferred
+payload and row. If that second resident allocation cannot fit, settlement uses
+the already charged fallback instead. A pre-commit rejection moves the same
+owners back to `Ready` when fallback remains legal. `PreferredOnly`, used after
+an irreversible tool side effect, transfers the reserved row to the exact
+preferred result and keeps that result in the Session-owned pending operation;
+it can never substitute the fallback. Claim growth allocates a replacement row
+before changing any counter, while rebind changes only the prepared payload and
+preserves the row allocation. Typed `EventKind` allocations, attempt-retained
+payloads, cold recovery, and the rest of the complete 32 MiB proof remain later
+implementation slices. A transient durable clock rejection is retried once
+from that exact owner.
 If that retry is also rejected, the Agent returns the original Clock cause
 instead of attempting a `step/end` that cannot pass the still-pending truthful
 result; shutdown or cold recovery retains responsibility for the open tail.
