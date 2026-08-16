@@ -898,6 +898,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_type_only_events_are_silent_and_do_not_change_lifecycle() {
+        let mut renderer = LiveRenderer::new();
+        for (seq, event_type) in [
+            "compaction/start",
+            "compaction/summary",
+            "compaction/end",
+            "compaction/prune",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let update = renderer
+                .consume(event(seq as u64, CommittedUiKind::TypeOnly { event_type }))
+                .unwrap();
+            assert!(update.frame.is_none());
+            assert!(matches!(update.lifecycle, super::LiveLifecycle::None));
+        }
+    }
+
+    #[test]
     fn turn_start_and_stopped_summary_are_fixed_status_frames() {
         let turn = TurnId::new(1).unwrap();
         let mut renderer = LiveRenderer::new();

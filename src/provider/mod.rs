@@ -18,7 +18,9 @@ use crate::{
     session::SessionId,
 };
 
-pub use crate::model::{MAX_PROVIDER_STREAM_CHUNKS, StreamProtocolError, StreamValidator};
+pub use crate::model::{
+    MAX_PROVIDER_STREAM_CHUNKS, RequestPurpose, StreamProtocolError, StreamValidator,
+};
 pub use retry::{
     MAX_RETRY_DELAY_MILLIS, MAX_RETRYABLE_CODE_BYTES, MAX_RETRYABLE_CODES, RetryBackoff, RetryMode,
     RetryPolicy, RetryPolicyError,
@@ -32,18 +34,6 @@ pub const MAX_PROVIDER_TOOLS: usize = 256;
 pub const MAX_PROVIDER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum session identifier length carried in an HTTP header.
 pub const MAX_PROVIDER_SESSION_ID_BYTES: usize = 1_024;
-
-/// Why a model call is being made.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RequestPurpose {
-    /// Normal conversation or tool continuation.
-    #[default]
-    Conversation,
-    /// Short auxiliary title generation.
-    SessionTitle,
-    /// Context-compaction generation.
-    Compaction,
-}
 
 /// A bounded provider-neutral request.
 #[derive(Eq, PartialEq)]

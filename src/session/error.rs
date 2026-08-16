@@ -183,6 +183,32 @@ pub enum TransitionError {
         event_type: &'static str,
         call_id: CallId,
     },
+    #[error("compaction/start cannot nest inside compaction {open}")]
+    CompactionAlreadyOpen { open: super::CompactionId },
+    #[error("{event_type} has no matching compaction/start")]
+    CompactionWithoutStart { event_type: &'static str },
+    #[error("{event_type} compaction id {actual} does not match open id {expected}")]
+    CompactionIdMismatch {
+        event_type: &'static str,
+        expected: super::CompactionId,
+        actual: super::CompactionId,
+    },
+    #[error("{event_type} sourceCommandId does not match compaction/start")]
+    CompactionSourceCommandMismatch { event_type: &'static str },
+    #[error("{event_type} compaction owner does not match the open turn or bracket")]
+    CompactionOwnerMismatch { event_type: &'static str },
+    #[error("{event_type} cannot cross an open compaction bracket")]
+    CompactionBoundaryCrossed { event_type: &'static str },
+    #[error("{event_type} is out of order in the open compaction bracket")]
+    CompactionBodyOutOfOrder { event_type: &'static str },
+    #[error("successful compaction/end requires its adjacent replacement checkpoint")]
+    CompactionSuccessWithoutReplacement,
+    #[error("durable compaction/start requires a complete dispatch snapshot")]
+    DurableCompactionDispatchRequired,
+    #[error("durable compaction/end cannot use the legacy string error shape")]
+    DurableLegacyCompactionError,
+    #[error("compaction dispatch does not match current Session facts: {0}")]
+    CompactionDispatchMismatch(&'static str),
     #[error("turn or step number has no representable successor")]
     IdentifierExhausted,
 }
@@ -219,6 +245,14 @@ pub enum SurfaceError {
     ToolResultWrongTarget,
     #[error("tool/result surface replacement may change only model-facing result content")]
     ToolResultChangedIdentity,
+    #[error("compaction checkpoint replacement does not exactly match its summary claim")]
+    CompactionReplacementMismatch,
+    #[error("compaction/prune must target one current tool/result node")]
+    PruneTargetNotToolResult,
+    #[error("durable tool/result replacement requires an adjacent compaction/prune marker")]
+    PruneReplacementWithoutMarker,
+    #[error("tool/result replacement does not match the adjacent compaction/prune marker")]
+    PruneReplacementMismatch,
 }
 
 /// Semantic validation shared by live append and replay.
@@ -249,6 +283,8 @@ pub enum EventValidationError {
     InvalidRetryEvent(&'static str),
     #[error("invalid approval event: {0}")]
     InvalidApprovalEvent(&'static str),
+    #[error("invalid compaction event: {0}")]
+    InvalidCompactionEvent(&'static str),
     #[error("session contains {actual} events; maximum is {maximum}")]
     TooManyEvents { maximum: usize, actual: usize },
 }

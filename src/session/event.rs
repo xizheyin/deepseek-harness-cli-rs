@@ -1338,6 +1338,18 @@ pub enum EventKind {
     ApprovalDecided {
         decided: ApprovalDecidedEvent,
     },
+    CompactionStart {
+        start: super::CompactionStartEvent,
+    },
+    CompactionSummary {
+        summary: super::CompactionSummaryEvent,
+    },
+    CompactionEnd {
+        end: super::CompactionEndEvent,
+    },
+    CompactionPrune {
+        prune: super::CompactionPruneEvent,
+    },
     EndSeed,
     /// An unknown envelope retained only because `ignorable: true` made it safe to skip.
     Unknown {
@@ -1444,6 +1456,26 @@ impl EventKind {
         Self::ApprovalDecided { decided }
     }
 
+    #[must_use]
+    pub fn compaction_start(start: super::CompactionStartEvent) -> Self {
+        Self::CompactionStart { start }
+    }
+
+    #[must_use]
+    pub fn compaction_summary(summary: super::CompactionSummaryEvent) -> Self {
+        Self::CompactionSummary { summary }
+    }
+
+    #[must_use]
+    pub fn compaction_end(end: super::CompactionEndEvent) -> Self {
+        Self::CompactionEnd { end }
+    }
+
+    #[must_use]
+    pub fn compaction_prune(prune: super::CompactionPruneEvent) -> Self {
+        Self::CompactionPrune { prune }
+    }
+
     /// Stable wire tag for this event.
     #[must_use]
     pub fn event_type(&self) -> &str {
@@ -1464,6 +1496,10 @@ impl EventKind {
             Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::ApprovalAsked { .. } => "approval/asked",
             Self::ApprovalDecided { .. } => "approval/decided",
+            Self::CompactionStart { .. } => "compaction/start",
+            Self::CompactionSummary { .. } => "compaction/summary",
+            Self::CompactionEnd { .. } => "compaction/end",
+            Self::CompactionPrune { .. } => "compaction/prune",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { event_type, .. } => event_type,
         }
@@ -1487,6 +1523,10 @@ impl EventKind {
             Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::ApprovalAsked { .. } => "approval/asked",
             Self::ApprovalDecided { .. } => "approval/decided",
+            Self::CompactionStart { .. } => "compaction/start",
+            Self::CompactionSummary { .. } => "compaction/summary",
+            Self::CompactionEnd { .. } => "compaction/end",
+            Self::CompactionPrune { .. } => "compaction/prune",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { .. } => return None,
         })
@@ -1533,6 +1573,10 @@ impl EventKind {
             }
             Self::ApprovalAsked { asked } => asked.validate()?,
             Self::ApprovalDecided { decided } => validate_approval_id(&decided.id)?,
+            Self::CompactionStart { start } => start.validate()?,
+            Self::CompactionSummary { summary } => summary.validate()?,
+            Self::CompactionEnd { end } => end.validate()?,
+            Self::CompactionPrune { prune } => prune.validate()?,
             // These values can only be created through their bounded, validated
             // constructors, so append has no second placeholder validation pass.
             Self::AssistantChunk { .. } | Self::Unknown { .. } => {}

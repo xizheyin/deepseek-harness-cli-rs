@@ -83,6 +83,22 @@ string_id!(
     AttachmentId
 );
 
+/// Why one provider-neutral model call is being made.
+///
+/// This value lives in the model layer because a durable compaction dispatch
+/// records it without depending on a concrete Provider implementation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestPurpose {
+    /// Normal conversation or tool continuation.
+    #[default]
+    Conversation,
+    /// Short auxiliary title generation.
+    SessionTitle,
+    /// Context-compaction generation.
+    Compaction,
+}
+
 /// A finite JSON number other than negative zero.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct FiniteNumber(f64);

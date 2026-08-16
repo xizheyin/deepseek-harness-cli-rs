@@ -130,7 +130,7 @@ Rust deliberately differs in these physical and safety details:
     across the allowed successful transactions and fails clearly if that still
     cannot produce an encodable request; it never truncates provenance.
 11. A failed Rust `compaction/end` stores the existing bounded provider-neutral
-    `LlmFailure` name/code/sanitized message rather than an upstream plugin's raw
+    `LlmFailure` code/sanitized message rather than an upstream plugin's raw
     JavaScript error chain. This keeps the close claim auditable and prevents
     opaque payloads or secrets from entering the journal. Users retain the
     actionable failure class/message; comparison tests normalize this envelope
@@ -1368,6 +1368,115 @@ original request fits remains advisory and does not produce this turn error.
 After an actual Provider `CONTEXT_WINDOW_EXCEEDED`, failure to make any durable
 replacement progress preserves the original provider failure instead of
 rewriting it as `AGENT_CONTEXT_LIMIT`.
+
+### Frozen compaction event wire
+
+The Rust format keeps the four upstream event tags and all upstream field
+names. `compaction/start` adds one optional `dispatch` object. Its absence is
+accepted only by the finite in-memory compatibility reader for an upstream
+event; every new or resumed Rust durable journal uses `DurableStrict` and
+requires it. This prevents a temporary Phase 8 payload from becoming an
+accidental permanent format while still allowing the committed upstream oracle
+to decode.
+
+```text
+compaction/start.data = {
+  compactionId,
+  sourceCommandId?,
+  turn: positive-safe-integer | null,
+  dispatch?: {
+    trigger: "pressure" | "context-overflow" | "hard-limit",
+    sourceSurfaceGeneration: non-negative-safe-integer,
+    shadowedRange: { start: EventSeq, end: EventSeq },
+    shadowedSeqs: EventSeq[],
+    preparedCall: {
+      config: LlmCallConfig,
+      adapterDefaults: LlmCallConfigAdapterDefaults,
+      contextWindow?: non-negative-safe-integer,
+      retryPolicy: {
+        mode: "normal" | "always",
+        maxRetries?: non-negative-safe-integer,
+        retryableCodes: string[],
+        backoff: {
+          initialDelayMs: positive-finite-number,
+          maxDelayMs: positive-finite-number,
+          jitterRatio: finite-number
+        }
+      }
+    },
+    requestHeaderSeq?: EventSeq,
+    requestContextSeq?: EventSeq,
+    system?: string,
+    tools: ToolSchema[],
+    sessionId: SessionId,
+    purpose: "compaction",
+    instruction: Message,
+    instructionFormatVersion: 1
+  }
+}
+
+compaction/summary.data = {
+  compactionId,
+  sourceCommandId?,
+  summary: ContentBlock[],
+  rawOutput?,
+  llmStreamCall?: true,
+  shadowedRange,
+  shadowedSeqs,
+  shadowedTokenCount,
+  provider,
+  model,
+  maxTokens?,
+  usage?
+}
+
+compaction/end.data = {
+  compactionId,
+  sourceCommandId?,
+  turn: positive-safe-integer | null,
+  error?: LlmFailure | string
+}
+
+compaction/prune.data = {
+  shadowedRange,
+  shadowedSeqs,
+  shadowedTokenCount
+}
+```
+
+The string form of `compaction/end.error` is read only by the in-memory
+upstream-compatibility path. That reader accepts arbitrary UTF-8 (including an
+empty string and control characters, matching upstream `errorChain`) up to a
+32 KiB Rust safety cap. Rust durable production and cold replay reject it;
+they write the existing provider-neutral `LlmFailure` object. The earlier draft
+incorrectly mentioned a failure `name`; `LlmFailure` has only the durable
+message/code plus its optional bounded status, retry-after, and request ID, so
+those are the authoritative fields. A durable compaction failure additionally
+requires a nonempty, non-control code <= 256 bytes, a nonempty message <= 32 KiB,
+a nonempty, non-control request ID <= 1,024 bytes when present, and complete
+compact failure JSON <= 48 KiB. Together with identifiers below this
+leaves a conservative margin inside the reserved 64 KiB close row; the exact
+encoded row is still preflighted before `compaction/start`.
+
+Both `compactionId` and `sourceCommandId`, when present, are 1 to 1,024
+non-control UTF-8 bytes. Provider/model are 1 to 1,024 non-control UTF-8 bytes.
+`shadowedSeqs` is nonempty, ordered by current-surface position, has distinct
+entries, begins/ends at `shadowedRange.start/end`, and contains at most 4,094
+entries for a summary or exactly one for a prune. A summary/raw-output list has
+at most 4,096 blocks; tools have at most 256 entries; system text has at most
+4 MiB. Retry policy has at most 256 distinct nonempty codes of at most 256
+bytes; normal mode requires `maxRetries` and a nonempty code list, while always
+mode omits both retries and codes. Backoff uses the existing timer ceiling and
+requires initial <= maximum and jitter in `[0, 1]`.
+
+`instructionFormatVersion` is exactly `1`. Its message ID is 1 to 1,024 visible
+ASCII bytes. The message is a user-role plugin
+message sourced from `dsh.compaction`; its complete body, ID, extension fields,
+and source are facts, not regenerated during replay. The future live producer
+owns the exact canonical instruction text and deterministic message ID. The
+Session schema validates its bounded role/source/version shape and preserves
+the exact message; cold replay compares the complete dispatch snapshot rather
+than trusting a recomputed string.
 
 The exact first-turn order is: validate the raw `TurnProposal` shape/bytes;
 materialize a deferred journal; claim and append `turn/start`; reserve but do

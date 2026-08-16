@@ -7,16 +7,21 @@ use std::{
 
 use crate::{
     json_value::json_values_equal,
-    model::{CallId, Message},
+    model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger},
 };
 
 use super::{
-    ApprovalOutcome, ApprovalRequestId, EventKind, EventSeq, MAX_SOURCE_EVENT_SEQS, SessionEvent,
-    StepId, SurfaceOp, TurnId,
+    ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionId, CompactionRange,
+    CompactionTrigger, EventKind, EventSeq, MAX_SAFE_INTEGER, MAX_SOURCE_EVENT_SEQS, SessionEvent,
+    SessionId, StepId, SurfaceOp, TurnId,
     codec::event_data_value,
+    compaction::{
+        COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
+        ModelVisibleDispatchSnapshot,
+    },
     error::{EventValidationError, SurfaceError, TransitionError},
     event::{RECOVERY_TOOL_RESULT_ID_PREFIX, TOOL_NOT_STARTED},
-    recovery::RecoveryAdmission,
+    recovery::{RecoveryAdmission, RecoveryCompactionStage},
 };
 
 const MAX_DURABLE_TOOL_CALLS_PER_STEP: usize = 64;
@@ -32,6 +37,7 @@ pub(crate) enum ValidationPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValidationAdmission {
     Ordinary,
+    CompatibilityReplay,
     HistoricalScan,
 }
 
@@ -80,6 +86,56 @@ enum DurableApproval {
         id: ApprovalRequestId,
         outcome: ApprovalOutcome,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpenCompaction {
+    id: CompactionId,
+    source_command_id: Option<String>,
+    owner: Option<TurnId>,
+    start_seq: EventSeq,
+    recipe: Option<CompactionRecipe>,
+    phase: CompactionPhase,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompactionRecipe {
+    trigger: CompactionTrigger,
+    range: CompactionRange,
+    shadowed_seqs: Arc<Vec<EventSeq>>,
+    provider: String,
+    model: String,
+    max_tokens: Option<NonNegativeSafeInteger>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CompactionPhase {
+    Started,
+    Summarized {
+        summary_seq: EventSeq,
+        range: CompactionRange,
+        shadowed_seqs: Arc<Vec<EventSeq>>,
+        summary_blocks: Arc<Vec<crate::model::JsonValue>>,
+        shadowed_token_count: NonNegativeSafeInteger,
+    },
+    Replaced {
+        summary_seq: EventSeq,
+        checkpoint_seq: EventSeq,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PruneShadowClaim {
+    target_seq: EventSeq,
+    shadowed_token_count: NonNegativeSafeInteger,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompactionState {
+    surface_generation: u64,
+    open: Option<OpenCompaction>,
+    prune_claim: Option<PruneShadowClaim>,
+    orphan_prune_count: u64,
 }
 
 /// Bounded durable facts needed to derive one deterministic recovery suffix.
@@ -217,11 +273,15 @@ impl SessionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Projection {
     policy: ValidationPolicy,
+    session_id: Option<SessionId>,
     next_turn: TurnId,
     boundary: Boundary,
     surface_nodes: Arc<Vec<SurfaceNode>>,
     request_header: Option<super::EpochHeader>,
+    request_header_seq: Option<EventSeq>,
     request_context: Option<super::RequestContext>,
+    request_context_seq: Option<EventSeq>,
+    compaction: CompactionState,
     pending_approvals: Vec<ApprovalRequestId>,
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
     retry_chains: Arc<BTreeMap<RetryChainKey, RetryChainState>>,
@@ -273,11 +333,15 @@ impl Projection {
     pub(crate) fn empty(policy: ValidationPolicy) -> Self {
         Self {
             policy,
+            session_id: None,
             next_turn: TurnId::first(),
             boundary: Boundary::Idle,
             surface_nodes: Arc::new(Vec::new()),
             request_header: None,
+            request_header_seq: None,
             request_context: None,
+            request_context_seq: None,
+            compaction: CompactionState::default(),
             pending_approvals: Vec::new(),
             owned_approval_ids: Arc::new(BTreeSet::new()),
             retry_chains: Arc::new(BTreeMap::new()),
@@ -285,12 +349,36 @@ impl Projection {
         }
     }
 
+    pub(crate) fn for_session(policy: ValidationPolicy, session_id: SessionId) -> Self {
+        let mut projection = Self::empty(policy);
+        projection.session_id = Some(session_id);
+        projection
+    }
+
     /// Validate and apply one candidate to a detached projection clone.
     pub(crate) fn with_event(&self, event: &SessionEvent) -> Result<Self, EventValidationError> {
         event.kind.validate()?;
         let mut next = self.clone();
+        let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
         next.apply_transition(event, ValidationAdmission::Ordinary)?;
         next.apply_surface(event)?;
+        next.compaction = compaction;
+        Ok(next)
+    }
+
+    /// Apply one event through the finite released-format compatibility
+    /// reader. New live events must continue through `with_event`.
+    pub(crate) fn with_compatible_event(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<Self, EventValidationError> {
+        event.kind.validate()?;
+        let mut next = self.clone();
+        let compaction =
+            next.next_compaction_state(event, ValidationAdmission::CompatibilityReplay)?;
+        next.apply_transition(event, ValidationAdmission::CompatibilityReplay)?;
+        next.apply_surface(event)?;
+        next.compaction = compaction;
         Ok(next)
     }
 
@@ -304,8 +392,10 @@ impl Projection {
         event: &SessionEvent,
     ) -> Result<(), EventValidationError> {
         event.kind.validate()?;
+        let compaction = self.next_compaction_state(event, ValidationAdmission::Ordinary)?;
         self.apply_transition(event, ValidationAdmission::Ordinary)?;
         self.apply_surface(event)?;
+        self.compaction = compaction;
         Ok(())
     }
 
@@ -316,8 +406,10 @@ impl Projection {
     ) -> Result<(), EventValidationError> {
         let event = admission.event();
         event.kind.validate()?;
+        let compaction = self.next_compaction_state(event, ValidationAdmission::HistoricalScan)?;
         self.apply_transition(event, ValidationAdmission::HistoricalScan)?;
         self.apply_surface(event)?;
+        self.compaction = compaction;
         Ok(())
     }
 
@@ -434,6 +526,544 @@ impl Projection {
 
     pub(crate) fn request_context(&self) -> Option<&super::RequestContext> {
         self.request_context.as_ref()
+    }
+
+    pub(crate) fn interrupted_compaction_stage(&self) -> Option<RecoveryCompactionStage> {
+        self.compaction.open.as_ref().map(|open| match &open.phase {
+            CompactionPhase::Started => RecoveryCompactionStage::Started,
+            CompactionPhase::Summarized { .. } => RecoveryCompactionStage::Summarized,
+            CompactionPhase::Replaced { .. } => RecoveryCompactionStage::Replaced,
+        })
+    }
+
+    pub(crate) fn orphan_prune_markers(&self) -> u64 {
+        self.compaction
+            .orphan_prune_count
+            .saturating_add(u64::from(self.compaction.prune_claim.is_some()))
+    }
+
+    pub(crate) fn compaction_recovery_is_consistent(&self) -> bool {
+        self.compaction.open.is_none()
+            || (self.pending_approvals.is_empty() && !self.has_pending_durable_call())
+    }
+
+    fn next_compaction_state(
+        &self,
+        event: &SessionEvent,
+        admission: ValidationAdmission,
+    ) -> Result<CompactionState, EventValidationError> {
+        let mut next = self.compaction.clone();
+
+        if self.policy == ValidationPolicy::DurableStrict
+            && admission == ValidationAdmission::Ordinary
+            && next.open.is_some()
+            && matches!(event.kind, EventKind::StepEnd { .. })
+        {
+            return Err(TransitionError::DurableRecoveryEventNotAllowed {
+                event_type: "step/end",
+            }
+            .into());
+        }
+
+        let recovery_only_ordinary = self.policy == ValidationPolicy::DurableStrict
+            && admission == ValidationAdmission::Ordinary
+            && (matches!(
+                &event.kind,
+                EventKind::EndSeed
+                    | EventKind::TurnEnd {
+                        reason: super::TurnEndReason::Interrupted,
+                        ..
+                    }
+            ) || matches!(
+                &event.kind,
+                EventKind::ToolResult { message, .. }
+                    if message.id().as_str().starts_with(RECOVERY_TOOL_RESULT_ID_PREFIX)
+            ));
+        if recovery_only_ordinary {
+            return Ok(next);
+        }
+
+        if admission == ValidationAdmission::HistoricalScan {
+            if matches!(event.kind, EventKind::EndSeed) {
+                next.open = None;
+                next.prune_claim = None;
+                next.orphan_prune_count = 0;
+            }
+            Self::advance_surface_generation(&mut next, event)?;
+            return Ok(next);
+        }
+
+        if self.policy == ValidationPolicy::MemoryCompatible
+            && matches!(event.kind, EventKind::EndSeed)
+        {
+            next.open = None;
+            next.prune_claim = None;
+            next.orphan_prune_count = 0;
+            return Ok(next);
+        }
+
+        let consumed_prune = self.apply_prune_adjacency(&mut next, event)?;
+
+        if let Some(open) = next.open.clone() {
+            next.open = self.advance_open_compaction(event, open, admission)?;
+        } else {
+            match &event.kind {
+                EventKind::CompactionStart { start } => {
+                    next.open = Some(self.validate_compaction_start(event.seq, start, admission)?);
+                }
+                EventKind::CompactionSummary { .. } => {
+                    return Err(TransitionError::CompactionWithoutStart {
+                        event_type: "compaction/summary",
+                    }
+                    .into());
+                }
+                EventKind::CompactionEnd { .. } => {
+                    return Err(TransitionError::CompactionWithoutStart {
+                        event_type: "compaction/end",
+                    }
+                    .into());
+                }
+                EventKind::CompactionPrune { prune } => {
+                    let target = prune.shadowed_seqs()[0];
+                    let Some(node) = self.surface_nodes.iter().find(|node| node.seq == target)
+                    else {
+                        return Err(SurfaceError::PruneTargetNotToolResult.into());
+                    };
+                    if node.kind != SurfaceNodeKind::ToolResult {
+                        return Err(SurfaceError::PruneTargetNotToolResult.into());
+                    }
+                    next.prune_claim = Some(PruneShadowClaim {
+                        target_seq: target,
+                        shadowed_token_count: prune.shadowed_token_count(),
+                    });
+                }
+                EventKind::UserMessage { message }
+                    if matches!(event.surface_op, Some(SurfaceOp::Replace(_)))
+                        && is_compaction_checkpoint_source(message) =>
+                {
+                    return Err(TransitionError::CompactionWithoutStart {
+                        event_type: "user/message replacement",
+                    }
+                    .into());
+                }
+                EventKind::ToolResult { .. }
+                    if self.policy == ValidationPolicy::DurableStrict
+                        && matches!(event.surface_op, Some(SurfaceOp::Replace(_)))
+                        && !consumed_prune =>
+                {
+                    return Err(SurfaceError::PruneReplacementWithoutMarker.into());
+                }
+                _ => {}
+            }
+        }
+
+        Self::advance_surface_generation(&mut next, event)?;
+        Ok(next)
+    }
+
+    fn advance_surface_generation(
+        state: &mut CompactionState,
+        event: &SessionEvent,
+    ) -> Result<(), TransitionError> {
+        if event.kind.is_surface_eligible() {
+            state.surface_generation = state
+                .surface_generation
+                .checked_add(1)
+                .filter(|generation| *generation <= MAX_SAFE_INTEGER)
+                .ok_or(TransitionError::IdentifierExhausted)?;
+        }
+        Ok(())
+    }
+
+    fn apply_prune_adjacency(
+        &self,
+        state: &mut CompactionState,
+        event: &SessionEvent,
+    ) -> Result<bool, EventValidationError> {
+        let Some(claim) = state.prune_claim.take() else {
+            return Ok(false);
+        };
+        if let Some(SurfaceOp::Replace(replacement)) = &event.surface_op {
+            let is_exact_tool_result = matches!(event.kind, EventKind::ToolResult { .. })
+                && replacement.start == claim.target_seq
+                && replacement.end == claim.target_seq
+                && event.source_event_seqs.as_deref() == Some([claim.target_seq].as_slice());
+            if is_exact_tool_result {
+                return Ok(true);
+            }
+            // A prune marker prices exactly the immediately following rewrite. Letting a
+            // different replacement pass would make consumers associate that price with the
+            // wrong surface mutation.
+            return Err(SurfaceError::PruneReplacementMismatch.into());
+        }
+        state.orphan_prune_count = state
+            .orphan_prune_count
+            .checked_add(1)
+            .ok_or(TransitionError::IdentifierExhausted)?;
+        Ok(false)
+    }
+
+    fn validate_compaction_start(
+        &self,
+        seq: EventSeq,
+        start: &super::CompactionStartEvent,
+        admission: ValidationAdmission,
+    ) -> Result<OpenCompaction, EventValidationError> {
+        if start.turn() != self.open_turn() {
+            return Err(TransitionError::CompactionOwnerMismatch {
+                event_type: "compaction/start",
+            }
+            .into());
+        }
+        let recipe = match start.dispatch() {
+            Some(dispatch) => Some(self.validate_compaction_dispatch(seq, dispatch)?),
+            None if admission != ValidationAdmission::CompatibilityReplay => {
+                return Err(TransitionError::DurableCompactionDispatchRequired.into());
+            }
+            None => None,
+        };
+        Ok(OpenCompaction {
+            id: start.compaction_id().clone(),
+            source_command_id: start.source_command_id().map(str::to_owned),
+            owner: start.turn(),
+            start_seq: seq,
+            recipe,
+            phase: CompactionPhase::Started,
+        })
+    }
+
+    fn validate_compaction_dispatch(
+        &self,
+        start_seq: EventSeq,
+        dispatch: &ModelVisibleDispatchSnapshot,
+    ) -> Result<CompactionRecipe, EventValidationError> {
+        if dispatch.source_surface_generation().get() != self.compaction.surface_generation {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "surface generation changed before compaction/start",
+            )
+            .into());
+        }
+        if !self.surface_range_matches(dispatch.shadowed_range(), dispatch.shadowed_seqs())
+            || dispatch
+                .shadowed_seqs()
+                .iter()
+                .any(|shadowed| *shadowed >= start_seq)
+        {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "shadowed range is not the selected current surface",
+            )
+            .into());
+        }
+        if self
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id != dispatch.session_id())
+        {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "sessionId does not match the active Session",
+            )
+            .into());
+        }
+        if dispatch.request_header_seq() != self.request_header_seq {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "requestHeaderSeq is not the latest header",
+            )
+            .into());
+        }
+        if dispatch.request_context_seq() != self.request_context_seq {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "requestContextSeq is not the latest context",
+            )
+            .into());
+        }
+        if let Some(header) = &self.request_header {
+            let canonical = header.canonicalized();
+            if dispatch.system() != canonical.system.as_deref()
+                || dispatch.tools() != canonical.tools.as_deref().unwrap_or_default()
+            {
+                return Err(TransitionError::CompactionDispatchMismatch(
+                    "system or tools differ from the referenced request header",
+                )
+                .into());
+            }
+        }
+        if !self.pending_approvals.is_empty() || self.has_pending_durable_call() {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "compaction cannot start with unresolved approval or tool work",
+            )
+            .into());
+        }
+        match (dispatch.trigger(), &self.boundary) {
+            (CompactionTrigger::Pressure | CompactionTrigger::HardLimit, Boundary::Turn { .. })
+            | (CompactionTrigger::ContextOverflow, Boundary::Step { .. }) => {}
+            (CompactionTrigger::Pressure | CompactionTrigger::HardLimit, _) => {
+                return Err(TransitionError::CompactionDispatchMismatch(
+                    "pressure and hard-limit compaction require an open turn without a step",
+                )
+                .into());
+            }
+            (CompactionTrigger::ContextOverflow, _) => {
+                return Err(TransitionError::CompactionDispatchMismatch(
+                    "context-overflow compaction requires an open step",
+                )
+                .into());
+            }
+        }
+        Ok(CompactionRecipe {
+            trigger: dispatch.trigger(),
+            range: dispatch.shadowed_range(),
+            shadowed_seqs: Arc::new(dispatch.shadowed_seqs().to_vec()),
+            provider: dispatch.prepared_call().config().provider().to_owned(),
+            model: dispatch.prepared_call().config().model().to_owned(),
+            max_tokens: dispatch.prepared_call().config().max_tokens(),
+        })
+    }
+
+    fn has_pending_durable_call(&self) -> bool {
+        match &self.boundary {
+            Boundary::Step {
+                pending_calls,
+                declared_calls,
+                ..
+            } => !pending_calls.is_empty() || declared_calls.iter().any(|call| !call.result_seen),
+            Boundary::Idle | Boundary::Turn { .. } => false,
+        }
+    }
+
+    fn advance_open_compaction(
+        &self,
+        event: &SessionEvent,
+        mut open: OpenCompaction,
+        admission: ValidationAdmission,
+    ) -> Result<Option<OpenCompaction>, EventValidationError> {
+        match &event.kind {
+            EventKind::CompactionStart { .. } => Err(TransitionError::CompactionAlreadyOpen {
+                open: open.id.clone(),
+            }
+            .into()),
+            EventKind::CompactionSummary { summary } => {
+                self.validate_compaction_identity(
+                    "compaction/summary",
+                    &open,
+                    summary.compaction_id(),
+                    summary.source_command_id(),
+                )?;
+                if !matches!(open.phase, CompactionPhase::Started) {
+                    return Err(TransitionError::CompactionBodyOutOfOrder {
+                        event_type: "compaction/summary",
+                    }
+                    .into());
+                }
+                if !event_is_immediately_after(event.seq, open.start_seq) {
+                    return Err(TransitionError::CompactionBodyOutOfOrder {
+                        event_type: "compaction/summary",
+                    }
+                    .into());
+                }
+                if self.open_turn() != open.owner
+                    || !self
+                        .surface_range_matches(summary.shadowed_range(), summary.shadowed_seqs())
+                {
+                    return Err(TransitionError::CompactionDispatchMismatch(
+                        "summary does not match its owner or selected surface",
+                    )
+                    .into());
+                }
+                if let Some(recipe) = &open.recipe {
+                    if summary.shadowed_range() != recipe.range
+                        || summary.shadowed_seqs() != recipe.shadowed_seqs.as_slice()
+                        || summary.provider() != recipe.provider
+                        || summary.model() != recipe.model
+                        || summary.max_tokens() != recipe.max_tokens
+                        || (self.policy == ValidationPolicy::DurableStrict
+                            && !summary.is_llm_stream_call())
+                    {
+                        return Err(TransitionError::CompactionDispatchMismatch(
+                            "summary differs from the prepared compaction call",
+                        )
+                        .into());
+                    }
+                }
+                let summary_blocks = summary
+                    .summary()
+                    .iter()
+                    .map(|block| block.raw().clone())
+                    .collect::<Vec<_>>();
+                open.phase = CompactionPhase::Summarized {
+                    summary_seq: event.seq,
+                    range: summary.shadowed_range(),
+                    shadowed_seqs: Arc::new(summary.shadowed_seqs().to_vec()),
+                    summary_blocks: Arc::new(summary_blocks),
+                    shadowed_token_count: summary.shadowed_token_count(),
+                };
+                Ok(Some(open))
+            }
+            EventKind::UserMessage { message }
+                if matches!(event.surface_op, Some(SurfaceOp::Replace(_))) =>
+            {
+                let CompactionPhase::Summarized {
+                    summary_seq,
+                    range,
+                    shadowed_seqs,
+                    summary_blocks,
+                    ..
+                } = &open.phase
+                else {
+                    return Err(TransitionError::CompactionBodyOutOfOrder {
+                        event_type: "user/message replacement",
+                    }
+                    .into());
+                };
+                if !event_is_immediately_after(event.seq, *summary_seq)
+                    || !self.validate_checkpoint_replacement(
+                        event,
+                        message,
+                        &open,
+                        *summary_seq,
+                        *range,
+                        shadowed_seqs,
+                        summary_blocks,
+                    )
+                {
+                    return Err(SurfaceError::CompactionReplacementMismatch.into());
+                }
+                open.phase = CompactionPhase::Replaced {
+                    summary_seq: *summary_seq,
+                    checkpoint_seq: event.seq,
+                };
+                open.recipe = None;
+                Ok(Some(open))
+            }
+            EventKind::CompactionEnd { end } => {
+                self.validate_compaction_identity(
+                    "compaction/end",
+                    &open,
+                    end.compaction_id(),
+                    end.source_command_id(),
+                )?;
+                if end.turn() != open.owner || self.open_turn() != open.owner {
+                    return Err(TransitionError::CompactionOwnerMismatch {
+                        event_type: "compaction/end",
+                    }
+                    .into());
+                }
+                if admission != ValidationAdmission::CompatibilityReplay
+                    && end.error().is_some_and(CompactionEndError::is_legacy)
+                {
+                    return Err(TransitionError::DurableLegacyCompactionError.into());
+                }
+                let previous = match open.phase {
+                    CompactionPhase::Started => open.start_seq,
+                    CompactionPhase::Summarized { summary_seq, .. } => summary_seq,
+                    CompactionPhase::Replaced { checkpoint_seq, .. } => checkpoint_seq,
+                };
+                if !event_is_immediately_after(event.seq, previous) {
+                    return Err(TransitionError::CompactionBodyOutOfOrder {
+                        event_type: "compaction/end",
+                    }
+                    .into());
+                }
+                if end.error().is_none() && !matches!(open.phase, CompactionPhase::Replaced { .. })
+                {
+                    return Err(TransitionError::CompactionSuccessWithoutReplacement.into());
+                }
+                Ok(None)
+            }
+            _ => Err(TransitionError::CompactionBoundaryCrossed {
+                event_type: event.kind.event_type_static(),
+            }
+            .into()),
+        }
+    }
+
+    fn validate_compaction_identity(
+        &self,
+        event_type: &'static str,
+        open: &OpenCompaction,
+        actual_id: &CompactionId,
+        actual_source_command_id: Option<&str>,
+    ) -> Result<(), TransitionError> {
+        if &open.id != actual_id {
+            return Err(TransitionError::CompactionIdMismatch {
+                event_type,
+                expected: open.id.clone(),
+                actual: actual_id.clone(),
+            });
+        }
+        if open.source_command_id.as_deref() != actual_source_command_id {
+            return Err(TransitionError::CompactionSourceCommandMismatch { event_type });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_checkpoint_replacement(
+        &self,
+        event: &SessionEvent,
+        message: &Message,
+        open: &OpenCompaction,
+        summary_seq: EventSeq,
+        range: CompactionRange,
+        shadowed_seqs: &[EventSeq],
+        summary_blocks: &[crate::model::JsonValue],
+    ) -> bool {
+        let Some(SurfaceOp::Replace(replacement)) = &event.surface_op else {
+            return false;
+        };
+        if replacement.start != range.start() || replacement.end != range.end() {
+            return false;
+        }
+        let mut expected_sources = Vec::with_capacity(shadowed_seqs.len() + 2);
+        expected_sources.push(open.start_seq);
+        expected_sources.push(summary_seq);
+        expected_sources.extend_from_slice(shadowed_seqs);
+        if event.source_event_seqs.as_deref() != Some(expected_sources.as_slice()) {
+            return false;
+        }
+        let MessageSourceKind::Plugin { plugin, .. } = message.source().kind() else {
+            return false;
+        };
+        let plugin_is_valid = plugin == COMPACTION_CHECKPOINT_SOURCE;
+        if !plugin_is_valid || !checkpoint_source_matches(message, open) {
+            return false;
+        }
+        let content = message.content();
+        if content.len() != summary_blocks.len() + 2
+            || !content.first().is_some_and(|block| {
+                canonical_text_block_matches(block, COMPACTION_CHECKPOINT_PREFIX)
+            })
+            || !content.last().is_some_and(|block| {
+                canonical_text_block_matches(block, COMPACTION_CHECKPOINT_SUFFIX)
+            })
+        {
+            return false;
+        }
+        content[1..content.len() - 1]
+            .iter()
+            .zip(summary_blocks)
+            .all(|(actual, expected)| actual.raw() == expected)
+    }
+
+    fn surface_range_matches(&self, range: CompactionRange, expected: &[EventSeq]) -> bool {
+        let Some(start) = self
+            .surface_nodes
+            .iter()
+            .position(|node| node.seq == range.start())
+        else {
+            return false;
+        };
+        let Some(end) = self
+            .surface_nodes
+            .iter()
+            .position(|node| node.seq == range.end())
+        else {
+            return false;
+        };
+        start <= end
+            && self.surface_nodes[start..=end]
+                .iter()
+                .map(|node| node.seq)
+                .eq(expected.iter().copied())
     }
 
     fn apply_transition(
@@ -658,6 +1288,7 @@ impl Projection {
                     });
                 }
                 self.request_header = Some(header.canonicalized());
+                self.request_header_seq = Some(event.seq);
             }
             EventKind::RequestContext { context } => {
                 if self.open_turn().is_none() {
@@ -666,6 +1297,7 @@ impl Projection {
                     });
                 }
                 self.request_context = Some(context.clone());
+                self.request_context_seq = Some(event.seq);
             }
             EventKind::LlmRetry { retry } => {
                 self.apply_retry(retry)?;
@@ -718,7 +1350,13 @@ impl Projection {
                     });
                 }
             }
-            EventKind::UserMessage { .. } | EventKind::EndSeed | EventKind::Unknown { .. } => {}
+            EventKind::CompactionStart { .. }
+            | EventKind::CompactionSummary { .. }
+            | EventKind::CompactionEnd { .. }
+            | EventKind::CompactionPrune { .. }
+            | EventKind::UserMessage { .. }
+            | EventKind::EndSeed
+            | EventKind::Unknown { .. } => {}
         }
         Ok(())
     }
@@ -1235,6 +1873,61 @@ impl Projection {
     }
 }
 
+fn event_is_immediately_after(current: EventSeq, previous: EventSeq) -> bool {
+    previous.get().checked_add(1) == Some(current.get())
+}
+
+fn checkpoint_source_matches(message: &Message, open: &OpenCompaction) -> bool {
+    let Some(fields) = message.source().raw().as_value().as_object() else {
+        return false;
+    };
+    let expected_len = if open.source_command_id.is_some() {
+        4
+    } else {
+        3
+    };
+    fields.len() == expected_len
+        && fields.get("kind").and_then(serde_json::Value::as_str) == Some("plugin")
+        && fields.get("plugin").and_then(serde_json::Value::as_str)
+            == Some(COMPACTION_CHECKPOINT_SOURCE)
+        && fields
+            .get("compactionId")
+            .and_then(serde_json::Value::as_str)
+            == Some(open.id.as_str())
+        && match &open.source_command_id {
+            Some(expected) => {
+                fields
+                    .get("sourceCommandId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected.as_str())
+            }
+            None => !fields.contains_key("sourceCommandId"),
+        }
+}
+
+fn is_compaction_checkpoint_source(message: &Message) -> bool {
+    let MessageSourceKind::Plugin { plugin, .. } = message.source().kind() else {
+        return false;
+    };
+    plugin == COMPACTION_CHECKPOINT_SOURCE
+        && message
+            .source()
+            .raw()
+            .as_value()
+            .get("compactionId")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+fn canonical_text_block_matches(block: &crate::model::ContentBlock, expected: &str) -> bool {
+    let Some(fields) = block.raw().as_value().as_object() else {
+        return false;
+    };
+    fields.len() == 2
+        && fields.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        && fields.get("text").and_then(serde_json::Value::as_str) == Some(expected)
+}
+
 fn validate_durable_call_identity(id: &CallId, name: &str) -> Result<(), TransitionError> {
     if id.is_empty()
         || id.as_str().len() > 1_024
@@ -1269,6 +1962,10 @@ impl EventKind {
             Self::LlmRetryStarted { .. } => "llm/retry-started",
             Self::ApprovalAsked { .. } => "approval/asked",
             Self::ApprovalDecided { .. } => "approval/decided",
+            Self::CompactionStart { .. } => "compaction/start",
+            Self::CompactionSummary { .. } => "compaction/summary",
+            Self::CompactionEnd { .. } => "compaction/end",
+            Self::CompactionPrune { .. } => "compaction/prune",
             Self::EndSeed => "session/end-seed",
             Self::Unknown { .. } => "unknown",
         }
@@ -1293,17 +1990,21 @@ fn mask_tool_result_content(data: &mut serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use crate::{
         model::{CallId, ContentBlock, Message},
         session::{
             ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId, Clock,
-            ClockError, EventKind, EventSeq, NewEvent, Session, SessionEvent, StepId,
-            SurfaceIntent, TOOL_NOT_STARTED, ToolFailure, TransitionError, TurnEndReason, TurnId,
-            UnixMillis,
+            ClockError, EventKind, EventSeq, NewEvent, Session, SessionEvent, SessionId, StepId,
+            SurfaceError, SurfaceIntent, TOOL_NOT_STARTED, ToolFailure, TransitionError,
+            TurnEndReason, TurnId, UnixMillis,
         },
     };
 
-    use super::{Projection, ValidationPolicy};
+    use super::{
+        COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SUFFIX, Projection, ValidationPolicy,
+    };
 
     #[derive(Clone, Copy)]
     struct FixedClock;
@@ -1374,6 +2075,141 @@ mod tests {
                 })?;
         }
         Ok(projection)
+    }
+
+    fn wire_event(
+        event_type: &str,
+        seq: u64,
+        data: Value,
+        surface_op: Option<Value>,
+        sources: Option<Vec<u64>>,
+    ) -> SessionEvent {
+        let mut event = json!({
+            "type": event_type,
+            "seq": seq,
+            "time": 7,
+            "data": data,
+        });
+        if let Some(surface_op) = surface_op {
+            event["surfaceOp"] = surface_op;
+        }
+        if let Some(sources) = sources {
+            event["sourceEventSeqs"] = json!(sources);
+        }
+        crate::session::codec::decode_event(event, seq as usize).unwrap()
+    }
+
+    fn strict_compaction_trace() -> Vec<SessionEvent> {
+        vec![
+            wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
+            wire_event(
+                "user/message",
+                1,
+                json!({
+                    "id": "user-before-compaction",
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "old context" }],
+                    "source": { "kind": "user" },
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            wire_event(
+                "turn/end",
+                2,
+                json!({ "turn": 1, "reason": { "kind": "completed" } }),
+                None,
+                None,
+            ),
+            wire_event("turn/start", 3, json!({ "turn": 2 }), None, None),
+            wire_event(
+                "compaction/start",
+                4,
+                json!({
+                    "compactionId": "compact-strict-1",
+                    "turn": 2,
+                    "dispatch": {
+                        "trigger": "pressure",
+                        "sourceSurfaceGeneration": 1,
+                        "shadowedRange": { "start": 1, "end": 1 },
+                        "shadowedSeqs": [1],
+                        "preparedCall": {
+                            "config": { "provider": "summary-provider", "model": "summary-model" },
+                            "adapterDefaults": {},
+                            "retryPolicy": {
+                                "mode": "always",
+                                "retryableCodes": [],
+                                "backoff": {
+                                    "initialDelayMs": 1,
+                                    "maxDelayMs": 1,
+                                    "jitterRatio": 0
+                                }
+                            }
+                        },
+                        "system": "summary system",
+                        "tools": [],
+                        "sessionId": "strict-compaction",
+                        "purpose": "compaction",
+                        "instruction": {
+                            "id": "compaction-instruction",
+                            "role": "user",
+                            "content": [{ "type": "text", "text": "Summarize safely." }],
+                            "source": { "kind": "plugin", "plugin": "dsh.compaction" }
+                        },
+                        "instructionFormatVersion": 1
+                    }
+                }),
+                None,
+                None,
+            ),
+            wire_event(
+                "compaction/summary",
+                5,
+                json!({
+                    "compactionId": "compact-strict-1",
+                    "summary": [{ "type": "text", "text": "condensed context", "kept": true }],
+                    "rawOutput": [
+                        { "type": "reasoning", "text": "private" },
+                        { "type": "text", "text": "condensed context", "kept": true }
+                    ],
+                    "llmStreamCall": true,
+                    "shadowedRange": { "start": 1, "end": 1 },
+                    "shadowedSeqs": [1],
+                    "shadowedTokenCount": 3,
+                    "provider": "summary-provider",
+                    "model": "summary-model"
+                }),
+                None,
+                None,
+            ),
+            wire_event(
+                "user/message",
+                6,
+                json!({
+                    "id": "compaction-checkpoint",
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": COMPACTION_CHECKPOINT_PREFIX },
+                        { "type": "text", "text": "condensed context", "kept": true },
+                        { "type": "text", "text": COMPACTION_CHECKPOINT_SUFFIX }
+                    ],
+                    "source": {
+                        "kind": "plugin",
+                        "plugin": "compact",
+                        "compactionId": "compact-strict-1"
+                    }
+                }),
+                Some(json!({ "op": "replace", "start": 1, "end": 1 })),
+                Some(vec![4, 5, 1]),
+            ),
+            wire_event(
+                "compaction/end",
+                7,
+                json!({ "compactionId": "compact-strict-1", "turn": 2 }),
+                None,
+                None,
+            ),
+        ]
     }
 
     #[test]
@@ -1618,6 +2454,363 @@ mod tests {
         assert!(matches!(
             strict_prefix(&events).unwrap_err(),
             TransitionError::DurableToolResultWrongSource { .. }
+        ));
+    }
+
+    #[test]
+    fn strict_compaction_requires_one_adjacent_four_event_bracket() {
+        let events = strict_compaction_trace();
+        assert!(Session::replay(&events).is_ok());
+        let mut projection = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        for event in &events {
+            projection = projection.with_event(event).unwrap();
+        }
+
+        assert_eq!(projection.interrupted_compaction_stage(), None);
+        assert_eq!(projection.state().open_turn(), TurnId::new(2).ok());
+        assert_eq!(
+            projection.state().surface_nodes(),
+            &[EventSeq::new(6).unwrap()]
+        );
+        assert_eq!(projection.messages().len(), 1);
+
+        let mut without_replacement = events[..6].to_vec();
+        without_replacement.push(wire_event(
+            "compaction/end",
+            6,
+            json!({ "compactionId": "compact-strict-1", "turn": 2 }),
+            None,
+            None,
+        ));
+        let mut projection = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        let error = without_replacement
+            .iter()
+            .try_for_each(|event| {
+                projection = projection.with_event(event)?;
+                Ok::<_, crate::session::EventValidationError>(())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::session::EventValidationError::Transition(
+                TransitionError::CompactionSuccessWithoutReplacement
+            )
+        ));
+    }
+
+    #[test]
+    fn legacy_compaction_shapes_are_reader_only_not_live_append_shapes() {
+        let start = wire_event(
+            "compaction/start",
+            0,
+            json!({ "compactionId": "legacy", "turn": null }),
+            None,
+            None,
+        );
+        let end = wire_event(
+            "compaction/end",
+            1,
+            json!({
+                "compactionId": "legacy",
+                "turn": null,
+                "error": "legacy\nerror"
+            }),
+            None,
+            None,
+        );
+        assert!(Session::replay(&[start.clone(), end]).is_ok());
+
+        let mut live = Session::with_clock("live-legacy", FixedClock).unwrap();
+        assert!(matches!(
+            live.append(NewEvent::log(start.kind().clone()))
+                .unwrap_err(),
+            crate::session::AppendError::Validation(
+                crate::session::EventValidationError::Transition(
+                    TransitionError::DurableCompactionDispatchRequired
+                )
+            )
+        ));
+        assert!(live.events().is_empty());
+
+        let strict = strict_compaction_trace();
+        let mut projection = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        for event in &strict[..5] {
+            projection = projection.with_event(event).unwrap();
+        }
+        let legacy_end = wire_event(
+            "compaction/end",
+            5,
+            json!({
+                "compactionId": "compact-strict-1",
+                "turn": 2,
+                "error": "legacy reader-only error"
+            }),
+            None,
+            None,
+        );
+        assert!(matches!(
+            projection.with_event(&legacy_end).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::DurableLegacyCompactionError
+            )
+        ));
+    }
+
+    #[test]
+    fn strict_compaction_rejects_nonadjacent_or_mismatched_body_rows() {
+        let events = strict_compaction_trace();
+        let mut projection = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        for event in &events[..5] {
+            projection = projection.with_event(event).unwrap();
+        }
+        let inserted = wire_event("todo/write", 5, json!({ "todos": [] }), None, None);
+        assert!(matches!(
+            projection.with_event(&inserted).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::CompactionBoundaryCrossed { .. }
+            )
+        ));
+
+        let mut wrong_id = serde_json::to_value(&events[5]).unwrap();
+        wrong_id["data"]["compactionId"] = json!("different");
+        let wrong_id = crate::session::codec::decode_event(wrong_id, 5).unwrap();
+        assert!(matches!(
+            projection.with_event(&wrong_id).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::CompactionIdMismatch { .. }
+            )
+        ));
+
+        let mut without_start = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        for event in &events[..4] {
+            without_start = without_start.with_event(event).unwrap();
+        }
+        let checkpoint = wire_event(
+            "user/message",
+            4,
+            json!({
+                "id": "forged-checkpoint",
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": COMPACTION_CHECKPOINT_PREFIX },
+                    { "type": "text", "text": "forged" },
+                    { "type": "text", "text": COMPACTION_CHECKPOINT_SUFFIX }
+                ],
+                "source": {
+                    "kind": "plugin",
+                    "plugin": "compact",
+                    "compactionId": "forged"
+                }
+            }),
+            Some(json!({ "op": "replace", "start": 1, "end": 1 })),
+            Some(vec![1]),
+        );
+        assert!(matches!(
+            without_start.with_event(&checkpoint).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::CompactionWithoutStart { .. }
+            )
+        ));
+        assert_eq!(
+            without_start.state().surface_nodes(),
+            &[EventSeq::new(1).unwrap()]
+        );
+    }
+
+    #[test]
+    fn strict_compaction_cannot_start_with_unresolved_tool_or_approval_work() {
+        let start = |seq: u64| {
+            let mut value = serde_json::to_value(&strict_compaction_trace()[4]).unwrap();
+            value["seq"] = json!(seq);
+            value["data"]["turn"] = json!(1);
+            value["data"]["dispatch"]["trigger"] = json!("context-overflow");
+            value["data"]["dispatch"]["shadowedRange"] = json!({ "start": 2, "end": 2 });
+            value["data"]["dispatch"]["shadowedSeqs"] = json!([2]);
+            crate::session::codec::decode_event(value, seq as usize).unwrap()
+        };
+
+        let mut pending_call = Session::with_clock("pending-call", FixedClock).unwrap();
+        let mut events = open_step(&mut pending_call, &[("call-1", "read", "{}")]);
+        events.push(start(3));
+        assert!(matches!(
+            strict_prefix(&events).unwrap_err(),
+            TransitionError::CompactionDispatchMismatch(
+                "compaction cannot start with unresolved approval or tool work"
+            )
+        ));
+
+        let mut pending_approval = Session::with_clock("pending-approval", FixedClock).unwrap();
+        let mut events = open_step(&mut pending_approval, &[("call-1", "read", "{}")]);
+        events.push(append(
+            &mut pending_approval,
+            NewEvent::log(EventKind::tool_call(turn(), step(), "call-1", "read", "{}")),
+        ));
+        events.push(append(
+            &mut pending_approval,
+            NewEvent::log(EventKind::approval_asked(
+                ApprovalAskedEvent::new(
+                    ApprovalRequestId::new("approval-1"),
+                    "read",
+                    Some(CallId::new("call-1")),
+                    None,
+                )
+                .unwrap(),
+            )),
+        ));
+        events.push(start(5));
+        assert!(matches!(
+            strict_prefix(&events).unwrap_err(),
+            TransitionError::CompactionDispatchMismatch(
+                "compaction cannot start with unresolved approval or tool work"
+            )
+        ));
+    }
+
+    #[test]
+    fn prune_marker_is_consumed_only_by_its_exact_adjacent_tool_result_rewrite() {
+        let events = vec![
+            wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
+            wire_event("step/start", 1, json!({ "turn": 1, "step": 1 }), None, None),
+            wire_event(
+                "tool/call",
+                2,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "callId": "call-1",
+                    "name": "read",
+                    "arguments": "{}"
+                }),
+                None,
+                None,
+            ),
+            wire_event(
+                "tool/result",
+                3,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "result-1",
+                        "role": "user",
+                        "source": { "kind": "tool", "callId": "call-1" },
+                        "content": [{
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "content": [{ "type": "text", "text": "large result" }],
+                            "isError": false
+                        }]
+                    },
+                    "meta": { "kept": true }
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            wire_event(
+                "compaction/prune",
+                4,
+                json!({
+                    "shadowedRange": { "start": 3, "end": 3 },
+                    "shadowedSeqs": [3],
+                    "shadowedTokenCount": 10
+                }),
+                None,
+                None,
+            ),
+            wire_event(
+                "tool/result",
+                5,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "result-1",
+                        "role": "user",
+                        "source": { "kind": "tool", "callId": "call-1" },
+                        "content": [{
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "content": [{ "type": "text", "text": "pruned" }],
+                            "isError": false
+                        }]
+                    },
+                    "meta": { "kept": true }
+                }),
+                Some(json!({ "op": "replace", "start": 3, "end": 3 })),
+                Some(vec![3]),
+            ),
+        ];
+        let mut projection = Projection::empty(ValidationPolicy::MemoryCompatible);
+        for event in &events {
+            projection = projection.with_event(event).unwrap();
+        }
+        assert_eq!(
+            projection.state().surface_nodes(),
+            &[EventSeq::new(5).unwrap()]
+        );
+        assert_eq!(projection.orphan_prune_markers(), 0);
+
+        let mut marker_only = Projection::empty(ValidationPolicy::MemoryCompatible);
+        for event in &events[..5] {
+            marker_only = marker_only.with_event(event).unwrap();
+        }
+        marker_only = marker_only
+            .with_event(&wire_event(
+                "todo/write",
+                5,
+                json!({ "todos": [] }),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(marker_only.orphan_prune_markers(), 1);
+
+        let mut mismatch = Projection::empty(ValidationPolicy::MemoryCompatible);
+        for event in &events[..5] {
+            mismatch = mismatch.with_event(event).unwrap();
+        }
+        let mut wrong = serde_json::to_value(&events[5]).unwrap();
+        wrong["sourceEventSeqs"] = json!([2]);
+        let wrong = crate::session::codec::decode_event(wrong, 5).unwrap();
+        assert!(matches!(
+            mismatch.with_event(&wrong).unwrap_err(),
+            crate::session::EventValidationError::Surface(SurfaceError::PruneReplacementMismatch)
+        ));
+
+        let mut wrong_kind = Projection::empty(ValidationPolicy::MemoryCompatible);
+        for event in &events[..5] {
+            wrong_kind = wrong_kind.with_event(event).unwrap();
+        }
+        let unrelated_replacement = wire_event(
+            "user/message",
+            5,
+            json!({
+                "id": "unrelated-replacement",
+                "role": "user",
+                "content": [{ "type": "text", "text": "not a pruned tool result" }],
+                "source": { "kind": "user" }
+            }),
+            Some(json!({ "op": "replace", "start": 3, "end": 3 })),
+            Some(vec![3]),
+        );
+        assert!(matches!(
+            wrong_kind.with_event(&unrelated_replacement).unwrap_err(),
+            crate::session::EventValidationError::Surface(SurfaceError::PruneReplacementMismatch)
         ));
     }
 }

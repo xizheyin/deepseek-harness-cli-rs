@@ -80,6 +80,14 @@ struct ColdEventContext<'a> {
     previous_ends_with_seed: bool,
 }
 
+/// Compact, non-secret description of an interrupted basic compaction bracket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryCompactionStage {
+    Started,
+    Summarized,
+    Replaced,
+}
+
 /// Sanitized, bounded facts shown before resume is allowed to mutate a file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryReport {
@@ -88,6 +96,8 @@ pub(crate) struct RecoveryReport {
     closes_step: bool,
     closes_turn: bool,
     adds_seed_marker: bool,
+    interrupted_compaction: Option<RecoveryCompactionStage>,
+    orphan_prune_markers: u64,
 }
 
 impl RecoveryReport {
@@ -111,11 +121,21 @@ impl RecoveryReport {
         self.adds_seed_marker
     }
 
+    pub(crate) fn interrupted_compaction(&self) -> Option<RecoveryCompactionStage> {
+        self.interrupted_compaction
+    }
+
+    pub(crate) fn orphan_prune_markers(&self) -> u64 {
+        self.orphan_prune_markers
+    }
+
     pub(crate) fn needs_warning(&self) -> bool {
         self.truncated_bytes != 0
             || !self.repaired_calls.is_empty()
             || self.closes_step
             || self.closes_turn
+            || self.interrupted_compaction.is_some()
+            || self.orphan_prune_markers != 0
     }
 
     #[cfg(test)]
@@ -132,7 +152,20 @@ impl RecoveryReport {
             closes_step,
             closes_turn,
             adds_seed_marker,
+            interrupted_compaction: None,
+            orphan_prune_markers: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_compaction_for_test(
+        mut self,
+        stage: Option<RecoveryCompactionStage>,
+        orphan_prune_markers: u64,
+    ) -> Self {
+        self.interrupted_compaction = stage;
+        self.orphan_prune_markers = orphan_prune_markers;
+        self
     }
 }
 
@@ -305,6 +338,9 @@ impl ColdScan {
         &self,
         recovery_time: UnixMillis,
     ) -> Result<(RecoveryPlan, Projection), StoreError> {
+        if !self.projection.compaction_recovery_is_consistent() {
+            return Err(StoreError::Corrupt);
+        }
         let last_prefix_seq = self.recovery_cursor.map_or_else(
             || {
                 self.next_seq
@@ -358,6 +394,8 @@ impl ColdScan {
             closes_step: snapshot.step().is_some(),
             closes_turn: snapshot.turn().is_some(),
             adds_seed_marker: !self.ends_with_seed(),
+            interrupted_compaction: self.projection.interrupted_compaction_stage(),
+            orphan_prune_markers: self.projection.orphan_prune_markers(),
         })
     }
 }
@@ -655,7 +693,8 @@ pub(crate) fn scan_jsonl_validating_header(
     mut validate_header: impl FnMut(&SessionHeader, WorkspaceIdentity) -> Result<(), StoreError>,
 ) -> Result<ColdScan, StoreError> {
     let mut digest = Context::new(&SHA256);
-    let mut projection = Projection::empty(ValidationPolicy::DurableStrict);
+    let mut projection =
+        Projection::for_session(ValidationPolicy::DurableStrict, expected_id.clone());
     let mut header = None;
     let mut workspace_identity = None;
     let mut line = Vec::new();
@@ -1078,20 +1117,22 @@ fn shallow_event_envelope(line: &[u8]) -> bool {
 mod tests {
     use std::{io::Cursor, sync::atomic::AtomicBool};
 
+    use serde_json::{Value, json};
+
     use crate::{
         model::{ContentBlock, Message},
         session::{
             ApprovalAskedEvent, ApprovalOutcome, ApprovalRequestId, Clock, ClockError, EventKind,
-            EventSeq, NewEvent, Session, SessionId, StepId, SurfaceIntent, TOOL_NOT_STARTED,
-            TOOL_OUTCOME_UNKNOWN, TurnEndReason, TurnId, UnixMillis,
+            EventSeq, NewEvent, Session, SessionEvent, SessionId, StepId, SurfaceIntent,
+            TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, TurnId, UnixMillis,
             jsonl::{encode_event_line, encode_header_line},
         },
         workspace_authority::WorkspaceIdentity,
     };
 
     use super::{
-        MAX_DURABLE_JOURNAL_BYTES, MAX_DURABLE_LOGICAL_EVENTS, RecoveredSeed, StoreError,
-        scan_jsonl,
+        MAX_DURABLE_JOURNAL_BYTES, MAX_DURABLE_LOGICAL_EVENTS, RecoveredSeed,
+        RecoveryCompactionStage, StoreError, scan_jsonl,
     };
     use crate::session::projection::{Projection, ValidationPolicy};
 
@@ -1189,6 +1230,248 @@ mod tests {
         line
     }
 
+    fn compaction_wire_event(
+        event_type: &str,
+        seq: u64,
+        data: Value,
+        surface_op: Option<Value>,
+        sources: Option<Vec<u64>>,
+    ) -> SessionEvent {
+        let mut event = json!({
+            "type": event_type,
+            "seq": seq,
+            "time": 7,
+            "data": data,
+        });
+        if let Some(surface_op) = surface_op {
+            event["surfaceOp"] = surface_op;
+        }
+        if let Some(sources) = sources {
+            event["sourceEventSeqs"] = json!(sources);
+        }
+        crate::session::codec::decode_event(event, seq as usize).unwrap()
+    }
+
+    fn compaction_orphan_prefix(stage: RecoveryCompactionStage) -> Vec<SessionEvent> {
+        let mut events = vec![
+            compaction_wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
+            compaction_wire_event(
+                "user/message",
+                1,
+                json!({
+                    "id": "old-context",
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "old context" }],
+                    "source": { "kind": "user" }
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            compaction_wire_event(
+                "turn/end",
+                2,
+                json!({ "turn": 1, "reason": { "kind": "completed" } }),
+                None,
+                None,
+            ),
+            compaction_wire_event("turn/start", 3, json!({ "turn": 2 }), None, None),
+            compaction_wire_event(
+                "compaction/start",
+                4,
+                json!({
+                    "compactionId": "resume-compaction",
+                    "turn": 2,
+                    "dispatch": {
+                        "trigger": "pressure",
+                        "sourceSurfaceGeneration": 1,
+                        "shadowedRange": { "start": 1, "end": 1 },
+                        "shadowedSeqs": [1],
+                        "preparedCall": {
+                            "config": { "provider": "summary-provider", "model": "summary-model" },
+                            "adapterDefaults": {},
+                            "retryPolicy": {
+                                "mode": "always",
+                                "retryableCodes": [],
+                                "backoff": {
+                                    "initialDelayMs": 1,
+                                    "maxDelayMs": 1,
+                                    "jitterRatio": 0
+                                }
+                            }
+                        },
+                        "system": "summary system",
+                        "tools": [],
+                        "sessionId": ID,
+                        "purpose": "compaction",
+                        "instruction": {
+                            "id": "summary-instruction",
+                            "role": "user",
+                            "content": [{ "type": "text", "text": "Summarize." }],
+                            "source": { "kind": "plugin", "plugin": "dsh.compaction" }
+                        },
+                        "instructionFormatVersion": 1
+                    }
+                }),
+                None,
+                None,
+            ),
+        ];
+        if matches!(
+            stage,
+            RecoveryCompactionStage::Summarized | RecoveryCompactionStage::Replaced
+        ) {
+            events.push(compaction_wire_event(
+                "compaction/summary",
+                5,
+                json!({
+                    "compactionId": "resume-compaction",
+                    "summary": [{ "type": "text", "text": "summary", "kept": true }],
+                    "rawOutput": [
+                        { "type": "reasoning", "text": "private" },
+                        { "type": "text", "text": "summary", "kept": true }
+                    ],
+                    "llmStreamCall": true,
+                    "shadowedRange": { "start": 1, "end": 1 },
+                    "shadowedSeqs": [1],
+                    "shadowedTokenCount": 2,
+                    "provider": "summary-provider",
+                    "model": "summary-model"
+                }),
+                None,
+                None,
+            ));
+        }
+        if stage == RecoveryCompactionStage::Replaced {
+            events.push(compaction_wire_event(
+                "user/message",
+                6,
+                json!({
+                    "id": "checkpoint",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n<compacted-summary>"
+                        },
+                        { "type": "text", "text": "summary", "kept": true },
+                        { "type": "text", "text": "</compacted-summary>" }
+                    ],
+                    "source": {
+                        "kind": "plugin",
+                        "plugin": "compact",
+                        "compactionId": "resume-compaction"
+                    }
+                }),
+                Some(json!({ "op": "replace", "start": 1, "end": 1 })),
+                Some(vec![4, 5, 1]),
+            ));
+        }
+        events
+    }
+
+    fn context_overflow_compaction_prefix(stage: RecoveryCompactionStage) -> Vec<SessionEvent> {
+        let pressure = compaction_orphan_prefix(stage);
+        let mut events = pressure[..4].to_vec();
+        events.push(compaction_wire_event(
+            "step/start",
+            4,
+            json!({ "turn": 2, "step": 1 }),
+            None,
+            None,
+        ));
+        for event in &pressure[4..] {
+            let mut value = serde_json::to_value(event).unwrap();
+            let shifted = event.seq().get() + 1;
+            value["seq"] = json!(shifted);
+            if matches!(event.kind(), EventKind::CompactionStart { .. }) {
+                value["data"]["dispatch"]["trigger"] = json!("context-overflow");
+            }
+            if matches!(event.kind(), EventKind::UserMessage { .. }) {
+                value["sourceEventSeqs"] = json!([5, 6, 1]);
+            }
+            events.push(crate::session::codec::decode_event(value, shifted as usize).unwrap());
+        }
+        events
+    }
+
+    fn orphan_prune_prefix() -> Vec<SessionEvent> {
+        vec![
+            compaction_wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
+            compaction_wire_event("step/start", 1, json!({ "turn": 1, "step": 1 }), None, None),
+            compaction_wire_event(
+                "assistant/message",
+                2,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "assistant-prune",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool-call",
+                            "id": "call-prune",
+                            "name": "read",
+                            "arguments": "{}"
+                        }],
+                        "source": {
+                            "kind": "model",
+                            "provider": "mock",
+                            "model": "mock-model"
+                        }
+                    }
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            compaction_wire_event(
+                "tool/call",
+                3,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "callId": "call-prune",
+                    "name": "read",
+                    "arguments": "{}"
+                }),
+                None,
+                None,
+            ),
+            compaction_wire_event(
+                "tool/result",
+                4,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "result-prune",
+                        "role": "user",
+                        "content": [{
+                            "type": "tool-result",
+                            "toolCallId": "call-prune",
+                            "content": [{ "type": "text", "text": "large result" }],
+                            "isError": false
+                        }],
+                        "source": { "kind": "tool", "callId": "call-prune" }
+                    },
+                    "meta": { "retained": true }
+                }),
+                Some(json!("append")),
+                Some(vec![3]),
+            ),
+            compaction_wire_event(
+                "compaction/prune",
+                5,
+                json!({
+                    "shadowedRange": { "start": 4, "end": 4 },
+                    "shadowedSeqs": [4],
+                    "shadowedTokenCount": 12
+                }),
+                None,
+                None,
+            ),
+        ]
+    }
+
     #[test]
     fn scanner_folds_more_than_the_memory_event_limit_without_history() {
         let mut bytes = header_line();
@@ -1210,6 +1493,216 @@ mod tests {
         assert_eq!(scan.workspace_identity().inode(), 0x2b);
         assert_eq!(scan.last_event_time(), Some(UnixMillis::new(7).unwrap()));
         assert_ne!(scan.physical_sha256(), &[0_u8; 32]);
+    }
+
+    #[test]
+    fn cold_recovery_seals_each_legal_compaction_orphan_without_fabricating_an_end() {
+        for stage in [
+            RecoveryCompactionStage::Started,
+            RecoveryCompactionStage::Summarized,
+            RecoveryCompactionStage::Replaced,
+        ] {
+            let prefix = compaction_orphan_prefix(stage);
+            let mut bytes = header_line();
+            for event in &prefix {
+                bytes.extend_from_slice(&encode_event_line(event).unwrap());
+            }
+            let scan = scan_bytes(&bytes).unwrap();
+            let (plan, projection) = scan
+                .prepare_recovery(UnixMillis::new(999).unwrap())
+                .unwrap();
+            let report = scan.recovery_report(&plan).unwrap();
+
+            assert_eq!(report.interrupted_compaction(), Some(stage));
+            assert!(report.needs_warning());
+            assert_eq!(plan.events().len(), 2);
+            assert!(matches!(
+                plan.events()[0].kind(),
+                EventKind::TurnEnd {
+                    reason: TurnEndReason::Interrupted,
+                    ..
+                }
+            ));
+            assert!(matches!(plan.events()[1].kind(), EventKind::EndSeed));
+            assert!(
+                plan.events()
+                    .iter()
+                    .all(|event| !matches!(event.kind(), EventKind::CompactionEnd { .. }))
+            );
+            assert_eq!(projection.interrupted_compaction_stage(), None);
+            assert_eq!(projection.state().open_turn(), None);
+            let expected_surface = if stage == RecoveryCompactionStage::Replaced {
+                EventSeq::new(6).unwrap()
+            } else {
+                EventSeq::new(1).unwrap()
+            };
+            assert_eq!(projection.state().surface_nodes(), &[expected_surface]);
+
+            for event in plan.events() {
+                bytes.extend_from_slice(&encode_event_line(event).unwrap());
+            }
+            let sealed = scan_bytes(&bytes).unwrap();
+            let (empty, sealed_projection) = sealed
+                .prepare_recovery(UnixMillis::new(1_001).unwrap())
+                .unwrap();
+            assert!(empty.events().is_empty());
+            assert_eq!(sealed_projection.interrupted_compaction_stage(), None);
+            assert!(!sealed.recovery_report(&empty).unwrap().needs_warning());
+        }
+    }
+
+    #[test]
+    fn context_overflow_orphan_closes_its_step_and_resumes_a_partial_repair() {
+        for stage in [
+            RecoveryCompactionStage::Started,
+            RecoveryCompactionStage::Summarized,
+            RecoveryCompactionStage::Replaced,
+        ] {
+            let mut bytes = header_line();
+            for event in context_overflow_compaction_prefix(stage) {
+                bytes.extend_from_slice(&encode_event_line(&event).unwrap());
+            }
+            let scan = scan_bytes(&bytes).unwrap();
+            let (plan, projection) = scan
+                .prepare_recovery(UnixMillis::new(998).unwrap())
+                .unwrap();
+            assert_eq!(
+                scan.recovery_report(&plan)
+                    .unwrap()
+                    .interrupted_compaction(),
+                Some(stage)
+            );
+            assert_eq!(plan.events().len(), 3);
+            let expected_surface = if stage == RecoveryCompactionStage::Replaced {
+                EventSeq::new(7).unwrap()
+            } else {
+                EventSeq::new(1).unwrap()
+            };
+            assert_eq!(projection.state().surface_nodes(), &[expected_surface]);
+        }
+
+        let prefix = context_overflow_compaction_prefix(RecoveryCompactionStage::Started);
+        let mut bytes = header_line();
+        for event in &prefix {
+            bytes.extend_from_slice(&encode_event_line(event).unwrap());
+        }
+        let scan = scan_bytes(&bytes).unwrap();
+        let (plan, _) = scan
+            .prepare_recovery(UnixMillis::new(999).unwrap())
+            .unwrap();
+        let report = scan.recovery_report(&plan).unwrap();
+        assert_eq!(
+            report.interrupted_compaction(),
+            Some(RecoveryCompactionStage::Started)
+        );
+        assert!(report.closes_step());
+        assert!(report.closes_turn());
+        assert_eq!(plan.events().len(), 3);
+        assert!(matches!(plan.events()[0].kind(), EventKind::StepEnd { .. }));
+        assert!(matches!(
+            plan.events()[1].kind(),
+            EventKind::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        assert!(matches!(plan.events()[2].kind(), EventKind::EndSeed));
+        assert!(matches!(
+            scan.projection().with_event(&plan.events()[0]).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                crate::session::TransitionError::DurableRecoveryEventNotAllowed {
+                    event_type: "step/end"
+                }
+            )
+        ));
+
+        // Simulate a crash after only the first repair row. The next scan must
+        // continue the same private recovery batch instead of inventing a new one.
+        bytes.extend_from_slice(&encode_event_line(&plan.events()[0]).unwrap());
+        let partial = scan_bytes(&bytes).unwrap();
+        let (remaining, projection) = partial
+            .prepare_recovery(UnixMillis::new(1_001).unwrap())
+            .unwrap();
+        assert_eq!(remaining.events().len(), 2);
+        assert_eq!(remaining.events()[0], plan.events()[1]);
+        assert!(matches!(remaining.events()[1].kind(), EventKind::EndSeed));
+        assert_eq!(remaining.events()[1].seq(), plan.events()[2].seq());
+        assert_eq!(
+            remaining.events()[1].time(),
+            UnixMillis::new(1_001).unwrap()
+        );
+        assert_eq!(projection.interrupted_compaction_stage(), None);
+        assert!(matches!(
+            partial
+                .projection()
+                .with_event(&remaining.events()[0])
+                .unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                crate::session::TransitionError::DurableRecoveryEventNotAllowed {
+                    event_type: "turn/end"
+                }
+            )
+        ));
+
+        bytes.extend_from_slice(&encode_event_line(&remaining.events()[0]).unwrap());
+        let after_turn = scan_bytes(&bytes).unwrap();
+        let (seed_only, _) = after_turn
+            .prepare_recovery(UnixMillis::new(1_002).unwrap())
+            .unwrap();
+        assert_eq!(seed_only.events().len(), 1);
+        assert!(matches!(seed_only.events()[0].kind(), EventKind::EndSeed));
+        bytes.extend_from_slice(&encode_event_line(&seed_only.events()[0]).unwrap());
+        let sealed = scan_bytes(&bytes).unwrap();
+        let (empty, _) = sealed
+            .prepare_recovery(UnixMillis::new(1_003).unwrap())
+            .unwrap();
+        assert!(empty.events().is_empty());
+    }
+
+    #[test]
+    fn cold_recovery_reports_and_clears_an_orphan_prune_marker() {
+        let mut bytes = header_line();
+        for event in orphan_prune_prefix() {
+            bytes.extend_from_slice(&encode_event_line(&event).unwrap());
+        }
+        let scan = scan_bytes(&bytes).unwrap();
+        let (plan, projection) = scan
+            .prepare_recovery(UnixMillis::new(999).unwrap())
+            .unwrap();
+        let report = scan.recovery_report(&plan).unwrap();
+        assert_eq!(report.orphan_prune_markers(), 1);
+        assert!(report.needs_warning());
+        assert_eq!(projection.orphan_prune_markers(), 0);
+        assert_eq!(
+            projection.state().surface_nodes(),
+            &[EventSeq::new(2).unwrap(), EventSeq::new(4).unwrap()]
+        );
+        assert!(plan.events().iter().all(|event| !matches!(
+            event.kind(),
+            EventKind::ToolResult { .. } | EventKind::CompactionPrune { .. }
+        )));
+
+        for event in plan.events() {
+            bytes.extend_from_slice(&encode_event_line(event).unwrap());
+        }
+        let sealed = scan_bytes(&bytes).unwrap();
+        let (empty, _) = sealed
+            .prepare_recovery(UnixMillis::new(1_001).unwrap())
+            .unwrap();
+        assert!(empty.events().is_empty());
+        assert!(!sealed.recovery_report(&empty).unwrap().needs_warning());
+    }
+
+    #[test]
+    fn cold_scan_rejects_a_complete_nonadjacent_compaction_body() {
+        let mut bytes = header_line();
+        for event in compaction_orphan_prefix(RecoveryCompactionStage::Started) {
+            bytes.extend_from_slice(&encode_event_line(&event).unwrap());
+        }
+        let unrelated = compaction_wire_event("todo/write", 5, json!({ "todos": [] }), None, None);
+        bytes.extend_from_slice(&encode_event_line(&unrelated).unwrap());
+
+        assert!(matches!(scan_bytes(&bytes), Err(StoreError::Corrupt)));
     }
 
     #[test]

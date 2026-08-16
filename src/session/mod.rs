@@ -2,6 +2,7 @@
 
 mod clock;
 mod codec;
+mod compaction;
 mod error;
 mod event;
 mod journal;
@@ -21,6 +22,12 @@ use std::sync::Arc;
 
 pub use clock::{Clock, SystemClock};
 pub use codec::{MAX_SESSION_EVENTS, MAX_SESSION_RETAINED_JSON_BYTES, MAX_SESSION_SNAPSHOT_BYTES};
+pub use compaction::{
+    CompactionEndError, CompactionEndEvent, CompactionId, CompactionPruneEvent, CompactionRange,
+    CompactionStartEvent, CompactionSummaryEvent, CompactionSummaryInput, CompactionTrigger,
+    ModelVisibleDispatchInput, ModelVisibleDispatchSnapshot, PreparedCompactionCallSnapshot,
+    PreparedRetryBackoffSnapshot, PreparedRetryModeSnapshot, PreparedRetryPolicySnapshot,
+};
 pub use error::{
     AppendError, ClockError, CodecError, EventValidationError, HeaderError, NumberError,
     ReplayError, SessionError, SurfaceError, TransitionError,
@@ -44,7 +51,7 @@ pub(crate) use observer::{
 };
 #[cfg(test)]
 pub(crate) use observer::{UiAssistantBlock, UiToolFailure};
-pub(crate) use recovery::{RecoveryCallReport, RecoveryReport};
+pub(crate) use recovery::{RecoveryCallReport, RecoveryCompactionStage, RecoveryReport};
 #[cfg(test)]
 pub(crate) use resume::PreparingResume;
 pub(crate) use resume::RecoveredSession;
@@ -294,10 +301,12 @@ impl Session {
         let created_at = clock.now()?;
         let header = SessionHeader::new(id, created_at)?;
         let retained_json_bytes = header.raw().encoded_len();
+        let projection =
+            Projection::for_session(ValidationPolicy::MemoryCompatible, header.id().clone());
         Ok(Self {
             header,
             next_seq: EventSeq::from_index(0),
-            projection: Projection::empty(ValidationPolicy::MemoryCompatible),
+            projection,
             first_live_seq: 0,
             clock: Box::new(clock),
             ui_observer: None,
@@ -317,10 +326,12 @@ impl Session {
         journal: DeferredJournal,
         header_bytes: u64,
     ) -> Self {
+        let projection =
+            Projection::for_session(ValidationPolicy::DurableStrict, header.id().clone());
         Self {
             header,
             next_seq: EventSeq::from_index(0),
-            projection: Projection::empty(ValidationPolicy::DurableStrict),
+            projection,
             first_live_seq: 0,
             clock: Box::new(clock),
             ui_observer: None,
@@ -348,10 +359,12 @@ impl Session {
         let id = id.into();
         let created_at = clock.now()?;
         let header = SessionHeader::new(id, created_at)?;
+        let projection =
+            Projection::for_session(ValidationPolicy::DurableStrict, header.id().clone());
         Ok(Self {
             header,
             next_seq: EventSeq::from_index(0),
-            projection: Projection::empty(ValidationPolicy::DurableStrict),
+            projection,
             first_live_seq: 0,
             clock: Box::new(clock),
             ui_observer: None,
@@ -377,7 +390,7 @@ impl Session {
         clock: impl Clock + 'static,
     ) -> Result<Self, SessionError> {
         header.validate_for(header.id())?;
-        let projection = replay_projection(seed)?;
+        let projection = replay_projection(seed, Some(header.id().clone()))?;
         let retained_json_bytes = retained_json_bytes(&header, seed)?;
         let first_live_seq = seed.len();
         let mut session = Self {
@@ -1470,7 +1483,7 @@ impl Session {
 
     /// Rebuild state and model messages from an event prefix without adding a seed marker.
     pub fn replay(events: &[SessionEvent]) -> Result<ReplayProjection, ReplayError> {
-        let projection = replay_projection(events)?;
+        let projection = replay_projection(events, None)?;
         Ok(ReplayProjection {
             state: projection.state(),
             messages: projection.messages(),
@@ -2301,7 +2314,10 @@ fn map_journal_append_error(error: JournalError) -> AppendError {
     }
 }
 
-fn replay_projection(events: &[SessionEvent]) -> Result<Projection, ReplayError> {
+fn replay_projection(
+    events: &[SessionEvent],
+    session_id: Option<SessionId>,
+) -> Result<Projection, ReplayError> {
     if events.len() > MAX_SESSION_EVENTS {
         return Err(ReplayError {
             index: MAX_SESSION_EVENTS,
@@ -2311,7 +2327,10 @@ fn replay_projection(events: &[SessionEvent]) -> Result<Projection, ReplayError>
             },
         });
     }
-    let mut projection = Projection::empty(ValidationPolicy::MemoryCompatible);
+    let mut projection = session_id.map_or_else(
+        || Projection::empty(ValidationPolicy::MemoryCompatible),
+        |session_id| Projection::for_session(ValidationPolicy::MemoryCompatible, session_id),
+    );
     for (index, event) in events.iter().enumerate() {
         let Some(expected) = EventSeq::from_index(index) else {
             return Err(ReplayError {
@@ -2338,7 +2357,7 @@ fn replay_projection(events: &[SessionEvent]) -> Result<Projection, ReplayError>
             });
         }
         projection = projection
-            .with_event(event)
+            .with_compatible_event(event)
             .map_err(|source| ReplayError { index, source })?;
     }
     Ok(projection)

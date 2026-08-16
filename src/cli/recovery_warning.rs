@@ -2,7 +2,9 @@
 
 use std::fmt::Write as _;
 
-use crate::session::{RecoveryCallReport, RecoveryReport, StoreError, TOOL_OUTCOME_UNKNOWN};
+use crate::session::{
+    RecoveryCallReport, RecoveryCompactionStage, RecoveryReport, StoreError, TOOL_OUTCOME_UNKNOWN,
+};
 
 use super::render::VisibleRenderer;
 
@@ -42,6 +44,32 @@ pub(super) fn render(report: &RecoveryReport) -> Result<Option<Vec<u8>>, StoreEr
             &mut output,
             b"dsh: recovery will close one interrupted user turn\n",
         )?;
+    }
+    if let Some(stage) = report.interrupted_compaction() {
+        let stage = match stage {
+            RecoveryCompactionStage::Started => "after its durable start",
+            RecoveryCompactionStage::Summarized => "after its summary",
+            RecoveryCompactionStage::Replaced => "after installing its checkpoint",
+        };
+        let mut line = String::new();
+        line.try_reserve_exact(112).map_err(|_| StoreError::Limit)?;
+        writeln!(
+            &mut line,
+            "dsh: recovery will seal one interrupted context compaction {stage}"
+        )
+        .map_err(|_| StoreError::Limit)?;
+        append(&mut output, line.as_bytes())?;
+    }
+    if report.orphan_prune_markers() != 0 {
+        let mut line = String::new();
+        line.try_reserve_exact(112).map_err(|_| StoreError::Limit)?;
+        writeln!(
+            &mut line,
+            "dsh: recovery will seal {} unapplied tool-result prune marker(s)",
+            report.orphan_prune_markers()
+        )
+        .map_err(|_| StoreError::Limit)?;
+        append(&mut output, line.as_bytes())?;
     }
     if report.adds_seed_marker() {
         append(
@@ -97,7 +125,10 @@ fn append(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::{MAX_RECOVERY_WARNING_BYTES, render};
-    use crate::session::{RecoveryCallReport, RecoveryReport, StoreError, TOOL_OUTCOME_UNKNOWN};
+    use crate::session::{
+        RecoveryCallReport, RecoveryCompactionStage, RecoveryReport, StoreError,
+        TOOL_OUTCOME_UNKNOWN,
+    };
 
     #[test]
     fn a_clean_resume_marker_needs_no_warning() {
@@ -168,5 +199,17 @@ mod tests {
             true,
         );
         assert_eq!(render(&one_over), Err(StoreError::Limit));
+    }
+
+    #[test]
+    fn compaction_orphans_are_described_without_leaking_payloads() {
+        let report = RecoveryReport::for_test(0, Vec::new(), false, true, true)
+            .with_compaction_for_test(Some(RecoveryCompactionStage::Summarized), 2);
+        let warning = String::from_utf8(render(&report).unwrap().unwrap()).unwrap();
+
+        assert!(warning.contains("will seal one interrupted context compaction after its summary"));
+        assert!(warning.contains("will seal 2 unapplied tool-result prune marker(s)"));
+        assert!(!warning.contains("compactionId"));
+        assert!(!warning.contains("provider"));
     }
 }

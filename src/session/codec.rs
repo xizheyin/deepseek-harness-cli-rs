@@ -284,6 +284,18 @@ fn decode_kind(
         "approval/decided" => EventKind::ApprovalDecided {
             decided: payload!(super::ApprovalDecidedEvent),
         },
+        "compaction/start" => EventKind::CompactionStart {
+            start: payload!(super::CompactionStartEvent),
+        },
+        "compaction/summary" => EventKind::CompactionSummary {
+            summary: payload!(super::CompactionSummaryEvent),
+        },
+        "compaction/end" => EventKind::CompactionEnd {
+            end: payload!(super::CompactionEndEvent),
+        },
+        "compaction/prune" => EventKind::CompactionPrune {
+            prune: payload!(super::CompactionPruneEvent),
+        },
         "session/end-seed" => {
             let _: EmptyData = payload!(EmptyData);
             EventKind::EndSeed
@@ -416,6 +428,10 @@ pub(crate) fn kind_data_value(kind: &EventKind) -> Result<Value, serde_json::Err
         EventKind::LlmRetryStarted { started } => serde_json::to_value(started),
         EventKind::ApprovalAsked { asked } => serde_json::to_value(asked),
         EventKind::ApprovalDecided { decided } => serde_json::to_value(decided),
+        EventKind::CompactionStart { start } => serde_json::to_value(start),
+        EventKind::CompactionSummary { summary } => serde_json::to_value(summary),
+        EventKind::CompactionEnd { end } => serde_json::to_value(end),
+        EventKind::CompactionPrune { prune } => serde_json::to_value(prune),
         EventKind::EndSeed => serde_json::to_value(EmptyData {}),
         EventKind::Unknown { data, .. } => Ok(data.as_value().clone()),
     }
@@ -542,3 +558,109 @@ struct RequestHeaderRef<'a> {
 
 #[derive(Deserialize, Serialize)]
 struct EmptyData {}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{decode_event, event_data_value};
+    use crate::session::{CodecError, EventKind};
+
+    fn envelope(event_type: &str, seq: u64, data: Value) -> Value {
+        json!({
+            "type": event_type,
+            "seq": seq,
+            "time": 7,
+            "data": data,
+        })
+    }
+
+    #[test]
+    fn compaction_tags_decode_without_losing_extensible_payloads() {
+        let cases = [
+            (
+                "compaction/start",
+                json!({
+                    "compactionId": "compact-1",
+                    "turn": null,
+                    "futureField": { "kept": true },
+                }),
+            ),
+            (
+                "compaction/summary",
+                json!({
+                    "compactionId": "compact-1",
+                    "summary": [{ "type": "text", "text": "summary", "extension": 1 }],
+                    "rawOutput": [{ "type": "reasoning", "text": "private" }],
+                    "shadowedRange": { "start": 0, "end": 0 },
+                    "shadowedSeqs": [0],
+                    "shadowedTokenCount": 4,
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "futureField": [1, 2, 3],
+                }),
+            ),
+            (
+                "compaction/end",
+                json!({
+                    "compactionId": "compact-1",
+                    "turn": null,
+                    "error": "",
+                    "futureField": "kept",
+                }),
+            ),
+            (
+                "compaction/prune",
+                json!({
+                    "shadowedRange": { "start": 0, "end": 0 },
+                    "shadowedSeqs": [0],
+                    "shadowedTokenCount": 9,
+                    "futureField": { "kept": true },
+                }),
+            ),
+        ];
+
+        for (index, (event_type, data)) in cases.into_iter().enumerate() {
+            let event = decode_event(envelope(event_type, index as u64, data.clone()), index)
+                .expect("valid compaction payload");
+            assert_eq!(event.kind().event_type(), event_type);
+            event.kind().validate().expect("payload validation");
+            assert_eq!(event_data_value(&event).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn malformed_known_compaction_payload_is_not_downgraded_to_unknown() {
+        let error = decode_event(
+            envelope(
+                "compaction/prune",
+                0,
+                json!({
+                    "shadowedSeqs": [0],
+                    "shadowedTokenCount": 1,
+                }),
+            ),
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CodecError::EventPayload { ref event_type, .. }
+                if event_type == "compaction/prune"
+        ));
+
+        let required = decode_event(envelope("compaction/future", 0, json!({})), 0).unwrap_err();
+        assert!(matches!(required, CodecError::UnknownRequiredEvent { .. }));
+        let ignorable = json!({
+            "type": "compaction/future",
+            "seq": 0,
+            "time": 7,
+            "data": { "kept": true },
+            "ignorable": true,
+        });
+        assert!(matches!(
+            decode_event(ignorable, 0).unwrap().kind(),
+            EventKind::Unknown { .. }
+        ));
+    }
+}

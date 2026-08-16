@@ -536,6 +536,18 @@ impl CommittedUiEvent {
             EventKind::RequestContext { .. } => CommittedUiKind::TypeOnly {
                 event_type: "request/context",
             },
+            EventKind::CompactionStart { .. } => CommittedUiKind::TypeOnly {
+                event_type: "compaction/start",
+            },
+            EventKind::CompactionSummary { .. } => CommittedUiKind::TypeOnly {
+                event_type: "compaction/summary",
+            },
+            EventKind::CompactionEnd { .. } => CommittedUiKind::TypeOnly {
+                event_type: "compaction/end",
+            },
+            EventKind::CompactionPrune { .. } => CommittedUiKind::TypeOnly {
+                event_type: "compaction/prune",
+            },
             EventKind::EndSeed => CommittedUiKind::TypeOnly {
                 event_type: "session/end-seed",
             },
@@ -602,4 +614,45 @@ fn concat_final_text(blocks: &[crate::model::ContentBlock]) -> Result<String, Ui
         }
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{CommittedUiEvent, CommittedUiKind};
+    use crate::session::codec::decode_event;
+
+    #[test]
+    fn compaction_projection_exposes_only_the_event_type() {
+        const SECRET: &str = "SECRET_COMPACTION_PAYLOAD_MUST_NOT_REACH_UI";
+        let event = decode_event(
+            json!({
+                "type": "compaction/summary",
+                "seq": 0,
+                "time": 1,
+                "data": {
+                    "compactionId": "compact-ui",
+                    "summary": [{ "type": "text", "text": SECRET }],
+                    "rawOutput": [{ "type": "reasoning", "text": SECRET }],
+                    "shadowedRange": { "start": 1, "end": 1 },
+                    "shadowedSeqs": [1],
+                    "shadowedTokenCount": 1,
+                    "provider": "deepseek",
+                    "model": "deepseek-chat"
+                }
+            }),
+            0,
+        )
+        .unwrap();
+
+        let projection = CommittedUiEvent::from_event(&event).unwrap();
+        assert!(matches!(
+            projection.kind,
+            CommittedUiKind::TypeOnly {
+                event_type: "compaction/summary"
+            }
+        ));
+        assert!(!format!("{projection:?}").contains(SECRET));
+    }
 }
