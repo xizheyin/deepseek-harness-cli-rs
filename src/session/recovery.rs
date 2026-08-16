@@ -10,15 +10,16 @@ use serde_json::Value;
 
 use crate::{
     json_value::JsonValue,
-    model::{ContentBlock, Message},
+    model::{CallId, ContentBlock, Message},
     workspace_authority::WorkspaceIdentity,
 };
 
 use super::{
-    ApprovalDecidedEvent, ApprovalOutcome, CodecError, EventKind, EventSeq, EventValidationError,
-    MAX_SAFE_INTEGER, NewEvent, SESSION_FORMAT_VERSION, SessionEvent, SessionHeader, SessionId,
-    StoreError, SurfaceIntent, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, ToolFailure,
-    TransitionError, TurnEndReason, UnixMillis,
+    ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId, CodecError, EventKind, EventSeq,
+    EventValidationError, MAX_SAFE_INTEGER, NewEvent, SESSION_FORMAT_VERSION, SessionEvent,
+    SessionHeader, SessionId, StepId, StoreError, SurfaceIntent, TOOL_NOT_STARTED,
+    TOOL_OUTCOME_UNKNOWN, ToolFailure, TransitionError, TurnEndReason, TurnId, UnixMillis,
+    attempt_anchor::RecoveryAttemptProof,
     codec::{decode_event, kind_data_value},
     journal_row::JournalRowLocator,
     jsonl::{MAX_JOURNAL_EVENT_LINE_BYTES, MAX_JOURNAL_HEADER_LINE_BYTES},
@@ -41,10 +42,35 @@ const APPROVAL_UNAVAILABLE_TEXT: &str =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryPlan {
     events: Vec<SessionEvent>,
+    actions: Vec<RecoveryAction>,
     resume_seed_len: u64,
     repaired_calls: usize,
     unknown_outcomes: usize,
     not_started: usize,
+}
+
+/// Exact semantic operation paired with one deterministic recovery row.
+///
+/// This enum is never serialized. It prevents the recovery-only projection
+/// admission from becoming a broad escape hatch for arbitrary historical
+/// events that merely have the right wire type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RecoveryAction {
+    CancelApproval {
+        id: ApprovalRequestId,
+    },
+    RepairCall {
+        call_id: CallId,
+    },
+    CloseStep {
+        turn: TurnId,
+        step: StepId,
+        interrupted_attempt: Option<RecoveryAttemptProof>,
+    },
+    CloseTurn {
+        turn: TurnId,
+    },
+    EndSeed,
 }
 
 /// Sealed proof that the cold scanner matched one complete recovery row.
@@ -54,23 +80,37 @@ pub(crate) struct RecoveryPlan {
 /// hatch for an arbitrary event.
 pub(super) struct RecoveryAdmission<'a> {
     event: &'a SessionEvent,
+    action: &'a RecoveryAction,
     row: Option<JournalRowLocator>,
 }
 
 impl<'a> RecoveryAdmission<'a> {
-    fn new(event: &'a SessionEvent) -> Self {
-        Self { event, row: None }
-    }
-
-    fn new_scanned(event: &'a SessionEvent, row: JournalRowLocator) -> Self {
+    fn new(event: &'a SessionEvent, action: &'a RecoveryAction) -> Self {
         Self {
             event,
+            action,
+            row: None,
+        }
+    }
+
+    fn new_scanned(
+        event: &'a SessionEvent,
+        action: &'a RecoveryAction,
+        row: JournalRowLocator,
+    ) -> Self {
+        Self {
+            event,
+            action,
             row: Some(row),
         }
     }
 
     pub(super) fn event(&self) -> &'a SessionEvent {
         self.event
+    }
+
+    pub(super) fn action(&self) -> &'a RecoveryAction {
+        self.action
     }
 
     pub(super) fn row(&self) -> Option<JournalRowLocator> {
@@ -429,6 +469,10 @@ fn build_recovery_plan(
     events
         .try_reserve_exact(MAX_RECOVERY_ROWS)
         .map_err(|_| StoreError::Limit)?;
+    let mut actions = Vec::new();
+    actions
+        .try_reserve_exact(MAX_RECOVERY_ROWS)
+        .map_err(|_| StoreError::Limit)?;
     let mut next = next_seq;
     let snapshot = projection.recovery_snapshot();
     let mut repaired_calls = 0_usize;
@@ -450,12 +494,14 @@ fn build_recovery_plan(
             };
             push_recovery_event(
                 &mut events,
+                &mut actions,
                 &mut next,
                 time,
                 NewEvent::log(EventKind::approval_decided(
                     ApprovalDecidedEvent::new(id.clone(), ApprovalOutcome::Cancelled)
                         .map_err(|_| StoreError::Corrupt)?,
                 )),
+                RecoveryAction::CancelApproval { id: id.clone() },
             )?;
         }
 
@@ -499,14 +545,29 @@ fn build_recovery_plan(
                 }
                 None => NewEvent::surface(kind, SurfaceIntent::append()),
             };
-            push_recovery_event(&mut events, &mut next, time, event)?;
+            push_recovery_event(
+                &mut events,
+                &mut actions,
+                &mut next,
+                time,
+                event,
+                RecoveryAction::RepairCall {
+                    call_id: call.id().clone(),
+                },
+            )?;
         }
 
         push_recovery_event(
             &mut events,
+            &mut actions,
             &mut next,
             time,
             NewEvent::log(EventKind::step_end(turn, step)),
+            RecoveryAction::CloseStep {
+                turn,
+                step,
+                interrupted_attempt: snapshot.attempt().cloned(),
+            },
         )?;
     }
 
@@ -515,9 +576,11 @@ fn build_recovery_plan(
         let time = closer_time.ok_or(StoreError::Corrupt)?;
         push_recovery_event(
             &mut events,
+            &mut actions,
             &mut next,
             time,
             NewEvent::log(EventKind::turn_end(turn, TurnEndReason::Interrupted)),
+            RecoveryAction::CloseTurn { turn },
         )?;
     }
 
@@ -528,24 +591,27 @@ fn build_recovery_plan(
     if !ends_with_seed {
         push_recovery_event(
             &mut events,
+            &mut actions,
             &mut next,
             marker_time,
             NewEvent::log(EventKind::EndSeed),
+            RecoveryAction::EndSeed,
         )?;
     }
-    if events.len() > MAX_RECOVERY_ROWS {
+    if events.len() > MAX_RECOVERY_ROWS || events.len() != actions.len() {
         return Err(StoreError::Limit);
     }
 
     let mut recovered_projection = projection.clone();
-    for event in &events {
+    for (event, action) in events.iter().zip(&actions) {
         recovered_projection
-            .apply_recovery_admission(RecoveryAdmission::new(event))
+            .apply_recovery_admission(RecoveryAdmission::new(event, action))
             .map_err(|_| StoreError::Corrupt)?;
     }
     Ok((
         RecoveryPlan {
             events,
+            actions,
             resume_seed_len: if ends_with_seed {
                 logical_events
             } else {
@@ -614,11 +680,13 @@ fn recovery_result_kind(
 
 fn push_recovery_event(
     events: &mut Vec<SessionEvent>,
+    actions: &mut Vec<RecoveryAction>,
     next: &mut Option<EventSeq>,
     time: UnixMillis,
     event: NewEvent,
+    action: RecoveryAction,
 ) -> Result<(), StoreError> {
-    if events.len() >= MAX_RECOVERY_ROWS {
+    if events.len() >= MAX_RECOVERY_ROWS || events.len() != actions.len() {
         return Err(StoreError::Limit);
     }
     let seq = next.ok_or(StoreError::Limit)?;
@@ -626,6 +694,7 @@ fn push_recovery_event(
         JsonValue::new(kind_data_value(&event.kind).map_err(|_| StoreError::Limit)?)
             .map_err(|_| StoreError::Limit)?;
     events.push(SessionEvent::from_new(seq, time, event, original_data));
+    actions.push(action);
     *next = seq
         .get()
         .checked_add(1)
@@ -897,7 +966,7 @@ fn apply_cold_event(
     }
 
     if let Some(cursor) = *recovery_cursor {
-        if recovery_event_matches(
+        if let Some(action) = recovery_event_matches(
             projection,
             context.session_id,
             event,
@@ -907,7 +976,11 @@ fn apply_cold_event(
             context.logical_events,
         )? {
             projection
-                .apply_recovery_admission(RecoveryAdmission::new_scanned(event, context.row))
+                .apply_recovery_admission(RecoveryAdmission::new_scanned(
+                    event,
+                    &action,
+                    context.row,
+                ))
                 .map_err(|_| StoreError::Corrupt)?;
             if matches!(event.kind(), EventKind::EndSeed) {
                 *recovery_cursor = None;
@@ -943,8 +1016,8 @@ fn apply_cold_event(
         .get()
         .checked_sub(1)
         .and_then(|value| EventSeq::new(value).ok());
-    if is_tentative_recovery_start(event)
-        && recovery_event_matches(
+    if is_tentative_recovery_start(event) {
+        if let Some(action) = recovery_event_matches(
             projection,
             context.session_id,
             event,
@@ -952,16 +1025,20 @@ fn apply_cold_event(
             root_last_real_seq,
             context.previous_time,
             context.logical_events,
-        )?
-    {
-        projection
-            .apply_scanned_row(event, context.row)
-            .map_err(|_| StoreError::Corrupt)?;
-        *recovery_cursor = Some(RecoveryCursor {
-            root_last_real_seq,
-            confirmed: false,
-        });
-        return Ok(());
+        )? {
+            projection
+                .apply_recovery_admission(RecoveryAdmission::new_scanned(
+                    event,
+                    &action,
+                    context.row,
+                ))
+                .map_err(|_| StoreError::Corrupt)?;
+            *recovery_cursor = Some(RecoveryCursor {
+                root_last_real_seq,
+                confirmed: false,
+            });
+            return Ok(());
+        }
     }
 
     match projection.apply_scanned_row(event, context.row) {
@@ -969,7 +1046,7 @@ fn apply_cold_event(
         Err(EventValidationError::Transition(
             TransitionError::DurableRecoveryEventNotAllowed { .. },
         )) => {
-            if !recovery_event_matches(
+            let Some(action) = recovery_event_matches(
                 projection,
                 context.session_id,
                 event,
@@ -977,11 +1054,16 @@ fn apply_cold_event(
                 root_last_real_seq,
                 context.previous_time,
                 context.logical_events,
-            )? {
+            )?
+            else {
                 return Err(StoreError::Corrupt);
-            }
+            };
             projection
-                .apply_recovery_admission(RecoveryAdmission::new_scanned(event, context.row))
+                .apply_recovery_admission(RecoveryAdmission::new_scanned(
+                    event,
+                    &action,
+                    context.row,
+                ))
                 .map_err(|_| StoreError::Corrupt)?;
             if !matches!(event.kind(), EventKind::EndSeed) {
                 *recovery_cursor = Some(RecoveryCursor {
@@ -1004,7 +1086,7 @@ fn recovery_event_matches(
     root_last_real_seq: Option<EventSeq>,
     previous_time: Option<UnixMillis>,
     logical_events: u64,
-) -> Result<bool, StoreError> {
+) -> Result<Option<RecoveryAction>, StoreError> {
     let (plan, _) = build_recovery_plan(
         projection,
         session_id,
@@ -1015,7 +1097,9 @@ fn recovery_event_matches(
         false,
         logical_events,
     )?;
-    Ok(plan.events().first() == Some(event))
+    Ok((plan.events().first() == Some(event))
+        .then(|| plan.actions.first().cloned())
+        .flatten())
 }
 
 fn is_tentative_recovery_start(event: &SessionEvent) -> bool {
@@ -1023,7 +1107,7 @@ fn is_tentative_recovery_start(event: &SessionEvent) -> bool {
         event.kind(),
         EventKind::ApprovalDecided { decided }
             if decided.outcome() == ApprovalOutcome::Cancelled
-    )
+    ) || matches!(event.kind(), EventKind::StepEnd { .. })
 }
 
 fn is_recovery_only_event(event: &SessionEvent) -> bool {
@@ -1140,11 +1224,15 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        model::{ContentBlock, Message},
+        model::{
+            ContentBlock, ContentBlockType, FinishReason, LlmCallConfig, LlmFailure, Message,
+            StreamChunk, TokenUsage,
+        },
         session::{
-            ApprovalAskedEvent, ApprovalOutcome, ApprovalRequestId, Clock, ClockError, EventKind,
-            EventSeq, NewEvent, Session, SessionEvent, SessionId, StepId, SurfaceIntent,
-            TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, TurnId, UnixMillis,
+            ApprovalAskedEvent, ApprovalOutcome, ApprovalRequestId, Clock, ClockError, EpochHeader,
+            EventKind, EventSeq, NewEvent, RequestHeaderReason, Session, SessionEvent, SessionId,
+            StepId, SurfaceIntent, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TurnEndReason, TurnId,
+            UnixMillis,
             jsonl::{encode_event_line, encode_header_line},
         },
         workspace_authority::WorkspaceIdentity,
@@ -1186,6 +1274,99 @@ mod tests {
         )
     }
 
+    fn log_event(seq: u64, kind: EventKind) -> SessionEvent {
+        let event = NewEvent::log(kind);
+        let original_data = crate::json_value::JsonValue::new(
+            crate::session::codec::kind_data_value(&event.kind).unwrap(),
+        )
+        .unwrap();
+        SessionEvent::from_new(
+            EventSeq::new(seq).unwrap(),
+            UnixMillis::new(7).unwrap(),
+            event,
+            original_data,
+        )
+    }
+
+    fn append_canonical_tool_assistant(
+        session: &mut Session,
+        turn: TurnId,
+        step: StepId,
+        calls: &[(&str, &str, &str)],
+    ) -> EventSeq {
+        session
+            .append(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .unwrap();
+        let mut sources = Vec::with_capacity(calls.len() * 2 + 1);
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            let index = u64::try_from(index).unwrap();
+            sources.push(
+                session
+                    .append(NewEvent::log(EventKind::assistant_chunk(
+                        turn,
+                        step,
+                        StreamChunk::block_start(index, ContentBlockType::ToolCall).unwrap(),
+                    )))
+                    .unwrap()
+                    .seq(),
+            );
+            sources.push(
+                session
+                    .append(NewEvent::log(EventKind::assistant_chunk(
+                        turn,
+                        step,
+                        StreamChunk::block_end(
+                            index,
+                            ContentBlock::tool_call(*id, *name, *arguments).unwrap(),
+                        )
+                        .unwrap(),
+                    )))
+                    .unwrap()
+                    .seq(),
+            );
+        }
+        sources.push(
+            session
+                .append(NewEvent::log(EventKind::assistant_chunk(
+                    turn,
+                    step,
+                    StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+                )))
+                .unwrap()
+                .seq(),
+        );
+        session
+            .append(NewEvent::surface(
+                EventKind::assistant_message(
+                    turn,
+                    step,
+                    Message::assistant(
+                        "assistant",
+                        calls
+                            .iter()
+                            .map(|(id, name, arguments)| {
+                                ContentBlock::tool_call(*id, *name, *arguments).unwrap()
+                            })
+                            .collect(),
+                        "mock",
+                        "mock-model",
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append().with_sources(sources),
+            ))
+            .unwrap()
+            .seq()
+    }
+
     fn open_tool_tail() -> (Vec<u8>, super::ColdScan) {
         let mut memory = Session::with_clock(ID, FixedClock).unwrap();
         let turn = TurnId::new(1).unwrap();
@@ -1196,22 +1377,15 @@ mod tests {
         memory
             .append(NewEvent::log(EventKind::step_start(turn, step)))
             .unwrap();
-        let assistant = Message::assistant(
-            "assistant",
-            vec![
-                ContentBlock::tool_call("call-a", "echo", "{\"a\":1}").unwrap(),
-                ContentBlock::tool_call("call-b", "echo", "{\"b\":2}").unwrap(),
+        append_canonical_tool_assistant(
+            &mut memory,
+            turn,
+            step,
+            &[
+                ("call-a", "echo", "{\"a\":1}"),
+                ("call-b", "echo", "{\"b\":2}"),
             ],
-            "mock",
-            "mock-model",
-        )
-        .unwrap();
-        memory
-            .append(NewEvent::surface(
-                EventKind::assistant_message(turn, step, assistant),
-                SurfaceIntent::append(),
-            ))
-            .unwrap();
+        );
         memory
             .append(NewEvent::log(EventKind::tool_call(
                 turn,
@@ -1227,6 +1401,42 @@ mod tests {
         }
         let scan = scan_bytes(&bytes).unwrap();
         (bytes, scan)
+    }
+
+    fn partial_attempt_prefix() -> Vec<u8> {
+        let mut memory = Session::with_clock(ID, FixedClock).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        memory
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        memory
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        memory
+            .append(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .unwrap();
+        memory
+            .append(NewEvent::log(EventKind::assistant_chunk(
+                turn,
+                step,
+                StreamChunk::usage(TokenUsage::new(11, 7).unwrap()).unwrap(),
+            )))
+            .unwrap();
+
+        let mut bytes = header_line();
+        for event in memory.events() {
+            bytes.extend_from_slice(&encode_event_line(event).unwrap());
+        }
+        bytes
     }
 
     fn end_seed_line(seq: u64) -> Vec<u8> {
@@ -1411,15 +1621,43 @@ mod tests {
             None,
             None,
         ));
+        events.push(log_event(
+            6,
+            EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: Some("summary system".to_owned()),
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            },
+        ));
+        events.push(log_event(
+            7,
+            EventKind::assistant_chunk(
+                TurnId::new(2).unwrap(),
+                StepId::new(1).unwrap(),
+                StreamChunk::finish(
+                    FinishReason::error(
+                        LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap(),
+            ),
+        ));
         for event in &pressure[5..] {
             let mut value = serde_json::to_value(event).unwrap();
-            let shifted = event.seq().get() + 1;
+            let shifted = event.seq().get() + 3;
             value["seq"] = json!(shifted);
             if matches!(event.kind(), EventKind::CompactionStart { .. }) {
                 value["data"]["dispatch"]["trigger"] = json!("context-overflow");
+                value["data"]["dispatch"]["requestHeaderSeq"] = json!(6);
             }
             if matches!(event.kind(), EventKind::UserMessage { .. }) {
-                value["sourceEventSeqs"] = json!([6, 7, 1]);
+                value["sourceEventSeqs"] = json!([8, 9, 1]);
             }
             events.push(crate::session::codec::decode_event(value, shifted as usize).unwrap());
         }
@@ -1427,81 +1665,54 @@ mod tests {
     }
 
     fn orphan_prune_prefix() -> Vec<SessionEvent> {
-        vec![
-            compaction_wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
-            compaction_wire_event("step/start", 1, json!({ "turn": 1, "step": 1 }), None, None),
-            compaction_wire_event(
-                "assistant/message",
-                2,
-                json!({
-                    "turn": 1,
-                    "step": 1,
-                    "message": {
-                        "id": "assistant-prune",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "tool-call",
-                            "id": "call-prune",
-                            "name": "read",
-                            "arguments": "{}"
-                        }],
-                        "source": {
-                            "kind": "model",
-                            "provider": "mock",
-                            "model": "mock-model"
-                        }
-                    }
-                }),
-                Some(json!("append")),
-                None,
-            ),
-            compaction_wire_event(
-                "tool/call",
-                3,
-                json!({
-                    "turn": 1,
-                    "step": 1,
-                    "callId": "call-prune",
-                    "name": "read",
-                    "arguments": "{}"
-                }),
-                None,
-                None,
-            ),
-            compaction_wire_event(
-                "tool/result",
-                4,
-                json!({
-                    "turn": 1,
-                    "step": 1,
-                    "message": {
-                        "id": "result-prune",
-                        "role": "user",
-                        "content": [{
-                            "type": "tool-result",
-                            "toolCallId": "call-prune",
-                            "content": [{ "type": "text", "text": "large result" }],
-                            "isError": false
-                        }],
-                        "source": { "kind": "tool", "callId": "call-prune" }
-                    },
-                    "meta": { "retained": true }
-                }),
-                Some(json!("append")),
-                Some(vec![3]),
-            ),
-            compaction_wire_event(
-                "compaction/prune",
-                5,
-                json!({
-                    "shadowedRange": { "start": 4, "end": 4 },
-                    "shadowedSeqs": [4],
-                    "shadowedTokenCount": 15
-                }),
-                None,
-                None,
-            ),
-        ]
+        let mut memory = Session::with_clock(ID, FixedClock).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        memory
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        memory
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        append_canonical_tool_assistant(&mut memory, turn, step, &[("call-prune", "read", "{}")]);
+        let call = memory
+            .append(NewEvent::log(EventKind::tool_call(
+                turn,
+                step,
+                "call-prune",
+                "read",
+                "{}",
+            )))
+            .unwrap();
+        let result = memory
+            .append(NewEvent::surface(
+                EventKind::tool_result(
+                    turn,
+                    step,
+                    Message::tool_result(
+                        "result-prune",
+                        "call-prune",
+                        vec![ContentBlock::text("large result").unwrap()],
+                        false,
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append().with_sources(vec![call.seq()]),
+            ))
+            .unwrap();
+        let mut events = memory.events().to_vec();
+        events.push(compaction_wire_event(
+            "compaction/prune",
+            u64::try_from(events.len()).unwrap(),
+            json!({
+                "shadowedRange": { "start": result.seq().get(), "end": result.seq().get() },
+                "shadowedSeqs": [result.seq().get()],
+                "shadowedTokenCount": 15
+            }),
+            None,
+            None,
+        ));
+        events
     }
 
     #[test]
@@ -1591,7 +1802,19 @@ mod tests {
             RecoveryCompactionStage::Replaced,
         ] {
             let mut bytes = header_line();
-            for event in context_overflow_compaction_prefix(stage) {
+            let prefix = context_overflow_compaction_prefix(stage);
+            let mut diagnostic = Projection::empty(ValidationPolicy::DurableStrict);
+            for event in &prefix {
+                diagnostic
+                    .apply_scanned_event(event)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "context overflow event {} failed: {error}",
+                            event.seq().get()
+                        )
+                    });
+            }
+            for event in prefix {
                 bytes.extend_from_slice(&encode_event_line(&event).unwrap());
             }
             let scan = scan_bytes(&bytes).unwrap();
@@ -1606,7 +1829,7 @@ mod tests {
             );
             assert_eq!(plan.events().len(), 3);
             let expected_surface = if stage == RecoveryCompactionStage::Replaced {
-                vec![EventSeq::new(8).unwrap(), EventSeq::new(2).unwrap()]
+                vec![EventSeq::new(10).unwrap(), EventSeq::new(2).unwrap()]
             } else {
                 vec![EventSeq::new(1).unwrap(), EventSeq::new(2).unwrap()]
             };
@@ -1692,9 +1915,85 @@ mod tests {
     }
 
     #[test]
+    fn cold_scan_rejects_a_second_context_overflow_compaction_start_in_one_step() {
+        let mut events = context_overflow_compaction_prefix(RecoveryCompactionStage::Started);
+        events.push(compaction_wire_event(
+            "compaction/end",
+            9,
+            json!({
+                "compactionId": "resume-compaction",
+                "turn": 2,
+                "error": {
+                    "message": "summary failed",
+                    "code": "SUMMARY_FAILED"
+                }
+            }),
+            None,
+            None,
+        ));
+
+        let mut second_start = serde_json::to_value(&events[8]).unwrap();
+        second_start["seq"] = json!(10);
+        second_start["data"]["compactionId"] = json!("resume-compaction-again");
+        events.push(crate::session::codec::decode_event(second_start, 10).unwrap());
+
+        let mut bytes = header_line();
+        for event in &events {
+            bytes.extend_from_slice(&encode_event_line(event).unwrap());
+        }
+        assert!(matches!(scan_bytes(&bytes), Err(StoreError::Corrupt)));
+    }
+
+    #[test]
+    fn cold_scan_rejects_context_overflow_replay_without_a_replacement() {
+        let mut events = context_overflow_compaction_prefix(RecoveryCompactionStage::Started);
+        events.push(compaction_wire_event(
+            "compaction/end",
+            9,
+            json!({
+                "compactionId": "resume-compaction",
+                "turn": 2,
+                "error": {
+                    "message": "summary failed",
+                    "code": "SUMMARY_FAILED"
+                }
+            }),
+            None,
+            None,
+        ));
+        events.push(log_event(
+            10,
+            EventKind::assistant_chunk(
+                TurnId::new(2).unwrap(),
+                StepId::new(1).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ),
+        ));
+
+        let mut bytes = header_line();
+        for event in &events {
+            bytes.extend_from_slice(&encode_event_line(event).unwrap());
+        }
+        assert!(matches!(scan_bytes(&bytes), Err(StoreError::Corrupt)));
+    }
+
+    #[test]
     fn cold_recovery_reports_and_clears_an_orphan_prune_marker() {
         let mut bytes = header_line();
-        for event in orphan_prune_prefix() {
+        let prefix = orphan_prune_prefix();
+        let assistant_seq = prefix
+            .iter()
+            .find_map(|event| {
+                matches!(event.kind(), EventKind::AssistantMessage { .. }).then_some(event.seq())
+            })
+            .unwrap();
+        let result_seq = prefix
+            .iter()
+            .find_map(|event| {
+                matches!(event.kind(), EventKind::ToolResult { .. }).then_some(event.seq())
+            })
+            .unwrap();
+        for event in prefix {
             bytes.extend_from_slice(&encode_event_line(&event).unwrap());
         }
         let scan = scan_bytes(&bytes).unwrap();
@@ -1707,7 +2006,7 @@ mod tests {
         assert_eq!(projection.orphan_prune_markers(), 0);
         assert_eq!(
             projection.state().surface_nodes(),
-            &[EventSeq::new(2).unwrap(), EventSeq::new(4).unwrap()]
+            &[assistant_seq, result_seq]
         );
         assert!(plan.events().iter().all(|event| !matches!(
             event.kind(),
@@ -1903,12 +2202,15 @@ mod tests {
         let (plan, projection) = scan.prepare_recovery(marker_time).unwrap();
 
         assert_eq!(plan.events().len(), 5);
-        assert_eq!(plan.resume_seed_len(), 8);
+        assert_eq!(plan.resume_seed_len(), scan.logical_events() + 4);
         assert_eq!(plan.repaired_calls(), 2);
         assert_eq!(plan.unknown_outcomes(), 1);
         assert_eq!(plan.not_started(), 1);
-        assert_eq!(plan.events()[0].seq().get(), 4);
-        assert_eq!(plan.events()[4].seq().get(), 8);
+        assert_eq!(plan.events()[0].seq(), scan.next_seq().unwrap());
+        assert_eq!(
+            plan.events()[4].seq().get(),
+            scan.next_seq().unwrap().get() + 4
+        );
         assert!(
             plan.events()[..4]
                 .iter()
@@ -1932,7 +2234,10 @@ mod tests {
                 .starts_with("dsh-recovery-tool-result-v1-")
         );
         assert_eq!(error.code, TOOL_OUTCOME_UNKNOWN);
-        assert_eq!(plan.events()[0].source_event_seqs().unwrap()[0].get(), 3);
+        assert_eq!(
+            plan.events()[0].source_event_seqs().unwrap()[0].get(),
+            scan.next_seq().unwrap().get() - 1
+        );
 
         let EventKind::ToolResult {
             message,
@@ -1958,6 +2263,134 @@ mod tests {
 
         let (same, _) = scan.prepare_recovery(marker_time).unwrap();
         assert_eq!(plan, same);
+    }
+
+    #[test]
+    fn partial_attempt_repair_is_interrupted_without_fabricating_an_assistant() {
+        let mut bytes = partial_attempt_prefix();
+        let scan = scan_bytes(&bytes).unwrap();
+        let (plan, recovered) = scan
+            .prepare_recovery(UnixMillis::new(999).unwrap())
+            .unwrap();
+
+        assert_eq!(plan.events().len(), 3);
+        assert!(matches!(plan.events()[0].kind(), EventKind::StepEnd { .. }));
+        assert!(matches!(
+            plan.events()[1].kind(),
+            EventKind::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        assert!(matches!(plan.events()[2].kind(), EventKind::EndSeed));
+        assert!(recovered.recovery_snapshot().attempt().is_none());
+        assert_eq!(recovered.state().open_turn(), None);
+        assert!(recovered.state().surface_nodes().is_empty());
+        assert_eq!(recovered.attempt_usage_totals_for_test(), (11, 7, 0, 0, 0));
+        let continued = recovered
+            .with_event(&log_event(
+                7,
+                EventKind::turn_start(TurnId::new(2).unwrap()),
+            ))
+            .unwrap()
+            .with_event(&log_event(
+                8,
+                EventKind::step_start(TurnId::new(2).unwrap(), StepId::new(1).unwrap()),
+            ))
+            .unwrap();
+        assert_eq!(continued.state().open_step(), Some(StepId::new(1).unwrap()));
+
+        // A crash after only the synthetic step/end keeps the original real
+        // prefix anchor. No partial model output is promoted to an assistant.
+        bytes.extend_from_slice(&encode_event_line(&plan.events()[0]).unwrap());
+        let after_step = scan_bytes(&bytes).unwrap();
+        let cursor = after_step
+            .recovery_cursor
+            .expect("the first ambiguous closer is tentative");
+        assert!(!cursor.confirmed);
+        assert_eq!(
+            cursor.root_last_real_seq.unwrap().get(),
+            plan.events()[0].seq().get() - 1
+        );
+        let (remaining, after_step_projection) = after_step
+            .prepare_recovery(UnixMillis::new(1_000).unwrap())
+            .unwrap();
+        assert_eq!(remaining.events().len(), 2);
+        assert!(matches!(
+            remaining.events()[0].kind(),
+            EventKind::TurnEnd {
+                reason: TurnEndReason::Interrupted,
+                ..
+            }
+        ));
+        assert!(
+            after_step_projection
+                .recovery_snapshot()
+                .attempt()
+                .is_none()
+        );
+        assert_eq!(
+            after_step_projection.attempt_usage_totals_for_test(),
+            (11, 7, 0, 0, 0)
+        );
+
+        bytes.extend_from_slice(&encode_event_line(&plan.events()[1]).unwrap());
+        let after_turn = scan_bytes(&bytes).unwrap();
+        assert!(
+            after_turn
+                .recovery_cursor
+                .expect("the recovery-only turn closer confirms the suffix")
+                .confirmed
+        );
+        let (only_seed, _) = after_turn
+            .prepare_recovery(UnixMillis::new(1_001).unwrap())
+            .unwrap();
+        assert_eq!(only_seed.events().len(), 1);
+        assert!(matches!(only_seed.events()[0].kind(), EventKind::EndSeed));
+
+        bytes.extend_from_slice(&encode_event_line(&plan.events()[2]).unwrap());
+        let sealed = scan_bytes(&bytes).unwrap();
+        assert!(sealed.recovery_cursor.is_none());
+        assert!(
+            sealed
+                .prepare_recovery(UnixMillis::new(1_002).unwrap())
+                .unwrap()
+                .0
+                .events()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn terminal_finish_without_an_assistant_is_also_interrupted_on_recovery() {
+        let mut bytes = partial_attempt_prefix();
+        let finish = log_event(
+            4,
+            EventKind::assistant_chunk(
+                TurnId::new(1).unwrap(),
+                StepId::new(1).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ),
+        );
+        bytes.extend_from_slice(&encode_event_line(&finish).unwrap());
+
+        let scan = scan_bytes(&bytes).unwrap();
+        assert!(scan.projection().recovery_snapshot().attempt().is_some());
+        let (plan, recovered) = scan
+            .prepare_recovery(UnixMillis::new(999).unwrap())
+            .unwrap();
+        assert_eq!(plan.events().len(), 3);
+        assert!(matches!(plan.events()[0].kind(), EventKind::StepEnd { .. }));
+        assert!(recovered.recovery_snapshot().attempt().is_none());
+        assert!(recovered.state().surface_nodes().is_empty());
+        assert_eq!(recovered.attempt_usage_totals_for_test(), (11, 7, 0, 0, 0));
+    }
+
+    #[test]
+    fn end_seed_cannot_close_an_open_provider_attempt() {
+        let mut bytes = partial_attempt_prefix();
+        bytes.extend_from_slice(&end_seed_line(4));
+        assert!(matches!(scan_bytes(&bytes), Err(StoreError::Corrupt)));
     }
 
     #[test]
@@ -2044,9 +2477,11 @@ mod tests {
             .prepare_recovery(UnixMillis::new(999).unwrap())
             .unwrap();
         bytes.extend_from_slice(&encode_event_line(&plan.events()[0]).unwrap());
-        bytes.extend_from_slice(
-            b"{\"type\":\"todo/write\",\"seq\":5,\"time\":7,\"data\":{\"todos\":[]}}\n",
+        let inserted = format!(
+            "{{\"type\":\"todo/write\",\"seq\":{},\"time\":7,\"data\":{{\"todos\":[]}}}}\n",
+            plan.events()[1].seq().get()
         );
+        bytes.extend_from_slice(inserted.as_bytes());
         assert!(matches!(scan_bytes(&bytes), Err(StoreError::Corrupt)));
     }
 
@@ -2061,22 +2496,7 @@ mod tests {
         memory
             .append(NewEvent::log(EventKind::step_start(turn, step)))
             .unwrap();
-        memory
-            .append(NewEvent::surface(
-                EventKind::assistant_message(
-                    turn,
-                    step,
-                    Message::assistant(
-                        "assistant",
-                        vec![ContentBlock::tool_call("call-a", "echo", "{}").unwrap()],
-                        "mock",
-                        "mock-model",
-                    )
-                    .unwrap(),
-                ),
-                SurfaceIntent::append(),
-            ))
-            .unwrap();
+        append_canonical_tool_assistant(&mut memory, turn, step, &[("call-a", "echo", "{}")]);
         memory
             .append(NewEvent::log(EventKind::tool_call(
                 turn, step, "call-a", "echo", "{}",

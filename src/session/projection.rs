@@ -11,6 +11,10 @@ use super::{
     ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionId, CompactionRange,
     CompactionTrigger, EventKind, EventSeq, MAX_SAFE_INTEGER, MAX_SOURCE_EVENT_SEQS, SessionEvent,
     SessionId, StepId, SurfaceOp, TurnId,
+    attempt_anchor::{
+        AttemptDisposition, AttemptError, AttemptProjection, CommittedAttemptFacts,
+        PreparedAttempt, PreparedAttemptChunk, RecoveryAttemptProof,
+    },
     compaction::{
         COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
         ModelVisibleDispatchSnapshot,
@@ -22,7 +26,7 @@ use super::{
     error::{EventValidationError, SurfaceError, TransitionError},
     event::{RECOVERY_TOOL_RESULT_ID_PREFIX, TOOL_NOT_STARTED},
     journal_row::JournalRowLocator,
-    recovery::{RecoveryAdmission, RecoveryCompactionStage},
+    recovery::{RecoveryAction, RecoveryAdmission, RecoveryCompactionStage},
     tool_result_pruner::{MaskedToolResultDigest, ToolResultSnapshot, masked_data_sha256},
 };
 
@@ -41,7 +45,9 @@ enum ValidationAdmission {
     Ordinary,
     CompatibilityReplay,
     ColdScan,
+    OwnedAttempt,
     OwnedPrune,
+    OwnedOverflowPrune,
     HistoricalScan,
 }
 
@@ -61,8 +67,27 @@ enum Boundary {
     Step {
         turn: TurnId,
         step: StepId,
+        step_start_surface_tokens: u64,
         pending_calls: Vec<CallId>,
         declared_calls: Vec<DurableDeclaredCall>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TokenMeasurementAnchor {
+    header: Option<Arc<super::EpochHeader>>,
+    surface_tokens: u64,
+    baseline: TokenBaseline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TokenBaseline {
+    Estimated {
+        tokens: u64,
+    },
+    Usage {
+        tokens: u64,
+        usage: crate::model::TokenUsage,
     },
 }
 
@@ -141,8 +166,9 @@ struct PruneShadowClaim {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct CompactionState {
+pub(super) struct CompactionState {
     surface_generation: u64,
+    replacement_generation: u64,
     open: Option<OpenCompaction>,
     prune_claim: Option<PruneShadowClaim>,
     orphan_prune_count: u64,
@@ -158,6 +184,7 @@ pub(crate) struct RecoverySnapshot {
     turn: Option<TurnId>,
     step: Option<StepId>,
     calls: Vec<RecoveryCall>,
+    attempt: Option<RecoveryAttemptProof>,
 }
 
 impl RecoverySnapshot {
@@ -171,6 +198,10 @@ impl RecoverySnapshot {
 
     pub(crate) fn calls(&self) -> &[RecoveryCall] {
         &self.calls
+    }
+
+    pub(super) fn attempt(&self) -> Option<&RecoveryAttemptProof> {
+        self.attempt.as_ref()
     }
 }
 
@@ -288,7 +319,7 @@ pub(crate) struct Projection {
     boundary: Boundary,
     surface_nodes: Arc<Vec<SurfaceNode>>,
     surface_tokens: u64,
-    request_header: Option<super::EpochHeader>,
+    request_header: Option<Arc<super::EpochHeader>>,
     request_header_seq: Option<EventSeq>,
     request_context: Option<super::RequestContext>,
     request_context_seq: Option<EventSeq>,
@@ -297,6 +328,8 @@ pub(crate) struct Projection {
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
     retry_chains: Arc<BTreeMap<RetryChainKey, RetryChainState>>,
     retry_schedules: Arc<BTreeMap<(super::RetryId, super::RetryNumber), RetryScheduleState>>,
+    attempt: Arc<AttemptProjection>,
+    token_anchor: Option<TokenMeasurementAnchor>,
 }
 
 /// One current model-visible node.
@@ -335,19 +368,75 @@ enum SurfaceRowBinding {
     Durable(JournalRowLocator),
 }
 
-pub(super) struct PreparedDurableProjection {
-    projection: Projection,
-    pending_tool_result: Option<EventSeq>,
+pub(super) enum PreparedDurableProjection {
+    Replace {
+        projection: Projection,
+        pending_tool_result: Option<EventSeq>,
+    },
+    AttemptChunk {
+        prepared: PreparedAttemptChunk,
+        compaction: CompactionState,
+    },
 }
 
 impl PreparedDurableProjection {
-    pub(super) fn bind(mut self, row: JournalRowLocator) -> Option<Projection> {
-        if let Some(seq) = self.pending_tool_result {
-            if seq != row.seq() || !self.projection.bind_tool_result_row(seq, row) {
-                return None;
+    pub(super) fn commit_memory(self, current: &mut Projection) -> bool {
+        match self {
+            Self::Replace {
+                projection,
+                pending_tool_result: None,
+            } => {
+                *current = projection;
+                true
+            }
+            Self::Replace {
+                pending_tool_result: Some(_),
+                ..
+            } => false,
+            Self::AttemptChunk {
+                prepared,
+                compaction,
+            } => {
+                let Some(attempt) = Arc::get_mut(&mut current.attempt) else {
+                    return false;
+                };
+                if !attempt.commit_chunk(prepared) {
+                    return false;
+                }
+                current.compaction = compaction;
+                true
             }
         }
-        Some(self.projection)
+    }
+
+    pub(super) fn commit(self, current: &mut Projection, row: JournalRowLocator) -> bool {
+        match self {
+            Self::Replace {
+                mut projection,
+                pending_tool_result,
+            } => {
+                if let Some(seq) = pending_tool_result {
+                    if seq != row.seq() || !projection.bind_tool_result_row(seq, row) {
+                        return false;
+                    }
+                }
+                *current = projection;
+                true
+            }
+            Self::AttemptChunk {
+                prepared,
+                compaction,
+            } => {
+                let Some(attempt) = Arc::get_mut(&mut current.attempt) else {
+                    return false;
+                };
+                if !attempt.commit_chunk(prepared) {
+                    return false;
+                }
+                current.compaction = compaction;
+                true
+            }
+        }
     }
 }
 
@@ -397,6 +486,8 @@ impl Projection {
             owned_approval_ids: Arc::new(BTreeSet::new()),
             retry_chains: Arc::new(BTreeMap::new()),
             retry_schedules: Arc::new(BTreeMap::new()),
+            attempt: Arc::new(AttemptProjection::default()),
+            token_anchor: None,
         }
     }
 
@@ -406,12 +497,66 @@ impl Projection {
         projection
     }
 
+    pub(super) fn begin_live_attempt(
+        &mut self,
+        turn: TurnId,
+        step: StepId,
+    ) -> Result<(), AttemptError> {
+        if self.compaction.open.is_some() {
+            return Err(AttemptError::Boundary {
+                event_type: "provider dispatch",
+                detail: "a compaction transaction is still open",
+            });
+        }
+        // Released in-memory sessions may contain legacy attempt-shaped rows
+        // that predate token ownership. Keep compatibility replay permissive,
+        // and initialize the strict fold only when the live Agent explicitly
+        // begins a new owned attempt inside the current step.
+        if self.policy == ValidationPolicy::MemoryCompatible && self.attempt.is_outside_step() {
+            if self.open_turn() != Some(turn) || self.open_step() != Some(step) {
+                return Err(AttemptError::Boundary {
+                    event_type: "assistant/chunk",
+                    detail: "the attempt does not belong to the open step",
+                });
+            }
+            self.attempt = Arc::new(self.attempt.step_start(turn, step)?);
+        }
+        let next = self.attempt.begin_live(
+            turn,
+            step,
+            self.request_header.as_deref(),
+            self.compaction.replacement_generation,
+        )?;
+        self.attempt = Arc::new(next);
+        Ok(())
+    }
+
+    pub(super) fn seal_live_attempt(&mut self) -> Result<PreparedAttempt, AttemptError> {
+        Arc::get_mut(&mut self.attempt)
+            .ok_or(AttemptError::OwnershipChanged)?
+            .take_prepared()
+    }
+
     /// Validate and apply one candidate to a detached projection clone.
     pub(crate) fn with_event(&self, event: &SessionEvent) -> Result<Self, EventValidationError> {
         event.kind.validate()?;
+        self.reject_unowned_attempt_event(event)?;
         let mut next = self.clone();
         let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
-        next.apply_transition(event, ValidationAdmission::Ordinary)?;
+        next.reject_unowned_context_overflow_start(event)?;
+        let retry_started = matches!(event.kind(), EventKind::LlmRetryStarted { .. });
+        if retry_started {
+            next.apply_transition(event, ValidationAdmission::Ordinary)?;
+            next.apply_attempt_transition(event, ValidationAdmission::Ordinary, None)?;
+        } else if matches!(
+            event.kind(),
+            EventKind::StepStart { .. } | EventKind::StepEnd { .. }
+        ) {
+            next.apply_attempt_transition(event, ValidationAdmission::Ordinary, None)?;
+        }
+        if !retry_started {
+            next.apply_transition(event, ValidationAdmission::Ordinary)?;
+        }
         next.apply_surface(event, SurfaceRowBinding::Memory)?;
         next.compaction = compaction;
         Ok(next)
@@ -443,15 +588,81 @@ impl Projection {
         event: &SessionEvent,
     ) -> Result<PreparedDurableProjection, EventValidationError> {
         event.kind.validate()?;
+        self.reject_unowned_attempt_event(event)?;
         let mut next = self.clone();
         let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
-        next.apply_transition(event, ValidationAdmission::Ordinary)?;
+        next.reject_unowned_context_overflow_start(event)?;
+        let retry_started = matches!(event.kind(), EventKind::LlmRetryStarted { .. });
+        if retry_started {
+            next.apply_transition(event, ValidationAdmission::Ordinary)?;
+            next.apply_attempt_transition(event, ValidationAdmission::Ordinary, None)?;
+        } else if matches!(
+            event.kind(),
+            EventKind::StepStart { .. } | EventKind::StepEnd { .. }
+        ) {
+            next.apply_attempt_transition(event, ValidationAdmission::Ordinary, None)?;
+        }
+        if !retry_started {
+            next.apply_transition(event, ValidationAdmission::Ordinary)?;
+        }
         next.apply_surface(event, SurfaceRowBinding::PendingDurable)?;
         next.compaction = compaction;
-        Ok(PreparedDurableProjection {
+        Ok(PreparedDurableProjection::Replace {
             projection: next,
             pending_tool_result: matches!(event.kind(), EventKind::ToolResult { .. })
                 .then_some(event.seq()),
+        })
+    }
+
+    /// Validate one token-owned stream chunk without cloning the growing
+    /// attempt fold. The returned delta is installed only after its journal
+    /// row, clock, and quota checks have all succeeded.
+    pub(super) fn prepare_durable_attempt_chunk(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<PreparedDurableProjection, EventValidationError> {
+        event.kind.validate()?;
+        let EventKind::AssistantChunk { turn, step, .. } = event.kind() else {
+            return Err(TransitionError::DurableAttemptEventNotAllowed {
+                event_type: event.kind().event_type_static(),
+            }
+            .into());
+        };
+        self.require_open_step(event.kind().event_type_static(), *turn, *step)?;
+        if event.surface_op().is_some() || event.source_event_seqs().is_some() {
+            return Err(SurfaceError::MetadataOnIneligibleEvent {
+                event_type: event.kind().event_type().to_owned(),
+            }
+            .into());
+        }
+        let compaction = self.next_compaction_state(event, ValidationAdmission::OwnedAttempt)?;
+        let prepared = self.attempt.prepare_chunk(
+            event,
+            self.request_header.as_deref(),
+            self.compaction.replacement_generation,
+        )?;
+        Ok(PreparedDurableProjection::AttemptChunk {
+            prepared,
+            compaction,
+        })
+    }
+
+    /// Validate a token-owned attempt closure on a detached shallow clone.
+    pub(super) fn prepare_durable_attempt_closure(
+        &self,
+        event: &SessionEvent,
+        disposition: AttemptDisposition,
+    ) -> Result<PreparedDurableProjection, EventValidationError> {
+        event.kind.validate()?;
+        let mut next = self.clone();
+        let compaction = next.next_compaction_state(event, ValidationAdmission::OwnedAttempt)?;
+        next.apply_attempt_transition(event, ValidationAdmission::OwnedAttempt, Some(disposition))?;
+        next.apply_transition(event, ValidationAdmission::OwnedAttempt)?;
+        next.apply_surface(event, SurfaceRowBinding::PendingDurable)?;
+        next.compaction = compaction;
+        Ok(PreparedDurableProjection::Replace {
+            projection: next,
+            pending_tool_result: None,
         })
     }
 
@@ -465,10 +676,30 @@ impl Projection {
         next.apply_transition(event, ValidationAdmission::OwnedPrune)?;
         next.apply_surface(event, SurfaceRowBinding::PendingDurable)?;
         next.compaction = compaction;
-        Ok(PreparedDurableProjection {
+        Ok(PreparedDurableProjection::Replace {
             projection: next,
             pending_tool_result: matches!(event.kind(), EventKind::ToolResult { .. })
                 .then_some(event.seq()),
+        })
+    }
+
+    /// Validate the first context-overflow prune marker as both a surface
+    /// transaction fact and the exact closure of the failed provider attempt.
+    pub(super) fn prepare_owned_overflow_prune_event(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<PreparedDurableProjection, EventValidationError> {
+        event.kind.validate()?;
+        let mut next = self.clone();
+        let compaction =
+            next.next_compaction_state(event, ValidationAdmission::OwnedOverflowPrune)?;
+        next.apply_context_overflow_transition(event)?;
+        next.apply_transition(event, ValidationAdmission::OwnedOverflowPrune)?;
+        next.apply_surface(event, SurfaceRowBinding::PendingDurable)?;
+        next.compaction = compaction;
+        Ok(PreparedDurableProjection::Replace {
+            projection: next,
+            pending_tool_result: None,
         })
     }
 
@@ -478,8 +709,41 @@ impl Projection {
         row: JournalRowLocator,
     ) -> Result<(), EventValidationError> {
         event.kind.validate()?;
+        if let EventKind::AssistantChunk { turn, step, .. } = event.kind() {
+            self.require_open_step(event.kind().event_type_static(), *turn, *step)?;
+            let compaction = self.next_compaction_state(event, ValidationAdmission::ColdScan)?;
+            self.apply_surface(event, SurfaceRowBinding::Durable(row))?;
+            let prepared = self.attempt.prepare_chunk(
+                event,
+                self.request_header.as_deref(),
+                self.compaction.replacement_generation,
+            )?;
+            let Some(attempt) = Arc::get_mut(&mut self.attempt) else {
+                return Err(AttemptError::Boundary {
+                    event_type: "assistant/chunk",
+                    detail: "cold attempt fold is not exclusively owned",
+                }
+                .into());
+            };
+            if !attempt.commit_chunk(prepared) {
+                return Err(AttemptError::Boundary {
+                    event_type: "assistant/chunk",
+                    detail: "cold attempt fold changed after validation",
+                }
+                .into());
+            }
+            self.compaction = compaction;
+            return Ok(());
+        }
         let compaction = self.next_compaction_state(event, ValidationAdmission::ColdScan)?;
-        self.apply_transition(event, ValidationAdmission::ColdScan)?;
+        let retry_started = matches!(event.kind(), EventKind::LlmRetryStarted { .. });
+        if retry_started {
+            self.apply_transition(event, ValidationAdmission::ColdScan)?;
+            self.apply_attempt_transition(event, ValidationAdmission::ColdScan, None)?;
+        } else {
+            self.apply_attempt_transition(event, ValidationAdmission::ColdScan, None)?;
+            self.apply_transition(event, ValidationAdmission::ColdScan)?;
+        }
         self.apply_surface(event, SurfaceRowBinding::Durable(row))?;
         self.compaction = compaction;
         Ok(())
@@ -504,6 +768,41 @@ impl Projection {
     ) -> Result<(), EventValidationError> {
         let event = admission.event();
         event.kind.validate()?;
+        match (admission.action(), event.kind()) {
+            (RecoveryAction::CancelApproval { id }, EventKind::ApprovalDecided { decided })
+                if decided.id() == id && decided.outcome() == ApprovalOutcome::Cancelled => {}
+            (RecoveryAction::RepairCall { call_id }, EventKind::ToolResult { message, .. })
+                if message.validate_tool_result().ok() == Some(call_id) => {}
+            (
+                RecoveryAction::CloseStep {
+                    turn: action_turn,
+                    step: action_step,
+                    interrupted_attempt,
+                },
+                EventKind::StepEnd { turn, step },
+            ) if action_turn == turn && action_step == step => {
+                let attempt = match interrupted_attempt {
+                    Some(proof) => self.attempt.interrupt_for_recovery(*turn, *step, proof)?,
+                    None => self.attempt.step_end(*turn, *step, None)?,
+                };
+                self.attempt = Arc::new(attempt);
+            }
+            (
+                RecoveryAction::CloseTurn { turn: action_turn },
+                EventKind::TurnEnd {
+                    turn,
+                    reason: super::TurnEndReason::Interrupted,
+                },
+            ) if action_turn == turn => {}
+            (RecoveryAction::EndSeed, EventKind::EndSeed) if self.attempt.is_outside_step() => {}
+            _ => {
+                return Err(AttemptError::Boundary {
+                    event_type: event.kind().event_type_static(),
+                    detail: "the recovery action does not match its deterministic event",
+                }
+                .into());
+            }
+        }
         let compaction = self.next_compaction_state(event, ValidationAdmission::HistoricalScan)?;
         self.apply_transition(event, ValidationAdmission::HistoricalScan)?;
         let binding = admission.row().map_or(
@@ -521,11 +820,13 @@ impl Projection {
                 turn: None,
                 step: None,
                 calls: Vec::new(),
+                attempt: self.attempt.recovery_proof(),
             },
             Boundary::Turn { turn, .. } => RecoverySnapshot {
                 turn: Some(*turn),
                 step: None,
                 calls: Vec::new(),
+                attempt: self.attempt.recovery_proof(),
             },
             Boundary::Step {
                 turn,
@@ -556,6 +857,7 @@ impl Projection {
                         result_seen: call.result_seen,
                     })
                     .collect(),
+                attempt: self.attempt.recovery_proof(),
             },
         }
     }
@@ -608,9 +910,14 @@ impl Projection {
             pending_calls,
             pending_approvals: self.pending_approvals.clone(),
             surface_nodes: self.surface_nodes.iter().map(|node| node.seq).collect(),
-            request_header: self.request_header.clone(),
+            request_header: self.request_header.as_deref().cloned(),
             request_context: self.request_context.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attempt_usage_totals_for_test(&self) -> (u64, u64, u64, u64, u64) {
+        self.attempt.usage_totals_for_test()
     }
 
     pub(crate) fn messages(&self) -> Vec<Message> {
@@ -649,6 +956,50 @@ impl Projection {
         self.compaction.surface_generation
     }
 
+    pub(crate) fn context_total_tokens(&self) -> Result<u64, SurfaceError> {
+        let current_header = self.request_header.as_deref();
+        let Some(anchor) = &self.token_anchor else {
+            return current_header
+                .map_or(Ok(0), |header| {
+                    estimate_request_header(
+                        header.system.as_deref(),
+                        header.tools.as_deref().unwrap_or_default(),
+                    )
+                })
+                .map_err(context_budget_surface_error)?
+                .checked_add(self.surface_tokens)
+                .ok_or(SurfaceError::TokenAccountingOverflow);
+        };
+        let matching_header = match (anchor.header.as_deref(), current_header) {
+            (None, None) => true,
+            (Some(anchor), Some(current)) => anchor.equivalent_to(current),
+            _ => false,
+        };
+        if !matching_header {
+            let header_tokens = current_header
+                .map_or(Ok(0), |header| {
+                    estimate_request_header(
+                        header.system.as_deref(),
+                        header.tools.as_deref().unwrap_or_default(),
+                    )
+                })
+                .map_err(context_budget_surface_error)?;
+            return header_tokens
+                .checked_add(self.surface_tokens)
+                .ok_or(SurfaceError::TokenAccountingOverflow);
+        }
+        let baseline = match &anchor.baseline {
+            TokenBaseline::Estimated { tokens } | TokenBaseline::Usage { tokens, .. } => *tokens,
+        };
+        if self.surface_tokens >= anchor.surface_tokens {
+            baseline
+                .checked_add(self.surface_tokens - anchor.surface_tokens)
+                .ok_or(SurfaceError::TokenAccountingOverflow)
+        } else {
+            Ok(baseline.saturating_sub(anchor.surface_tokens - self.surface_tokens))
+        }
+    }
+
     pub(crate) fn has_unresolved_surface_tool_calls(&self) -> bool {
         let mut unresolved = std::collections::BTreeMap::<CallId, usize>::new();
         for node in self.surface_nodes.iter() {
@@ -682,7 +1033,7 @@ impl Projection {
     }
 
     pub(crate) fn request_header(&self) -> Option<&super::EpochHeader> {
-        self.request_header.as_ref()
+        self.request_header.as_deref()
     }
 
     pub(crate) fn request_context(&self) -> Option<&super::RequestContext> {
@@ -836,7 +1187,20 @@ impl Projection {
             }
         }
 
+        let replacement_progress = consumed_prune
+            || matches!(
+                (&event.kind, &event.surface_op),
+                (EventKind::UserMessage { message }, Some(SurfaceOp::Replace(_)))
+                    if is_compaction_checkpoint_source(message)
+            );
         Self::advance_surface_generation(&mut next, event)?;
+        if replacement_progress {
+            next.replacement_generation = next
+                .replacement_generation
+                .checked_add(1)
+                .filter(|generation| *generation <= MAX_SAFE_INTEGER)
+                .ok_or(TransitionError::IdentifierExhausted)?;
+        }
         Ok(next)
     }
 
@@ -1421,6 +1785,7 @@ impl Projection {
                     self.boundary = Boundary::Step {
                         turn: *turn,
                         step: *step,
+                        step_start_surface_tokens: self.surface_tokens,
                         pending_calls: Vec::new(),
                         declared_calls: Vec::new(),
                     };
@@ -1526,7 +1891,7 @@ impl Projection {
                         event_type: event.kind.event_type_static(),
                     });
                 }
-                self.request_header = Some(header.canonicalized());
+                self.request_header = Some(Arc::new(header.canonicalized()));
                 self.request_header_seq = Some(event.seq);
             }
             EventKind::RequestContext { context } => {
@@ -1598,6 +1963,298 @@ impl Projection {
             | EventKind::Unknown { .. } => {}
         }
         Ok(())
+    }
+
+    fn apply_attempt_transition(
+        &mut self,
+        event: &SessionEvent,
+        admission: ValidationAdmission,
+        disposition: Option<AttemptDisposition>,
+    ) -> Result<(), EventValidationError> {
+        if self.policy == ValidationPolicy::MemoryCompatible
+            && admission != ValidationAdmission::OwnedAttempt
+            && self.attempt.is_outside_step()
+        {
+            return Ok(());
+        }
+        if admission == ValidationAdmission::OwnedAttempt {
+            let legal = match (disposition, event.kind()) {
+                (Some(AttemptDisposition::Committed), EventKind::AssistantMessage { .. })
+                | (Some(AttemptDisposition::Retry), EventKind::LlmRetry { .. })
+                | (
+                    Some(
+                        AttemptDisposition::Failed
+                        | AttemptDisposition::Cancelled
+                        | AttemptDisposition::Interrupted,
+                    ),
+                    EventKind::StepEnd { .. },
+                ) => true,
+                (
+                    Some(AttemptDisposition::ContextOverflow),
+                    EventKind::CompactionStart { start },
+                ) => start.dispatch().is_some_and(|dispatch| {
+                    dispatch.trigger() == CompactionTrigger::ContextOverflow
+                }),
+                _ => false,
+            };
+            if !legal {
+                return Err(AttemptError::Boundary {
+                    event_type: event.kind().event_type_static(),
+                    detail: "the closure event does not match its attempt disposition",
+                }
+                .into());
+            }
+        }
+        let is_context_start = matches!(
+            event.kind(),
+            EventKind::CompactionStart { start }
+                if start.dispatch().is_some_and(|dispatch| {
+                    dispatch.trigger() == CompactionTrigger::ContextOverflow
+                })
+        );
+        let is_step_prune =
+            matches!(event.kind(), EventKind::CompactionPrune { .. }) && self.open_step().is_some();
+        if disposition == Some(AttemptDisposition::ContextOverflow) {
+            self.apply_context_overflow_transition(event)?;
+            return Ok(());
+        }
+        if admission == ValidationAdmission::ColdScan && is_context_start {
+            if self.attempt.context_overflow_was_used() && !self.attempt.has_open_attempt() {
+                let Boundary::Step { turn, step, .. } = &self.boundary else {
+                    return Err(AttemptError::Boundary {
+                        event_type: "compaction/start",
+                        detail: "context-overflow compaction requires the matching open step",
+                    }
+                    .into());
+                };
+                self.attempt = Arc::new(self.attempt.context_overflow_start(*turn, *step)?);
+                return Ok(());
+            }
+            self.apply_context_overflow_transition(event)?;
+            return Ok(());
+        }
+        if admission == ValidationAdmission::ColdScan
+            && is_step_prune
+            && self.attempt.has_open_attempt()
+        {
+            self.apply_context_overflow_transition(event)?;
+            return Ok(());
+        }
+        let next = match event.kind() {
+            EventKind::StepStart { turn, step } => {
+                if disposition.is_some() {
+                    return Err(AttemptError::Boundary {
+                        event_type: "step/start",
+                        detail: "step/start cannot close a provider attempt",
+                    }
+                    .into());
+                }
+                self.attempt.step_start(*turn, *step)?
+            }
+            EventKind::AssistantMessage { .. } => {
+                if disposition != Some(AttemptDisposition::Committed)
+                    && admission == ValidationAdmission::OwnedAttempt
+                {
+                    return Err(AttemptError::Boundary {
+                        event_type: "assistant/message",
+                        detail: "assistant/message requires the committed disposition",
+                    }
+                    .into());
+                }
+                let (next, facts) = self.attempt.assistant(event)?;
+                self.token_anchor = Some(self.prepare_token_anchor(event, &facts)?);
+                next
+            }
+            EventKind::LlmRetry { .. } => {
+                if disposition != Some(AttemptDisposition::Retry)
+                    && admission == ValidationAdmission::OwnedAttempt
+                {
+                    return Err(AttemptError::Boundary {
+                        event_type: "llm/retry",
+                        detail: "llm/retry requires the retry disposition",
+                    }
+                    .into());
+                }
+                self.attempt.retry(event)?
+            }
+            EventKind::LlmRetryStarted { started } => {
+                if disposition.is_some() {
+                    return Err(AttemptError::Boundary {
+                        event_type: "llm/retry-started",
+                        detail: "retry-started cannot close a provider attempt",
+                    }
+                    .into());
+                }
+                // The fixed upstream permits retry-started to arrive after
+                // its step has already closed. It still updates the durable
+                // retry index, but there is no live attempt slot to reopen.
+                if self.open_turn() != Some(started.turn())
+                    || self.open_step() != Some(started.step())
+                {
+                    return Ok(());
+                }
+                self.attempt.retry_started(started.turn(), started.step())?
+            }
+            EventKind::StepEnd { turn, step } => {
+                let normalized = if admission == ValidationAdmission::ColdScan
+                    && self.attempt.has_open_attempt()
+                {
+                    Some(AttemptDisposition::Failed)
+                } else {
+                    disposition
+                };
+                self.attempt.step_end(*turn, *step, normalized)?
+            }
+            _ => return Ok(()),
+        };
+        self.attempt = Arc::new(next);
+        Ok(())
+    }
+
+    fn reject_unowned_context_overflow_start(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<(), EventValidationError> {
+        if (self.policy == ValidationPolicy::DurableStrict || !self.attempt.is_outside_step())
+            && matches!(
+                event.kind(),
+                EventKind::CompactionStart { start }
+                    if start.dispatch().is_some_and(|dispatch| {
+                        dispatch.trigger() == CompactionTrigger::ContextOverflow
+                    })
+            )
+        {
+            return Err(TransitionError::DurableAttemptEventNotAllowed {
+                event_type: "compaction/start",
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn reject_unowned_attempt_event(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<(), EventValidationError> {
+        if (self.policy == ValidationPolicy::DurableStrict || !self.attempt.is_outside_step())
+            && matches!(
+                event.kind(),
+                EventKind::AssistantChunk { .. }
+                    | EventKind::AssistantMessage { .. }
+                    | EventKind::LlmRetry { .. }
+            )
+        {
+            return Err(TransitionError::DurableAttemptEventNotAllowed {
+                event_type: event.kind().event_type_static(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn apply_context_overflow_transition(
+        &mut self,
+        event: &SessionEvent,
+    ) -> Result<(), EventValidationError> {
+        let Boundary::Step { turn, step, .. } = &self.boundary else {
+            return Err(AttemptError::Boundary {
+                event_type: event.kind().event_type_static(),
+                detail: "context-overflow recovery requires the matching open step",
+            }
+            .into());
+        };
+        let starts_compaction = matches!(event.kind(), EventKind::CompactionStart { .. });
+        let next = self.attempt.context_overflow(
+            *turn,
+            *step,
+            self.compaction.replacement_generation,
+            starts_compaction,
+        )?;
+        self.attempt = Arc::new(next);
+        Ok(())
+    }
+
+    fn prepare_token_anchor(
+        &self,
+        event: &SessionEvent,
+        facts: &CommittedAttemptFacts,
+    ) -> Result<TokenMeasurementAnchor, EventValidationError> {
+        let EventKind::AssistantMessage { message, .. } = event.kind() else {
+            return Err(AttemptError::Boundary {
+                event_type: event.kind().event_type_static(),
+                detail: "only assistant/message can install a token anchor",
+            }
+            .into());
+        };
+        let Boundary::Step {
+            step_start_surface_tokens,
+            ..
+        } = &self.boundary
+        else {
+            return Err(AttemptError::Boundary {
+                event_type: "assistant/message",
+                detail: "the token anchor has no matching step/start",
+            }
+            .into());
+        };
+        let header = self.request_header.clone();
+        let header_tokens = header
+            .as_deref()
+            .map_or(Ok(0), |header| {
+                estimate_request_header(
+                    header.system.as_deref(),
+                    header.tools.as_deref().unwrap_or_default(),
+                )
+            })
+            .map_err(context_budget_surface_error)?;
+
+        let (surface_tokens, baseline) = match (facts.usage(), header.as_deref()) {
+            (Some(usage), Some(_)) => {
+                let surface_tokens = step_start_surface_tokens
+                    .checked_add(facts.provider_assistant_tokens())
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                let estimated = header_tokens
+                    .checked_add(surface_tokens)
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                let usage_tokens = usage
+                    .input_tokens()
+                    .get()
+                    .checked_add(usage.cache_read_tokens().map_or(0, |value| value.get()))
+                    .and_then(|total| {
+                        total.checked_add(usage.cache_write_tokens().map_or(0, |value| value.get()))
+                    })
+                    .and_then(|total| total.checked_add(usage.output_tokens().get()))
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                let baseline = if usage_tokens >= estimated {
+                    TokenBaseline::Usage {
+                        tokens: usage_tokens,
+                        usage: usage.clone(),
+                    }
+                } else {
+                    TokenBaseline::Estimated { tokens: estimated }
+                };
+                (surface_tokens, baseline)
+            }
+            _ => {
+                let event_tokens = if message.content().is_empty() {
+                    0
+                } else {
+                    estimate_message(message).map_err(context_budget_surface_error)?
+                };
+                let surface_tokens = step_start_surface_tokens
+                    .checked_add(event_tokens)
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                let tokens = header_tokens
+                    .checked_add(surface_tokens)
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                (surface_tokens, TokenBaseline::Estimated { tokens })
+            }
+        };
+        Ok(TokenMeasurementAnchor {
+            header,
+            surface_tokens,
+            baseline,
+        })
     }
 
     fn apply_surface(
@@ -2316,12 +2973,16 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        model::{CallId, ContentBlock, Message},
+        model::{
+            CallId, ContentBlock, ContentBlockType, FinishReason, LlmCallConfig, Message,
+            StreamChunk,
+        },
         session::{
-            ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId, Clock,
-            ClockError, EventKind, EventSeq, NewEvent, Session, SessionEvent, SessionId, StepId,
-            SurfaceError, SurfaceIntent, TOOL_NOT_STARTED, ToolFailure, TransitionError,
-            TurnEndReason, TurnId, UnixMillis, journal_row::JournalRowLocator,
+            ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome, ApprovalRequestId,
+            AttemptDisposition, Clock, ClockError, EpochHeader, EventKind, EventSeq, NewEvent,
+            RequestHeaderReason, Session, SessionEvent, SessionId, StepId, SurfaceError,
+            SurfaceIntent, TOOL_NOT_STARTED, ToolFailure, TransitionError, TurnEndReason, TurnId,
+            UnixMillis, journal_row::JournalRowLocator,
         },
     };
 
@@ -2365,14 +3026,17 @@ mod tests {
     ) -> Result<Projection, crate::session::EventValidationError> {
         let row = crate::session::jsonl::encode_event_line(event).unwrap();
         let locator = JournalRowLocator::new(event.seq(), 0, &row).unwrap();
-        projection
-            .prepare_owned_prune_event(event)?
-            .bind(locator)
-            .ok_or_else(|| SurfaceError::ToolResultChangedIdentity.into())
+        let prepared = projection.prepare_owned_prune_event(event)?;
+        let mut next = projection.clone();
+        if prepared.commit(&mut next, locator) {
+            Ok(next)
+        } else {
+            Err(SurfaceError::ToolResultChangedIdentity.into())
+        }
     }
 
     fn open_step(session: &mut Session, calls: &[(&str, &str, &str)]) -> Vec<SessionEvent> {
-        vec![
+        let mut events = vec![
             append(session, NewEvent::log(EventKind::turn_start(turn()))),
             append(
                 session,
@@ -2380,18 +3044,93 @@ mod tests {
             ),
             append(
                 session,
-                NewEvent::surface(
-                    EventKind::assistant_message(turn(), step(), assistant_with_calls(calls)),
-                    SurfaceIntent::append(),
-                ),
+                NewEvent::log(EventKind::RequestHeader {
+                    header: EpochHeader {
+                        config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                        adapter_defaults: None,
+                        system: None,
+                        tools: None,
+                    },
+                    reason: RequestHeaderReason::Initial,
+                }),
             ),
-        ]
+        ];
+        let mut sources = Vec::with_capacity(calls.len() * 2 + 1);
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            let index = u64::try_from(index).unwrap();
+            let start = append(
+                session,
+                NewEvent::log(EventKind::assistant_chunk(
+                    turn(),
+                    step(),
+                    StreamChunk::block_start(index, ContentBlockType::ToolCall).unwrap(),
+                )),
+            );
+            sources.push(start.seq());
+            events.push(start);
+            let end = append(
+                session,
+                NewEvent::log(EventKind::assistant_chunk(
+                    turn(),
+                    step(),
+                    StreamChunk::block_end(
+                        index,
+                        ContentBlock::tool_call(*id, *name, *arguments).unwrap(),
+                    )
+                    .unwrap(),
+                )),
+            );
+            sources.push(end.seq());
+            events.push(end);
+        }
+        let finish = append(
+            session,
+            NewEvent::log(EventKind::assistant_chunk(
+                turn(),
+                step(),
+                StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+            )),
+        );
+        sources.push(finish.seq());
+        events.push(finish);
+        events.push(append(
+            session,
+            NewEvent::surface(
+                EventKind::assistant_message(turn(), step(), assistant_with_calls(calls)),
+                SurfaceIntent::append().with_sources(sources),
+            ),
+        ));
+        events
     }
 
     fn strict_prefix(events: &[SessionEvent]) -> Result<Projection, TransitionError> {
         let mut projection = Projection::empty(ValidationPolicy::DurableStrict);
         for event in events {
-            projection = projection.with_event(event).map_err(|error| match error {
+            let result = match event.kind() {
+                EventKind::AssistantChunk { .. } => {
+                    let prepared = projection.prepare_durable_attempt_chunk(event);
+                    prepared.and_then(|prepared| {
+                        let row = crate::session::jsonl::encode_event_line(event).unwrap();
+                        let locator = JournalRowLocator::new(event.seq(), 0, &row).unwrap();
+                        if prepared.commit(&mut projection, locator) {
+                            Ok(())
+                        } else {
+                            Err(crate::session::EventValidationError::from(
+                                super::AttemptError::OwnershipChanged,
+                            ))
+                        }
+                    })
+                }
+                EventKind::AssistantMessage { .. } => projection
+                    .prepare_durable_attempt_closure(event, AttemptDisposition::Committed)
+                    .map(|prepared| {
+                        let row = crate::session::jsonl::encode_event_line(event).unwrap();
+                        let locator = JournalRowLocator::new(event.seq(), 0, &row).unwrap();
+                        assert!(prepared.commit(&mut projection, locator));
+                    }),
+                _ => projection.with_event(event).map(|next| projection = next),
+            };
+            result.map_err(|error| match error {
                 crate::session::EventValidationError::Transition(error) => error,
                 other => panic!("unexpected validation error: {other}"),
             })?;
@@ -2753,7 +3492,11 @@ mod tests {
             }
         ));
 
-        let isolated = vec![events[0].clone(), events[1].clone(), events[3].clone()];
+        let isolated = vec![
+            events[0].clone(),
+            events[1].clone(),
+            events[events.len() - 2].clone(),
+        ];
         assert!(matches!(
             strict_scanned_prefix(&isolated).unwrap_err(),
             TransitionError::DurableToolResultMismatch { .. }
@@ -2958,77 +3701,54 @@ mod tests {
 
     #[test]
     fn strict_prune_marker_uses_the_current_tool_result_price() {
-        let prefix = [
-            wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
-            wire_event("step/start", 1, json!({ "turn": 1, "step": 1 }), None, None),
-            wire_event(
-                "assistant/message",
-                2,
-                json!({
-                    "turn": 1,
-                    "step": 1,
-                    "message": {
-                        "id": "assistant-prune-price",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "tool-call",
-                            "id": "call-prune-price",
-                            "name": "read",
-                            "arguments": "{}"
-                        }],
-                        "source": { "kind": "model", "provider": "mock", "model": "mock" }
-                    }
-                }),
-                Some(json!("append")),
-                None,
-            ),
-            wire_event(
-                "tool/call",
-                3,
-                json!({
-                    "turn": 1,
-                    "step": 1,
-                    "callId": "call-prune-price",
-                    "name": "read",
-                    "arguments": "{}"
-                }),
-                None,
-                None,
-            ),
-            wire_event(
-                "tool/result",
-                4,
-                json!({
-                    "turn": 1,
-                    "step": 1,
-                    "message": {
-                        "id": "result-prune-price",
-                        "role": "user",
-                        "content": [{
-                            "type": "tool-result",
-                            "toolCallId": "call-prune-price",
-                            "content": [{ "type": "text", "text": "x".repeat(47) }],
-                            "isError": false
-                        }],
-                        "source": { "kind": "tool", "callId": "call-prune-price" }
-                    },
-                    "meta": { "retained": true }
-                }),
-                Some(json!("append")),
-                Some(vec![3]),
-            ),
-        ];
-        let mut projection = Projection::empty(ValidationPolicy::DurableStrict);
-        for event in &prefix {
-            projection = projection.with_event(event).unwrap();
-        }
+        let mut memory = Session::with_clock("prune-price", FixedClock).unwrap();
+        let mut prefix = open_step(&mut memory, &[("call-prune-price", "read", "{}")]);
+        let call = append(
+            &mut memory,
+            NewEvent::log(EventKind::tool_call(
+                turn(),
+                step(),
+                "call-prune-price",
+                "read",
+                "{}",
+            )),
+        );
+        prefix.push(call.clone());
+        let result_seq = EventSeq::new(u64::try_from(prefix.len()).unwrap()).unwrap();
+        prefix.push(wire_event(
+            "tool/result",
+            result_seq.get(),
+            json!({
+                "turn": 1,
+                "step": 1,
+                "message": {
+                    "id": "result-prune-price",
+                    "role": "user",
+                    "content": [{
+                        "type": "tool-result",
+                        "toolCallId": "call-prune-price",
+                        "content": [{ "type": "text", "text": "x".repeat(47) }],
+                        "isError": false
+                    }],
+                    "source": { "kind": "tool", "callId": "call-prune-price" }
+                },
+                "meta": { "retained": true }
+            }),
+            Some(json!("append")),
+            Some(vec![call.seq().get()]),
+        ));
+        let projection = strict_prefix(&prefix).unwrap();
+        let marker_seq = EventSeq::new(result_seq.get() + 1).unwrap();
         let marker = |count| {
             wire_event(
                 "compaction/prune",
-                5,
+                marker_seq.get(),
                 json!({
-                    "shadowedRange": { "start": 4, "end": 4 },
-                    "shadowedSeqs": [4],
+                    "shadowedRange": {
+                        "start": result_seq.get(),
+                        "end": result_seq.get()
+                    },
+                    "shadowedSeqs": [result_seq.get()],
                     "shadowedTokenCount": count
                 }),
                 None,
@@ -3056,7 +3776,7 @@ mod tests {
         let before_tokens = projection.surface_tokens;
         let replacement = wire_event(
             "tool/result",
-            6,
+            marker_seq.get() + 1,
             json!({
                 "turn": 1,
                 "step": 1,
@@ -3076,8 +3796,12 @@ mod tests {
                 },
                 "meta": { "retained": true }
             }),
-            Some(json!({ "op": "replace", "start": 4, "end": 4 })),
-            Some(vec![4]),
+            Some(json!({
+                "op": "replace",
+                "start": result_seq.get(),
+                "end": result_seq.get()
+            })),
+            Some(vec![result_seq.get()]),
         );
 
         let mut hot = append_owned_prune(&projection, &marker(24)).unwrap();
@@ -3093,7 +3817,16 @@ mod tests {
         assert_eq!(hot.surface_tokens, before_tokens);
         assert_eq!(
             hot.state().surface_nodes(),
-            &[EventSeq::new(2).unwrap(), EventSeq::new(6).unwrap()]
+            &[
+                prefix
+                    .iter()
+                    .find_map(|event| {
+                        matches!(event.kind(), EventKind::AssistantMessage { .. })
+                            .then_some(event.seq())
+                    })
+                    .unwrap(),
+                replacement.seq()
+            ]
         );
         assert_eq!(hot.orphan_prune_markers(), 0);
 
@@ -3235,20 +3968,22 @@ mod tests {
 
     #[test]
     fn strict_compaction_cannot_start_with_unresolved_tool_or_approval_work() {
-        let start = |seq: u64| {
+        let start = |seq: u64, shadowed: EventSeq| {
             let mut value = serde_json::to_value(&strict_compaction_trace()[5]).unwrap();
             value["seq"] = json!(seq);
             value["data"]["turn"] = json!(1);
             value["data"]["dispatch"]["trigger"] = json!("context-overflow");
             value["data"]["dispatch"]["sourceSurfaceGeneration"] = json!(1);
-            value["data"]["dispatch"]["shadowedRange"] = json!({ "start": 2, "end": 2 });
-            value["data"]["dispatch"]["shadowedSeqs"] = json!([2]);
+            value["data"]["dispatch"]["shadowedRange"] =
+                json!({ "start": shadowed.get(), "end": shadowed.get() });
+            value["data"]["dispatch"]["shadowedSeqs"] = json!([shadowed.get()]);
             crate::session::codec::decode_event(value, seq as usize).unwrap()
         };
 
         let mut pending_call = Session::with_clock("pending-call", FixedClock).unwrap();
         let mut events = open_step(&mut pending_call, &[("call-1", "read", "{}")]);
-        events.push(start(3));
+        let shadowed = events.last().unwrap().seq();
+        events.push(start(events.len() as u64, shadowed));
         assert!(matches!(
             strict_prefix(&events).unwrap_err(),
             TransitionError::CompactionDispatchMismatch(
@@ -3258,6 +3993,7 @@ mod tests {
 
         let mut pending_approval = Session::with_clock("pending-approval", FixedClock).unwrap();
         let mut events = open_step(&mut pending_approval, &[("call-1", "read", "{}")]);
+        let shadowed = events.last().unwrap().seq();
         events.push(append(
             &mut pending_approval,
             NewEvent::log(EventKind::tool_call(turn(), step(), "call-1", "read", "{}")),
@@ -3274,7 +4010,7 @@ mod tests {
                 .unwrap(),
             )),
         ));
-        events.push(start(5));
+        events.push(start(events.len() as u64, shadowed));
         assert!(matches!(
             strict_prefix(&events).unwrap_err(),
             TransitionError::CompactionDispatchMismatch(

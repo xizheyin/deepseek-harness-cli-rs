@@ -909,12 +909,18 @@ mod tests {
     use tokio::sync::{mpsc as tokio_mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
-    use crate::model::{ContentBlock, Message};
+    use crate::model::{
+        ContentBlock, ContentBlockType, FinishReason, FiniteNumber, LlmCallConfig, LlmFailure,
+        Message, MessageSource, NonNegativeSafeInteger, StreamChunk, TokenUsage,
+    };
+    use crate::session::projection::{Projection, ValidationPolicy};
     use crate::session::{
-        AppendError, BarrierError, ClaimedAppend, Clock, ClockError, EventKind, EventSeq, NewEvent,
-        PrunePairAppendError, Session, SessionMode, StepId, SurfaceIntent, SystemClock, TodoItem,
-        TodoStatus, ToolResultPruneConfig, TurnEndReason, TurnId, UnixMillis,
-        journal_row::JournalRowLocator,
+        AppendError, AttemptDisposition, BarrierError, ClaimedAppend, Clock, ClockError,
+        EpochHeader, EventKind, EventSeq, EventValidationError, LlmRetryEvent,
+        LlmRetryStartedEvent, NewEvent, PreparedAttempt, PrunePairAppendError, RequestHeaderReason,
+        RetryId, RetryNumber, Session, SessionMode, SessionStorage, StepId, SurfaceIntent,
+        SystemClock, TodoItem, TodoStatus, ToolResultPruneConfig, TransitionError, TurnEndReason,
+        TurnId, UnixMillis, journal_row::JournalRowLocator,
     };
 
     use super::{
@@ -1124,13 +1130,335 @@ mod tests {
             .filter(|row| !row.is_empty())
             .map(|row| serde_json::from_slice::<serde_json::Value>(row).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(rows[5]["type"], "compaction/prune");
-        assert_eq!(rows[6]["type"], "tool/result");
-        assert_eq!(rows[6]["sourceEventSeqs"], serde_json::json!([4]));
+        let marker_index = usize::try_from(receipt.marker().seq().get()).unwrap();
+        let replacement_index = usize::try_from(receipt.replacement().seq().get()).unwrap();
+        assert_eq!(rows[marker_index]["type"], "compaction/prune");
+        assert_eq!(rows[replacement_index]["type"], "tool/result");
         assert_eq!(
-            rows[6]["surfaceOp"],
-            serde_json::json!({"op":"replace","start":4,"end":4})
+            rows[replacement_index]["sourceEventSeqs"],
+            serde_json::json!([result_seq.get()])
         );
+        assert_eq!(
+            rows[replacement_index]["surfaceOp"],
+            serde_json::json!({
+                "op":"replace",
+                "start":result_seq.get(),
+                "end":result_seq.get()
+            })
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_overflow_prune_atomically_closes_the_failed_attempt() {
+        let (path, file) = test_file("session-overflow-prune-pair");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, result_seq) =
+            prunable_session("session-overflow-prune-pair", SystemClock, writer).await;
+        let turn = TurnId::new(1).unwrap();
+        let first_step = StepId::new(1).unwrap();
+        let overflow_step = StepId::new(2).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, overflow_step)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let failed = reservation.begin_attempt(turn, overflow_step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &failed,
+                StreamChunk::finish(
+                    FinishReason::error(
+                        LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _sealed = reservation.seal_attempt(&failed).unwrap();
+        let row = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = row
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        let before = reservation.session().next_seq();
+        assert!(reservation.append_prune_pair(replacement).is_err());
+        assert_eq!(reservation.session().next_seq(), before);
+        let row = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = row
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        let receipt = reservation
+            .append_prune_pair_with_attempt(replacement, Some(&failed))
+            .unwrap();
+        assert_eq!(
+            receipt.marker().seq().get() + 1,
+            receipt.replacement().seq().get()
+        );
+        assert!(reservation.retire_attempt(&failed).is_err());
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&failed).unwrap();
+
+        let replay = reservation.begin_attempt(turn, overflow_step).unwrap();
+        reservation
+            .append_attempt_closure_settled(
+                &replay,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, overflow_step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&replay).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_overflow_marker_only_cannot_replay_without_surface_progress() {
+        let (path, file) = test_file("session-overflow-marker-only");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, result_seq) =
+            prunable_session("session-overflow-marker-only", clock.clone(), writer).await;
+        let turn = TurnId::new(1).unwrap();
+        let first_step = StepId::new(1).unwrap();
+        let overflow_step = StepId::new(2).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, overflow_step)))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let mut reservation = session.reservation();
+        let failed = reservation.begin_attempt(turn, overflow_step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &failed,
+                StreamChunk::finish(
+                    FinishReason::error(
+                        LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.seal_attempt(&failed).unwrap();
+        let row = reservation
+            .read_validated_surface_row(result_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        let replacement = row
+            .prune(ToolResultPruneConfig::new(50, 4, 3).unwrap())
+            .unwrap()
+            .unwrap();
+        clock.fail_after(1);
+        assert!(matches!(
+            reservation.append_prune_pair_with_attempt(replacement, Some(&failed)),
+            Err(PrunePairAppendError::MarkerCommitted {
+                source: AppendError::Clock(_),
+                ..
+            })
+        ));
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&failed).unwrap();
+        assert!(reservation.begin_attempt(turn, overflow_step).is_err());
+
+        reservation
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(
+                    Message::user(
+                        "unrelated-after-overflow",
+                        vec![ContentBlock::text("this is not compaction progress").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append(),
+            ))
+            .await
+            .unwrap();
+        assert!(reservation.begin_attempt(turn, overflow_step).is_err());
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, overflow_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("context is full", "CONTEXT_WINDOW_EXCEEDED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_anchor_matches_hot_and_cold_token_measurement() {
+        let (path, file) = test_file("attempt-token-anchor");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let mut session =
+            Session::new_active_for_test("attempt-token-anchor", SystemClock, writer).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let first_step = StepId::new(1).unwrap();
+        let second_step = StepId::new(2).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(
+                    Message::user(
+                        "old-user",
+                        vec![ContentBlock::text("abcd").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append(),
+            ))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::surface(
+                EventKind::user_message(
+                    Message::user(
+                        "current-user",
+                        vec![ContentBlock::text("abcdefgh").unwrap()],
+                        MessageSource::user().unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                SurfaceIntent::append(),
+            ))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: Some("abcd".to_owned()),
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+
+        let usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(20).unwrap(),
+            NonNegativeSafeInteger::new(7).unwrap(),
+            Some(NonNegativeSafeInteger::new(3).unwrap()),
+            Some(NonNegativeSafeInteger::new(4).unwrap()),
+            Some(NonNegativeSafeInteger::new(6).unwrap()),
+        )
+        .unwrap();
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, second_step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, ContentBlock::text("abcd").unwrap()).unwrap(),
+            StreamChunk::usage(usage).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        let assistant =
+            finish_only_assistant(turn, second_step, reservation.seal_attempt(&token).unwrap());
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, assistant)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, second_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(reservation.session().context_total_tokens().unwrap(), 44);
+        drop(reservation);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mut cold =
+            Projection::for_session(ValidationPolicy::DurableStrict, session.id().clone());
+        for (index, row) in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .enumerate()
+        {
+            let value = serde_json::from_slice(row).unwrap();
+            let event = crate::session::codec::decode_event(value, index).unwrap();
+            cold.apply_scanned_event(&event).unwrap();
+        }
+        assert_eq!(cold.context_total_tokens().unwrap(), 44);
+
+        session.shutdown().await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1251,8 +1579,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0][1]["sourceEventSeqs"], serde_json::json!([4]));
-        assert_eq!(pairs[1][1]["sourceEventSeqs"], serde_json::json!([6]));
+        assert_eq!(
+            pairs[0][1]["sourceEventSeqs"],
+            serde_json::json!([result_seqs[0].get()])
+        );
+        assert_eq!(
+            pairs[1][1]["sourceEventSeqs"],
+            serde_json::json!([result_seqs[1].get()])
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1529,6 +1863,754 @@ mod tests {
             Err(AppendError::DurablePoisoned)
         );
         assert!(session.shutdown().await.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_token_owned_finish_closes_only_after_its_durable_barrier() {
+        let (path, file) = test_file("attempt-token-lifecycle");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-token-lifecycle", writer).await;
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let finish = reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        assert_eq!(receipt.seq().get(), finish.seq().get() + 1);
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_durable_admission_rejects_all_attempt_rows() {
+        let (path, file) = test_file("attempt-ordinary-bypass");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-ordinary-bypass", writer).await;
+        let mut reservation = session.reservation();
+        let failure = LlmFailure::new("retry", "TRANSIENT").unwrap();
+        let retry = LlmRetryEvent::normal(
+            RetryId::new("retry-ordinary-bypass"),
+            turn,
+            step,
+            "mock",
+            "policy",
+            RetryNumber::new(1).unwrap(),
+            RetryNumber::new(2).unwrap(),
+            FiniteNumber::new(0.0).unwrap(),
+            failure,
+        )
+        .unwrap();
+        let candidates = [
+            NewEvent::log(EventKind::assistant_chunk(
+                turn,
+                step,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )),
+            NewEvent::surface(
+                EventKind::AssistantMessage {
+                    turn,
+                    step,
+                    message: Message::assistant(
+                        "forged-assistant",
+                        Vec::new(),
+                        "mock",
+                        "mock-model",
+                    )
+                    .unwrap(),
+                    usage: None,
+                },
+                SurfaceIntent::append(),
+            ),
+            NewEvent::log(EventKind::llm_retry(retry)),
+        ];
+
+        for candidate in candidates {
+            let expected_type = candidate.kind.event_type().to_owned();
+            let before = reservation.session().next_seq();
+            let error = reservation
+                .append_settled(candidate.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AppendError::Validation(EventValidationError::Transition(
+                    TransitionError::DurableAttemptEventNotAllowed { event_type }
+                )) if event_type == expected_type
+            ));
+            assert_eq!(reservation.session().next_seq(), before);
+
+            let mut claim = reservation.claim_batch([candidate]).unwrap().remove(0);
+            let error = reservation
+                .settle_exact_settled(&mut claim)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                AppendError::Validation(EventValidationError::Transition(
+                    TransitionError::DurableAttemptEventNotAllowed { event_type }
+                )) if event_type == expected_type
+            ));
+            assert_eq!(reservation.session().next_seq(), before);
+            reservation.release(&mut claim).unwrap();
+        }
+
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_memory_admission_cannot_bypass_a_live_attempt_token() {
+        let mut session = Session::with_clock("attempt-memory-bypass", SystemClock).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let failure = LlmFailure::new("retry", "TRANSIENT").unwrap();
+        let retry = LlmRetryEvent::normal(
+            RetryId::new("retry-memory-bypass"),
+            turn,
+            step,
+            "mock",
+            "policy",
+            RetryNumber::new(1).unwrap(),
+            RetryNumber::new(2).unwrap(),
+            FiniteNumber::new(0.0).unwrap(),
+            failure,
+        )
+        .unwrap();
+        let candidates = [
+            NewEvent::log(EventKind::assistant_chunk(
+                turn,
+                step,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )),
+            NewEvent::surface(
+                EventKind::AssistantMessage {
+                    turn,
+                    step,
+                    message: Message::assistant(
+                        "forged-memory-assistant",
+                        Vec::new(),
+                        "mock",
+                        "mock-model",
+                    )
+                    .unwrap(),
+                    usage: None,
+                },
+                SurfaceIntent::append(),
+            ),
+            NewEvent::log(EventKind::llm_retry(retry)),
+        ];
+
+        for candidate in candidates {
+            let expected_type = candidate.kind.event_type().to_owned();
+            let before = reservation.session().next_seq();
+            let error = reservation.append_settled(candidate).await.unwrap_err();
+            assert!(matches!(
+                error,
+                AppendError::Validation(EventValidationError::Transition(
+                    TransitionError::DurableAttemptEventNotAllowed { event_type }
+                )) if event_type == expected_type
+            ));
+            assert_eq!(reservation.session().next_seq(), before);
+        }
+
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("attempt stopped", "ATTEMPT_FAILED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_chunk_attempt_closes_through_owned_step_end() {
+        let (path, file) = test_file("attempt-zero-chunk-close");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-zero-chunk-close", writer).await;
+        let mut reservation = session.reservation();
+        let mut step_end = reservation
+            .claim_batch([NewEvent::log(EventKind::step_end(turn, step))])
+            .unwrap()
+            .remove(0);
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .settle_step_end_with_attempt_settled(
+                &mut step_end,
+                Some(&token),
+                Some(AttemptDisposition::Failed),
+            )
+            .await
+            .unwrap();
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(reservation.session().state().open_step(), None);
+        assert_eq!(
+            reservation.release(&mut step_end),
+            Err(AppendError::InvalidClaim)
+        );
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("provider failed", "AGENT_PROVIDER_STREAM").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retry_reopens_the_same_step_only_after_its_owned_attempt_closes() {
+        let (path, file) = test_file("attempt-retry-lifecycle");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-retry-lifecycle", writer).await;
+        let mut reservation = session.reservation();
+        let failure = LlmFailure::new("try again", "TRANSIENT").unwrap();
+        let first = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &first,
+                StreamChunk::finish(FinishReason::error(failure.clone()).unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let _failed = reservation.seal_attempt(&first).unwrap();
+        let retry_id = RetryId::new("retry-attempt-1");
+        let retry_number = RetryNumber::new(1).unwrap();
+        let retry = LlmRetryEvent::normal(
+            retry_id.clone(),
+            turn,
+            step,
+            "mock",
+            "policy",
+            retry_number,
+            RetryNumber::new(2).unwrap(),
+            FiniteNumber::new(0.0).unwrap(),
+            failure,
+        )
+        .unwrap();
+        reservation
+            .append_attempt_closure_settled(
+                &first,
+                AttemptDisposition::Retry,
+                NewEvent::log(EventKind::llm_retry(retry)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&first).unwrap();
+
+        let started = LlmRetryStartedEvent::new(retry_id, turn, step, retry_number).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::llm_retry_started(started)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+
+        let second = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &second,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&second).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        reservation
+            .append_attempt_closure_settled(&second, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&second).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_closure_can_consume_the_same_claim_that_protects_its_row() {
+        let (path, file) = test_file("attempt-claim-lifecycle");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-claim-lifecycle", writer).await;
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        let mut claims = reservation.claim_batch([closure]).unwrap();
+        let mut assistant = claims.remove(0);
+        reservation
+            .settle_attempt_closure_exact_settled(
+                &mut assistant,
+                &token,
+                AttemptDisposition::Committed,
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(
+            reservation.release(&mut assistant),
+            Err(AppendError::InvalidClaim)
+        );
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_claim_aware_closure_remains_owned_by_the_same_claim() {
+        let (path, file) = test_file("attempt-claim-drop");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) = attempt_ready_session("attempt-claim-drop", writer).await;
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer_at(&path, FlightKind::Append, offset);
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let mut assistant = reservation.claim_batch([closure]).unwrap().remove(0);
+        {
+            let mut waiting = Box::pin(reservation.settle_attempt_closure_exact_settled(
+                &mut assistant,
+                &token,
+                AttemptDisposition::Committed,
+            ));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("claim closure unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            reservation.flush_barrier().await,
+            Err(BarrierError::Append(AppendError::NeedsAppendSettle))
+        );
+        assert!(reservation.retire_attempt(&token).is_err());
+
+        reservation
+            .settle_attempt_closure_exact_settled(
+                &mut assistant,
+                &token,
+                AttemptDisposition::Committed,
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(
+            reservation.release(&mut assistant),
+            Err(AppendError::InvalidClaim)
+        );
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.barrier.load(Ordering::SeqCst), 2);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_token_cannot_cross_its_reservation_owner() {
+        let (path, file) = test_file("attempt-reservation-owner");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-reservation-owner", writer).await;
+        let token = {
+            let mut first = session.reservation();
+            first.begin_attempt(turn, step).unwrap()
+        };
+        let mut second = session.reservation();
+        let error = second
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppendError::Validation(_)));
+        assert_eq!(second.session().next_seq().unwrap().get(), 3);
+        drop(second);
+        assert!(session.shutdown().await.is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_attempt_closure_wait_still_closes_the_same_token_once() {
+        let (path, file) = test_file("attempt-closure-drop");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) = attempt_ready_session("attempt-closure-drop", writer).await;
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let gated = gated_writer_at(&path, FlightKind::Append, offset);
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated;
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        {
+            let mut waiting = Box::pin(reservation.append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                closure.clone(),
+            ));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("closure unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+        let mismatch = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "different pending closure".to_owned(),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch, AppendError::NeedsAppendSettle);
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(counts.append.load(Ordering::SeqCst), 2);
+        assert_eq!(counts.barrier.load(Ordering::SeqCst), 1);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        assert_eq!(counts.finish.load(Ordering::SeqCst), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pending_attempt_chunk_cannot_be_settled_by_a_different_payload() {
+        let (path, file) = test_file("attempt-chunk-payload");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-chunk-payload", writer).await;
+
+        let old_storage = match &mut session.mode {
+            SessionMode::Durable { storage, .. } => {
+                std::mem::replace(storage, SessionStorage::Closed)
+            }
+            SessionMode::Memory { .. } => panic!("test requires durable mode"),
+        };
+        let SessionStorage::Active(mut old_writer) = old_storage else {
+            panic!("attempt setup did not retain an active writer");
+        };
+        old_writer.finish().await.unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let GatedWriter {
+            writer,
+            arrived,
+            release,
+            counts,
+        } = gated_writer_at(&path, FlightKind::Append, offset);
+        let SessionMode::Durable { storage, .. } = &mut session.mode else {
+            panic!("test requires durable mode");
+        };
+        *storage = SessionStorage::Active(writer);
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "force the next attempt row to settle storage".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            }))
+            .await
+            .unwrap();
+        let original = StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap();
+        {
+            let mut waiting =
+                Box::pin(reservation.append_attempt_chunk_settled(&token, original.clone()));
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("chunk unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        release.send(()).unwrap();
+
+        let different = StreamChunk::finish(FinishReason::max_tokens().unwrap(), None).unwrap();
+        assert_eq!(
+            reservation
+                .append_attempt_chunk_settled(&token, different)
+                .await,
+            Err(AppendError::NeedsAppendSettle)
+        );
+        reservation
+            .append_attempt_chunk_settled(&token, original)
+            .await
+            .unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(counts.append.load(Ordering::SeqCst), 3);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_attempt_disposition_cannot_close_with_an_unrelated_event() {
+        let (path, file) = test_file("attempt-closure-kind");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) = attempt_ready_session("attempt-closure-kind", writer).await;
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let closure = finish_only_assistant(turn, step, prepared);
+        let before = reservation.session().next_seq();
+        let error = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::log(EventKind::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "still open".to_owned(),
+                        status: TodoStatus::Pending,
+                    }],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppendError::Validation(_)));
+        assert_eq!(reservation.session().next_seq(), before);
+        reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2087,6 +3169,10 @@ mod tests {
     }
 
     fn gated_writer(path: &PathBuf, target: FlightKind) -> GatedWriter {
+        gated_writer_at(path, target, 0)
+    }
+
+    fn gated_writer_at(path: &PathBuf, target: FlightKind, offset: u64) -> GatedWriter {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2099,8 +3185,8 @@ mod tests {
         let worker_counts = Arc::clone(&counts);
         let join = thread::spawn(move || {
             let mut cursor = JournalCursor {
-                physical_offset: 0,
-                durable_offset: 0,
+                physical_offset: offset,
+                durable_offset: offset,
             };
             let mut gated = false;
             while let Some(command) = receiver.blocking_recv() {
@@ -2161,8 +3247,8 @@ mod tests {
                 sender,
                 join,
                 JournalCursor {
-                    physical_offset: 0,
-                    durable_offset: 0,
+                    physical_offset: offset,
+                    durable_offset: offset,
                 },
             ),
             arrived: arrived_rx,
@@ -2213,6 +3299,50 @@ mod tests {
         }
     }
 
+    async fn attempt_ready_session(id: &str, writer: JournalWriter) -> (Session, TurnId, StepId) {
+        let mut session = Session::new_active_for_test(id, SystemClock, writer).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::turn_start(turn)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::step_start(turn, step)))
+            .await
+            .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
+        (session, turn, step)
+    }
+
+    fn finish_only_assistant(turn: TurnId, step: StepId, prepared: PreparedAttempt) -> NewEvent {
+        let (content, usage, finish, replay_state, sources) = prepared.into_parts();
+        assert_eq!(finish, FinishReason::stop().unwrap());
+        assert!(replay_state.is_none());
+        let message = Message::assistant("assistant", content, "mock", "mock-model").unwrap();
+        NewEvent::surface(
+            EventKind::AssistantMessage {
+                turn,
+                step,
+                message,
+                usage,
+            },
+            SurfaceIntent::append().with_sources(sources),
+        )
+    }
+
     async fn prunable_session(
         id: &str,
         clock: impl Clock + 'static,
@@ -2240,25 +3370,76 @@ mod tests {
             .append_settled(NewEvent::log(EventKind::step_start(turn, step)))
             .await
             .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .await
+            .unwrap();
+        session.flush_barrier().await.unwrap();
         let calls = text_lengths
             .iter()
             .enumerate()
             .map(|(index, _)| {
                 ContentBlock::tool_call(format!("call-{}", index + 1), "read", "{}").unwrap()
             })
-            .collect();
-        let assistant = Message::assistant("assistant-1", calls, "mock", "mock-model").unwrap();
-        session
-            .append_settled(NewEvent::surface(
-                EventKind::assistant_message(turn, step, assistant),
-                SurfaceIntent::append(),
-            ))
+            .collect::<Vec<_>>();
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for (index, call) in calls.iter().cloned().enumerate() {
+            let index = u64::try_from(index).unwrap();
+            reservation
+                .append_attempt_chunk_settled(
+                    &token,
+                    StreamChunk::block_start(index, ContentBlockType::ToolCall).unwrap(),
+                )
+                .await
+                .unwrap();
+            reservation
+                .append_attempt_chunk_settled(&token, StreamChunk::block_end(index, call).unwrap())
+                .await
+                .unwrap();
+        }
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+            )
             .await
             .unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let (content, usage, finish, replay_state, sources) = prepared.into_parts();
+        assert_eq!(finish, FinishReason::tool_calls().unwrap());
+        assert!(replay_state.is_none());
+        let assistant = Message::assistant("assistant-1", content, "mock", "mock-model").unwrap();
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::surface(
+                    EventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message: assistant,
+                        usage,
+                    },
+                    SurfaceIntent::append().with_sources(sources),
+                ),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
         let mut results = Vec::with_capacity(text_lengths.len());
         for (index, text_length) in text_lengths.iter().copied().enumerate() {
             let call_id = format!("call-{}", index + 1);
-            let call = session
+            let call = reservation
                 .append_settled(NewEvent::log(EventKind::tool_call(
                     turn,
                     step,
@@ -2275,7 +3456,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let result = session
+            let result = reservation
                 .append_settled(NewEvent::surface(
                     EventKind::tool_result(turn, step, result),
                     SurfaceIntent::append().with_sources(vec![call.seq()]),
@@ -2284,6 +3465,7 @@ mod tests {
                 .unwrap();
             results.push(result.seq());
         }
+        drop(reservation);
         (session, results)
     }
 

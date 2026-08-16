@@ -35,6 +35,25 @@ pub(super) fn estimate_message(message: &Message) -> Result<u64, ContextBudgetEr
         })
 }
 
+/// Price the provider-visible assistant content reconstructed from one exact
+/// chunk span. An empty stream contributes no surface message or role
+/// overhead, matching the fixed upstream TokenMeter.
+pub(super) fn estimate_provider_assistant<'a>(
+    blocks: impl IntoIterator<Item = &'a ContentBlock>,
+) -> Result<u64, ContextBudgetError> {
+    let mut tokens = 0_u64;
+    let mut has_content = false;
+    for block in blocks {
+        has_content = true;
+        tokens = checked_add(tokens, estimate_content_block(block)?)?;
+    }
+    if has_content {
+        checked_add(tokens, ROLE_OVERHEAD)
+    } else {
+        Ok(0)
+    }
+}
+
 pub(super) fn estimate_request_header(
     system: Option<&str>,
     tools: &[ToolSchema],

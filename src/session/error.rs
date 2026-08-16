@@ -175,6 +175,8 @@ pub enum TransitionError {
     DurableRecoveryEventNotAllowed { event_type: &'static str },
     #[error("{event_type} can be appended only by the owned tool-result pruner")]
     DurablePruneEventNotAllowed { event_type: &'static str },
+    #[error("{event_type} can be appended only by the owned provider-attempt lifecycle")]
+    DurableAttemptEventNotAllowed { event_type: &'static str },
     #[error("durable result for call {call_id} does not match approval decision {approval_id}")]
     DurableApprovalResultMismatch {
         approval_id: super::ApprovalRequestId,
@@ -270,6 +272,8 @@ pub enum SurfaceError {
 /// Semantic validation shared by live append and replay.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum EventValidationError {
+    #[error(transparent)]
+    Attempt(#[from] super::attempt_anchor::AttemptError),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]

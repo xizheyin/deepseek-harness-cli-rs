@@ -29,15 +29,15 @@ use crate::{
     },
     provider::{
         ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
-        ProviderRequest, ProviderRequestDraft, ProviderRequestError, RetryMode, StreamValidator,
+        ProviderRequest, ProviderRequestDraft, ProviderRequestError, RetryMode,
     },
     session::{
         AppendError, AppendReceipt, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome,
-        ApprovalRequestId, BarrierError, ClaimedAppend, EpochHeader, EventClaim, EventKind,
-        EventSeq, LlmRetryEvent, LlmRetryStartedEvent, NewEvent, RequestContext,
-        RequestHeaderReason, RetryId, RetryNumber, Session, SessionReadError, SessionReservation,
-        StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause,
-        TurnEndCancelCause, TurnEndReason, TurnId,
+        ApprovalRequestId, AttemptDisposition, AttemptToken, BarrierError, ClaimedAppend,
+        EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent, LlmRetryStartedEvent,
+        NewEvent, PreparedAttempt, RequestContext, RequestHeaderReason, RetryId, RetryNumber,
+        Session, SessionReadError, SessionReservation, StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN,
+        ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause, TurnEndReason, TurnId,
     },
 };
 
@@ -58,7 +58,7 @@ pub use tool::{
     ToolExecutorError, ToolPreparation, ToolPreparationFuture,
 };
 
-use assembler::{AssembledAssistant, AssistantAssembler, without_tool_calls};
+use assembler::{AssembledAssistant, without_tool_calls};
 use retry::{RetryDecision, decide, policy_key};
 
 pub const MAX_AGENT_STEPS_PER_TURN: usize = 64;
@@ -947,7 +947,7 @@ impl StepResolution {
 }
 
 enum StreamOutcome {
-    Finished(AssembledAssistant, Vec<EventSeq>),
+    Finished(PreparedAttempt),
     Cancelled,
     Error(LlmFailure),
 }
@@ -1210,14 +1210,18 @@ async fn run_entered_turn(
         messages.clear();
         driver.counters.steps += 1;
 
-        let resolution = match AssertUnwindSafe(run_step(
+        let mut attempt_token = None;
+        let mut resolution = match AssertUnwindSafe(run_step(
             reservation,
             driver,
-            turn,
-            step,
-            cancellation,
-            budget_failure,
+            StepExecution {
+                turn,
+                step,
+                cancellation,
+                budget_failure,
+            },
             first_preparation,
+            &mut attempt_token,
         ))
         .catch_unwind()
         .await
@@ -1229,7 +1233,44 @@ async fn run_entered_turn(
                 "the agent stopped after an internal failure",
             )?)),
         };
-        reservation.settle_exact_settled(&mut step_end).await?;
+        let disposition = if attempt_token.is_some() {
+            if matches!(&resolution.outcome, StepOutcome::Cancelled) {
+                Some(AttemptDisposition::Cancelled)
+            } else if matches!(&resolution.outcome, StepOutcome::Error(_)) {
+                Some(AttemptDisposition::Failed)
+            } else {
+                // A successful model response must already have committed its
+                // assistant closure and retired the attempt. Surface a stable
+                // internal error, but still close the reserved step/end
+                // instead of leaving a half-open durable turn.
+                resolution = StepResolution::new(StepOutcome::Error(failure_reason(
+                    "AGENT_INTERNAL",
+                    "the agent did not finish its provider attempt",
+                )?));
+                Some(AttemptDisposition::Failed)
+            }
+        } else {
+            None
+        };
+        reservation
+            .settle_step_end_with_attempt_settled(
+                &mut step_end,
+                attempt_token.as_ref(),
+                disposition,
+            )
+            .await?;
+        if let Some(token) = attempt_token.as_ref() {
+            match dispatch_barrier(reservation).await? {
+                DispatchBarrier::Ready => {}
+                DispatchBarrier::ObserverUnavailable => {
+                    driver.observer_unavailable = true;
+                    resolution =
+                        StepResolution::new(StepOutcome::Error(observer_unavailable_failure()?));
+                }
+            }
+            reservation.retire_attempt(token)?;
+            attempt_token.take();
+        }
         if driver.durable_limit.is_some() {
             return Ok(TurnEndReason::Error {
                 error: driver.session_limit_failure.clone(),
@@ -1379,6 +1420,12 @@ fn prepare_conversation_request(
     driver: &Driver<'_>,
     pending_messages: &[Message],
 ) -> Result<AttemptPreparation, AgentLoopError> {
+    if session.context_total_tokens().is_err() {
+        return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+            "AGENT_INTERNAL",
+            "the agent stopped after an internal failure",
+        )?));
+    }
     let source_surface_generation = session.surface_generation();
     let pending_generation = u64::try_from(pending_messages.len())
         .map_err(|_| AgentLoopError::Invariant("pending message count exceeded u64"))?;
@@ -1489,15 +1536,26 @@ fn context_limit_failure() -> Result<LlmFailure, AgentLoopError> {
     )
 }
 
+struct StepExecution<'a> {
+    turn: TurnId,
+    step: StepId,
+    cancellation: &'a CancellationToken,
+    budget_failure: &'a LlmFailure,
+}
+
 async fn run_step(
     reservation: &mut SessionReservation<'_>,
     driver: &mut Driver<'_>,
-    turn: TurnId,
-    step: StepId,
-    cancellation: &CancellationToken,
-    budget_failure: &LlmFailure,
+    execution: StepExecution<'_>,
     mut first_preparation: Option<AttemptPreparation>,
+    attempt_token: &mut Option<AttemptToken>,
 ) -> Result<StepResolution, AgentLoopError> {
+    let StepExecution {
+        turn,
+        step,
+        cancellation,
+        budget_failure,
+    } = execution;
     let mut retry_chains: BTreeMap<(String, String), (RetryId, usize)> = BTreeMap::new();
     let mut retries_in_step = 0_usize;
     loop {
@@ -1677,6 +1735,12 @@ async fn run_step(
             )?)));
         }
 
+        if attempt_token.is_some() {
+            return Err(AgentLoopError::Invariant(
+                "a previous provider attempt was not retired before dispatch",
+            ));
+        }
+        *attempt_token = Some(reservation.begin_attempt(turn, step)?);
         let attempt_cancellation = cancellation.child_token();
         let stream = match catch_unwind(AssertUnwindSafe(|| {
             driver
@@ -1697,23 +1761,34 @@ async fn run_step(
             driver,
             turn,
             step,
+            attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+                "provider attempt owner disappeared before streaming",
+            ))?,
             stream,
             cancellation,
             budget_failure,
         )
         .await;
-        if !matches!(streamed, Ok(StreamOutcome::Finished(_, _))) {
+        if !matches!(streamed, Ok(StreamOutcome::Finished(_))) {
             attempt_cancellation.cancel();
         }
         let streamed = streamed?;
-        let (assembled, source_seqs) = match streamed {
+        let prepared_attempt = match streamed {
             StreamOutcome::Cancelled => {
                 return Ok(StepResolution::new(StepOutcome::Cancelled));
             }
             StreamOutcome::Error(error) => {
                 return Ok(StepResolution::new(StepOutcome::Error(error)));
             }
-            StreamOutcome::Finished(assembled, sources) => (assembled, sources),
+            StreamOutcome::Finished(prepared) => prepared,
+        };
+
+        let (content, usage, finish, replay_state, source_seqs) = prepared_attempt.into_parts();
+        let assembled = AssembledAssistant {
+            content,
+            usage,
+            finish,
+            replay_state,
         };
 
         // Cancellation can race with the provider's final item. Re-check it
@@ -1812,8 +1887,15 @@ async fn run_step(
                     failure,
                 )?,
             };
+            let token = attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+                "failed provider attempt lost its Session owner",
+            ))?;
             match reservation
-                .append_settled(NewEvent::log(EventKind::llm_retry(retry_event)))
+                .append_attempt_closure_settled(
+                    token,
+                    AttemptDisposition::Retry,
+                    NewEvent::log(EventKind::llm_retry(retry_event)),
+                )
                 .await
             {
                 Ok(_) => {}
@@ -1823,6 +1905,15 @@ async fn run_step(
                     )));
                 }
                 Err(error) => return Err(error.into()),
+            }
+            let barrier = dispatch_barrier(reservation).await?;
+            reservation.retire_attempt(token)?;
+            attempt_token.take();
+            if barrier == DispatchBarrier::ObserverUnavailable {
+                driver.observer_unavailable = true;
+                return Ok(StepResolution::new(StepOutcome::Error(
+                    observer_unavailable_failure()?,
+                )));
             }
             retry_chains.insert(chain_key, (retry_id.clone(), prior + 1));
             retries_in_step += 1;
@@ -1876,6 +1967,7 @@ async fn run_step(
             effective_config,
             assembled,
             source_seqs,
+            attempt_token,
             cancellation,
             budget_failure,
         )
@@ -1887,15 +1979,13 @@ async fn run_step(
 async fn consume_stream(
     reservation: &mut SessionReservation<'_>,
     driver: &mut Driver<'_>,
-    turn: TurnId,
-    step: StepId,
+    _turn: TurnId,
+    _step: StepId,
+    attempt: &AttemptToken,
     mut stream: crate::provider::ProviderStream,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<StreamOutcome, AgentLoopError> {
-    let mut validator = StreamValidator::default();
-    let mut assembler = AssistantAssembler::default();
-    let mut sources = Vec::new();
     let mut ready_chunks = 0_usize;
     loop {
         let next = AssertUnwindSafe(stream.next()).catch_unwind();
@@ -1917,17 +2007,17 @@ async fn consume_stream(
             },
         };
         let Some(item) = item else {
-            if let Err(error) = validator.complete() {
-                return Ok(StreamOutcome::Error(failure_from_display(
+            return match reservation.seal_attempt(attempt) {
+                Ok(prepared) => Ok(StreamOutcome::Finished(prepared)),
+                Err(AppendError::Validation(_)) => Ok(StreamOutcome::Error(failure_reason(
                     "AGENT_PROVIDER_PROTOCOL",
                     "the provider stream ended incorrectly",
-                    &error,
-                )?));
-            }
-            let assembled = assembler.finish().ok_or(AgentLoopError::Invariant(
-                "validated stream had no terminal finish",
-            ))?;
-            return Ok(StreamOutcome::Finished(assembled, sources));
+                )?)),
+                Err(error) if is_budget_error(&error) => Ok(StreamOutcome::Error(
+                    driver.failure_for_budget(&error, budget_failure),
+                )),
+                Err(error) => Err(error.into()),
+            };
         };
         let chunk = match item {
             Ok(chunk) => chunk,
@@ -1939,34 +2029,33 @@ async fn consume_stream(
                 )?));
             }
         };
-        if let Err(error) = validator.accept(&chunk) {
-            return Ok(StreamOutcome::Error(failure_from_display(
-                "AGENT_PROVIDER_PROTOCOL",
-                "the provider emitted an invalid stream",
-                &error,
-            )?));
-        }
-        let seq = match reservation
-            .append_settled(NewEvent::log(EventKind::assistant_chunk(
-                turn,
-                step,
-                chunk.clone(),
-            )))
+        let reported_output_tokens = match chunk.kind() {
+            StreamChunkKind::Usage { usage } => Some(usage.output_tokens().get()),
+            _ => None,
+        };
+        match reservation
+            .append_attempt_chunk_settled(attempt, chunk)
             .await
         {
-            Ok(event) => event.seq(),
+            Ok(_) => {}
             Err(error) if is_budget_error(&error) => {
                 return Ok(StreamOutcome::Error(
                     driver.failure_for_budget(&error, budget_failure),
                 ));
             }
+            Err(AppendError::Validation(_)) => {
+                return Ok(StreamOutcome::Error(failure_reason(
+                    "AGENT_PROVIDER_PROTOCOL",
+                    "the provider emitted an invalid stream",
+                )?));
+            }
             Err(error) => return Err(error.into()),
-        };
-        if let StreamChunkKind::Usage { usage } = chunk.kind() {
+        }
+        if let Some(output_tokens) = reported_output_tokens {
             driver.counters.reported_output_tokens = driver
                 .counters
                 .reported_output_tokens
-                .checked_add(usage.output_tokens().get())
+                .checked_add(output_tokens)
                 .unwrap_or(u64::MAX);
             if driver.counters.reported_output_tokens
                 > driver.config.limits.max_reported_output_tokens_per_turn
@@ -1977,8 +2066,6 @@ async fn consume_stream(
                 )?));
             }
         }
-        sources.push(seq);
-        assembler.push(&chunk);
         ready_chunks += 1;
         if ready_chunks == AGENT_READY_WORK_BUDGET {
             ready_chunks = 0;
@@ -2005,6 +2092,7 @@ async fn commit_successful_attempt(
     config: LlmCallConfig,
     mut assembled: AssembledAssistant,
     source_seqs: Vec<EventSeq>,
+    attempt_token: &mut Option<AttemptToken>,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<StepResolution, AgentLoopError> {
@@ -2073,7 +2161,13 @@ async fn commit_successful_attempt(
         SurfaceIntent::append().with_sources(source_seqs),
     );
     if tool_calls.is_empty() {
-        match reservation.append_settled(assistant).await {
+        let token = attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+            "successful provider attempt lost its Session owner",
+        ))?;
+        match reservation
+            .append_attempt_closure_settled(token, AttemptDisposition::Committed, assistant)
+            .await
+        {
             Ok(receipt) => driver.observe_assistant_commit(&receipt),
             Err(error) if is_budget_error(&error) => {
                 return Ok(StepResolution::new(StepOutcome::Error(
@@ -2081,6 +2175,15 @@ async fn commit_successful_attempt(
                 )));
             }
             Err(error) => return Err(error.into()),
+        }
+        let barrier = dispatch_barrier(reservation).await?;
+        reservation.retire_attempt(token)?;
+        attempt_token.take();
+        if barrier == DispatchBarrier::ObserverUnavailable {
+            driver.observer_unavailable = true;
+            return Ok(StepResolution::new(StepOutcome::Error(
+                observer_unavailable_failure()?,
+            )));
         }
         return Ok(StepResolution::new(if max_tokens {
             StepOutcome::MaxTokens
@@ -2097,6 +2200,7 @@ async fn commit_successful_attempt(
         assistant,
         tool_calls,
         claim_profiles,
+        attempt_token,
         cancellation,
         budget_failure,
     )
@@ -2151,6 +2255,7 @@ async fn commit_tool_round(
     assistant: NewEvent,
     calls: Vec<ToolCall>,
     claim_profiles: Vec<ToolClaimProfile>,
+    attempt_token: &mut Option<AttemptToken>,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<StepResolution, AgentLoopError> {
@@ -2250,10 +2355,23 @@ async fn commit_tool_round(
             };
         }
     }
+    let token = attempt_token.as_ref().ok_or(AgentLoopError::Invariant(
+        "successful provider attempt lost its Session owner",
+    ))?;
     let assistant_receipt = reservation
-        .settle_exact_settled(&mut assistant_claim)
+        .settle_attempt_closure_exact_settled(
+            &mut assistant_claim,
+            token,
+            AttemptDisposition::Committed,
+        )
         .await?;
     driver.observe_assistant_commit(&assistant_receipt);
+    let barrier = dispatch_barrier(reservation).await?;
+    reservation.retire_attempt(token)?;
+    attempt_token.take();
+    if barrier == DispatchBarrier::ObserverUnavailable {
+        driver.observer_unavailable = true;
+    }
     driver.counters.tool_calls += planned.len();
 
     let mut cancelled = false;

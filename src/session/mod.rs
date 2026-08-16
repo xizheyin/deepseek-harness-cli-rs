@@ -1,5 +1,6 @@
 //! Append-only session log and deterministic projections.
 
+mod attempt_anchor;
 mod clock;
 mod codec;
 mod compaction;
@@ -24,6 +25,8 @@ mod tool_result_pruner;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+pub use attempt_anchor::AttemptError;
+pub(crate) use attempt_anchor::{AttemptDisposition, PreparedAttempt};
 pub use clock::{Clock, SystemClock};
 pub use codec::{MAX_SESSION_EVENTS, MAX_SESSION_RETAINED_JSON_BYTES, MAX_SESSION_SNAPSHOT_BYTES};
 pub use compaction::{
@@ -64,7 +67,7 @@ pub(crate) use tool_result_pruner::{
     ValidatedRawRow,
 };
 
-use crate::model::{JsonValue, Message, NonNegativeSafeInteger};
+use crate::model::{JsonValue, Message, NonNegativeSafeInteger, StreamChunk};
 
 use self::{
     codec::decode_snapshot,
@@ -74,7 +77,7 @@ use self::{
         DurableTimestamp, EventLineTemplate, MAX_JOURNAL_EVENT_LINE_BYTES,
         prepared_event_line_upper_bound,
     },
-    projection::{Projection, ValidationPolicy},
+    projection::{PreparedDurableProjection, Projection, ValidationPolicy},
     store::{DeferredJournal, SessionStorage},
     tool_result_pruner::masked_data_sha256,
 };
@@ -136,7 +139,32 @@ enum DurableOperationOwner {
         token: u64,
         kind: ClaimOperationKind,
     },
+    Attempt {
+        authority: Arc<()>,
+        reservation: Arc<()>,
+        nonce: u64,
+        kind: AttemptOperationKind,
+        claim: Option<AttemptClaimOwner>,
+    },
+    OverflowPruneMarker {
+        authority: Arc<()>,
+        reservation: Arc<()>,
+        nonce: u64,
+        target: EventSeq,
+    },
     OwnedPrune(OwnedPrunePhase),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptOperationKind {
+    Chunk,
+    Closure(AttemptDisposition),
+}
+
+#[derive(Clone, Debug)]
+struct AttemptClaimOwner {
+    reservation: Arc<()>,
+    token: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +211,18 @@ enum DurableAppendAttempt {
     Committed(AppendReceipt),
     NeedsStorageSettle(PendingDurableOperation),
     Failed(AppendError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryProjectionAdmission {
+    Ordinary,
+    AttemptChunk,
+    AttemptClosure(AttemptDisposition),
+}
+
+enum EitherProjection {
+    Ordinary(Projection),
+    Attempt(PreparedDurableProjection),
 }
 
 /// A durability checkpoint failed before an external effect could start.
@@ -388,6 +428,38 @@ pub struct EventClaim {
     settled: bool,
 }
 
+/// Opaque process-local authority for exactly one provider stream attempt.
+///
+/// It is intentionally not cloneable: Session remains the source of truth and
+/// the Agent must eventually retire this exact owner after a storage barrier.
+#[derive(Debug)]
+pub(crate) struct AttemptToken {
+    authority: Arc<()>,
+    reservation: Arc<()>,
+    nonce: u64,
+    turn: TurnId,
+    step: StepId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveAttemptPhase {
+    Open,
+    Closed {
+        closure_seq: EventSeq,
+        closed_at_barrier_epoch: u64,
+        disposition: AttemptDisposition,
+    },
+}
+
+#[derive(Debug)]
+struct ActiveAttemptOwner {
+    reservation: Arc<()>,
+    nonce: u64,
+    turn: TurnId,
+    step: StepId,
+    phase: ActiveAttemptPhase,
+}
+
 /// Exclusive append view that prevents ordinary events from consuming claims.
 pub struct SessionReservation<'a> {
     session: &'a mut Session,
@@ -442,6 +514,10 @@ pub struct Session {
     ui_observer_attached: bool,
     observer_attach_at: Option<EventSeq>,
     ui_observer_faulted: bool,
+    attempt_authority: Arc<()>,
+    next_attempt_nonce: u64,
+    active_attempt: Option<ActiveAttemptOwner>,
+    barrier_epoch: u64,
     mode: SessionMode,
 }
 
@@ -472,6 +548,10 @@ impl Session {
             ui_observer_attached: false,
             observer_attach_at: EventSeq::new(0).ok(),
             ui_observer_faulted: false,
+            attempt_authority: Arc::new(()),
+            next_attempt_nonce: 1,
+            active_attempt: None,
+            barrier_epoch: 0,
             mode: SessionMode::Memory {
                 events: Vec::new(),
                 retained_json_bytes,
@@ -497,6 +577,10 @@ impl Session {
             ui_observer_attached: false,
             observer_attach_at: EventSeq::new(0).ok(),
             ui_observer_faulted: false,
+            attempt_authority: Arc::new(()),
+            next_attempt_nonce: 1,
+            active_attempt: None,
+            barrier_epoch: 0,
             mode: SessionMode::Durable {
                 storage: SessionStorage::Deferred(journal),
                 logical_event_count: 0,
@@ -530,6 +614,10 @@ impl Session {
             ui_observer_attached: false,
             observer_attach_at: EventSeq::new(0).ok(),
             ui_observer_faulted: false,
+            attempt_authority: Arc::new(()),
+            next_attempt_nonce: 1,
+            active_attempt: None,
+            barrier_epoch: 0,
             mode: SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 logical_event_count: 0,
@@ -562,6 +650,10 @@ impl Session {
             ui_observer_attached: false,
             observer_attach_at: None,
             ui_observer_faulted: false,
+            attempt_authority: Arc::new(()),
+            next_attempt_nonce: 1,
+            active_attempt: None,
+            barrier_epoch: 0,
             mode: SessionMode::Memory {
                 events: seed.to_vec(),
                 retained_json_bytes,
@@ -591,6 +683,10 @@ impl Session {
             ui_observer_attached: false,
             observer_attach_at: Some(seed.next_seq),
             ui_observer_faulted: false,
+            attempt_authority: Arc::new(()),
+            next_attempt_nonce: 1,
+            active_attempt: None,
+            barrier_epoch: 0,
             mode: SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 logical_event_count: seed.logical_event_count,
@@ -679,7 +775,8 @@ impl Session {
             &self.mode,
             SessionMode::Durable {
                 pending_operation: Some(PendingDurableOperation {
-                    owner: DurableOperationOwner::Claim { .. },
+                    owner: DurableOperationOwner::Claim { .. }
+                        | DurableOperationOwner::Attempt { claim: Some(_), .. },
                     ..
                 }),
                 ..
@@ -710,8 +807,154 @@ impl Session {
             Some(
                 DurableOperationOwner::Ordinary
                 | DurableOperationOwner::Claim { .. }
+                | DurableOperationOwner::Attempt { .. }
+                | DurableOperationOwner::OverflowPruneMarker { .. }
                 | DurableOperationOwner::OwnedPrune(_),
             ) => Err(AppendError::NeedsAppendSettle),
+        }
+    }
+
+    fn pending_attempt_operation(
+        &self,
+        token: &AttemptToken,
+        expected: &PreparedEvent,
+    ) -> Result<Option<AttemptOperationKind>, AppendError> {
+        let SessionMode::Durable {
+            pending_operation, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        match pending_operation.as_ref() {
+            None => Ok(None),
+            Some(PendingDurableOperation {
+                prepared,
+                owner:
+                    DurableOperationOwner::Attempt {
+                        authority,
+                        reservation,
+                        nonce,
+                        kind,
+                        claim: None,
+                    },
+                ..
+            }) if Arc::ptr_eq(authority, &token.authority)
+                && Arc::ptr_eq(reservation, &token.reservation)
+                && *nonce == token.nonce
+                && prepared == expected =>
+            {
+                Ok(Some(*kind))
+            }
+            Some(_) => Err(AppendError::NeedsAppendSettle),
+        }
+    }
+
+    fn pending_attempt_claim_operation(
+        &self,
+        token: &AttemptToken,
+        reservation: &Arc<()>,
+        claim_token: u64,
+    ) -> Result<Option<AttemptOperationKind>, AppendError> {
+        let SessionMode::Durable {
+            pending_operation, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        match pending_operation.as_ref().map(|operation| &operation.owner) {
+            None => Ok(None),
+            Some(DurableOperationOwner::Attempt {
+                authority,
+                reservation: attempt_reservation,
+                nonce,
+                kind,
+                claim:
+                    Some(AttemptClaimOwner {
+                        reservation: pending_reservation,
+                        token: pending_claim,
+                    }),
+            }) if Arc::ptr_eq(authority, &token.authority)
+                && Arc::ptr_eq(attempt_reservation, &token.reservation)
+                && *nonce == token.nonce
+                && Arc::ptr_eq(pending_reservation, reservation)
+                && *pending_claim == claim_token =>
+            {
+                Ok(Some(*kind))
+            }
+            Some(_) => Err(AppendError::NeedsAppendSettle),
+        }
+    }
+
+    fn validate_open_attempt_token(
+        &self,
+        token: &AttemptToken,
+        reservation: &Arc<()>,
+    ) -> Result<(), AppendError> {
+        if !Arc::ptr_eq(&self.attempt_authority, &token.authority) {
+            return Err(invalid_attempt("attempt token belongs to another Session"));
+        }
+        if !Arc::ptr_eq(reservation, &token.reservation) {
+            return Err(invalid_attempt(
+                "attempt token belongs to another reservation",
+            ));
+        }
+        match &self.active_attempt {
+            Some(active)
+                if active.nonce == token.nonce
+                    && Arc::ptr_eq(&active.reservation, reservation)
+                    && active.turn == token.turn
+                    && active.step == token.step
+                    && active.phase == ActiveAttemptPhase::Open =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid_attempt(
+                "attempt token is stale, closed, or belongs to another step",
+            )),
+        }
+    }
+
+    fn mark_attempt_closed(
+        &mut self,
+        token: &AttemptToken,
+        reservation: &Arc<()>,
+        receipt: &AppendReceipt,
+        disposition: AttemptDisposition,
+    ) -> Result<(), AppendError> {
+        self.validate_open_attempt_token(token, reservation)?;
+        let Some(active) = &mut self.active_attempt else {
+            return Err(invalid_attempt("attempt owner disappeared before closure"));
+        };
+        active.phase = ActiveAttemptPhase::Closed {
+            closure_seq: receipt.seq(),
+            closed_at_barrier_epoch: self.barrier_epoch,
+            disposition,
+        };
+        Ok(())
+    }
+
+    fn validate_attempt_operation_owner(
+        &self,
+        authority: &Arc<()>,
+        reservation: &Arc<()>,
+        nonce: u64,
+    ) -> Result<(), AppendError> {
+        if !Arc::ptr_eq(&self.attempt_authority, authority) {
+            return Err(invalid_attempt(
+                "attempt operation belongs to another Session",
+            ));
+        }
+        match &self.active_attempt {
+            Some(active)
+                if active.nonce == nonce
+                    && Arc::ptr_eq(&active.reservation, reservation)
+                    && active.phase == ActiveAttemptPhase::Open =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid_attempt(
+                "attempt operation is stale or its closure already committed",
+            )),
         }
     }
 
@@ -856,6 +1099,29 @@ impl Session {
             protected_row_bytes,
             owner,
         } = operation;
+        let attempt_owner = match &owner {
+            DurableOperationOwner::Attempt {
+                authority,
+                reservation,
+                nonce,
+                ..
+            }
+            | DurableOperationOwner::OverflowPruneMarker {
+                authority,
+                reservation,
+                nonce,
+                ..
+            } => Some((authority, reservation, *nonce)),
+            DurableOperationOwner::Ordinary
+            | DurableOperationOwner::Claim { .. }
+            | DurableOperationOwner::OwnedPrune(_) => None,
+        };
+        if let Some((authority, reservation, nonce)) = attempt_owner {
+            if let Err(error) = self.validate_attempt_operation_owner(authority, reservation, nonce)
+            {
+                return DurableAppendAttempt::Failed(error);
+            }
+        }
         let Some(seq) = self.next_seq else {
             return DurableAppendAttempt::Failed(AppendError::SequenceExhausted);
         };
@@ -884,7 +1150,9 @@ impl Session {
                 };
                 let stageable = writer.ensure_stageable().is_ok();
                 let next_batch_state = match &owner {
-                    DurableOperationOwner::Ordinary | DurableOperationOwner::Claim { .. } => {
+                    DurableOperationOwner::Ordinary
+                    | DurableOperationOwner::Claim { .. }
+                    | DurableOperationOwner::Attempt { .. } => {
                         if !stageable
                             || pending_batch.event_count != 0
                             || pending_batch.state != PendingDurableBatchState::Empty
@@ -900,7 +1168,8 @@ impl Session {
                         }
                         PendingDurableBatchState::Ordinary
                     }
-                    DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Marker { target }) => {
+                    DurableOperationOwner::OverflowPruneMarker { target, .. }
+                    | DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Marker { target }) => {
                         if !stageable
                             || pending_batch.event_count != 0
                             || pending_batch.state != PendingDurableBatchState::Empty
@@ -967,6 +1236,19 @@ impl Session {
             DurableOperationOwner::OwnedPrune(_) => {
                 self.projection.prepare_owned_prune_event(&event)
             }
+            DurableOperationOwner::OverflowPruneMarker { .. } => {
+                self.projection.prepare_owned_overflow_prune_event(&event)
+            }
+            DurableOperationOwner::Attempt {
+                kind: AttemptOperationKind::Chunk,
+                ..
+            } => self.projection.prepare_durable_attempt_chunk(&event),
+            DurableOperationOwner::Attempt {
+                kind: AttemptOperationKind::Closure(disposition),
+                ..
+            } => self
+                .projection
+                .prepare_durable_attempt_closure(&event, *disposition),
             DurableOperationOwner::Ordinary | DurableOperationOwner::Claim { .. } => {
                 self.projection.prepare_durable_event(&event)
             }
@@ -1048,12 +1330,6 @@ impl Session {
             }
             return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
         };
-        let Some(projection) = prepared_projection.bind(row_locator) else {
-            if let SessionMode::Durable { storage, .. } = &mut self.mode {
-                *storage = SessionStorage::Failed(StoreError::Poisoned);
-            }
-            return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
-        };
         let Some(unused_timestamp_bytes) = row_template_len.checked_sub(row.len()) else {
             if let SessionMode::Durable { storage, .. } = &mut self.mode {
                 *storage = SessionStorage::Failed(StoreError::Poisoned);
@@ -1081,19 +1357,76 @@ impl Session {
             logical_event_count,
             accepted_journal_bytes,
             pending_batch,
-            storage: SessionStorage::Active(_),
+            storage,
             ..
         } = &mut self.mode
         else {
             return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
         };
+        if !matches!(storage, SessionStorage::Active(_)) {
+            return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+        }
+        if !prepared_projection.commit(&mut self.projection, row_locator) {
+            *storage = SessionStorage::Failed(StoreError::Poisoned);
+            return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+        }
+        if let DurableOperationOwner::Attempt {
+            authority,
+            reservation,
+            nonce,
+            kind: AttemptOperationKind::Closure(disposition),
+            ..
+        } = &owner
+        {
+            let Some(active) = &mut self.active_attempt else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            if !Arc::ptr_eq(&self.attempt_authority, authority)
+                || !Arc::ptr_eq(&active.reservation, reservation)
+                || active.nonce != *nonce
+                || active.phase != ActiveAttemptPhase::Open
+            {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            }
+            active.phase = ActiveAttemptPhase::Closed {
+                closure_seq: seq,
+                closed_at_barrier_epoch: self.barrier_epoch,
+                disposition: *disposition,
+            };
+        }
+        if let DurableOperationOwner::OverflowPruneMarker {
+            authority,
+            reservation,
+            nonce,
+            ..
+        } = &owner
+        {
+            let Some(active) = &mut self.active_attempt else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            if !Arc::ptr_eq(&self.attempt_authority, authority)
+                || !Arc::ptr_eq(&active.reservation, reservation)
+                || active.nonce != *nonce
+                || active.phase != ActiveAttemptPhase::Open
+            {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            }
+            active.phase = ActiveAttemptPhase::Closed {
+                closure_seq: seq,
+                closed_at_barrier_epoch: self.barrier_epoch,
+                disposition: AttemptDisposition::ContextOverflow,
+            };
+        }
         pending_batch.bytes.extend_from_slice(&row);
         pending_batch.event_count += 1;
         pending_batch.state = next_batch_state;
         *logical_event_count = next_logical_event_count;
         *accepted_journal_bytes = next_accepted_journal_bytes;
         self.next_seq = next_seq;
-        self.projection = projection;
         let observer_faulted = observer::publish_committed(&mut self.ui_observer, &event);
         self.ui_observer_faulted |= observer_faulted;
         DurableAppendAttempt::Committed(AppendReceipt {
@@ -1247,6 +1580,16 @@ impl Session {
                 SessionStorage::Closed => Err(StoreError::WriterStopped),
             },
         };
+        if result.is_ok() {
+            let Some(next_epoch) = self.barrier_epoch.checked_add(1) else {
+                if let SessionMode::Durable { storage, .. } = &mut self.mode {
+                    *storage = SessionStorage::Failed(StoreError::Poisoned);
+                }
+                self.take_barrier_error();
+                return Err(BarrierError::Storage(StoreError::Poisoned));
+            };
+            self.barrier_epoch = next_epoch;
+        }
         if let Err(error) = result {
             if let SessionMode::Durable { storage, .. } = &mut self.mode {
                 if matches!(storage, SessionStorage::Active(_)) {
@@ -1558,6 +1901,21 @@ impl Session {
         reserved_events: usize,
         reserved_retained_json_bytes: usize,
     ) -> Result<AppendReceipt, AppendError> {
+        self.append_prepared_with_admission(
+            prepared,
+            reserved_events,
+            reserved_retained_json_bytes,
+            MemoryProjectionAdmission::Ordinary,
+        )
+    }
+
+    fn append_prepared_with_admission(
+        &mut self,
+        prepared: PreparedEvent,
+        reserved_events: usize,
+        reserved_retained_json_bytes: usize,
+        admission: MemoryProjectionAdmission,
+    ) -> Result<AppendReceipt, AppendError> {
         let (committed_events, retained_json_bytes) = match &self.mode {
             SessionMode::Memory {
                 events,
@@ -1617,7 +1975,20 @@ impl Session {
             .kind()
             .live_event_type()
             .ok_or(EventValidationError::UnknownLiveEvent)?;
-        let next_projection = self.projection.with_event(&candidate)?;
+        let next_projection = match admission {
+            MemoryProjectionAdmission::Ordinary => Ok::<_, EventValidationError>(
+                EitherProjection::Ordinary(self.projection.with_event(&candidate)?),
+            ),
+            MemoryProjectionAdmission::AttemptChunk => Ok(EitherProjection::Attempt(
+                self.projection.prepare_durable_attempt_chunk(&candidate)?,
+            )),
+            MemoryProjectionAdmission::AttemptClosure(disposition) => {
+                Ok(EitherProjection::Attempt(
+                    self.projection
+                        .prepare_durable_attempt_closure(&candidate, disposition)?,
+                ))
+            }
+        }?;
         let committed_message = match candidate.kind() {
             EventKind::UserMessage { message }
             | EventKind::AssistantMessage { message, .. }
@@ -1654,7 +2025,16 @@ impl Session {
             .get()
             .checked_add(1)
             .and_then(|next| EventSeq::new(next).ok());
-        self.projection = next_projection;
+        match next_projection {
+            EitherProjection::Ordinary(projection) => self.projection = projection,
+            EitherProjection::Attempt(prepared) => {
+                if !prepared.commit_memory(&mut self.projection) {
+                    return Err(
+                        EventValidationError::Attempt(AttemptError::OwnershipChanged).into(),
+                    );
+                }
+            }
+        }
         let committed = match &self.mode {
             SessionMode::Memory { events, .. } => events.last().ok_or(AppendError::Capacity)?,
             SessionMode::Durable { .. } => return Err(AppendError::DurableAsyncRequired),
@@ -1875,6 +2255,10 @@ impl Session {
         self.projection.surface_generation()
     }
 
+    pub(crate) fn context_total_tokens(&self) -> Result<u64, SurfaceError> {
+        self.projection.context_total_tokens()
+    }
+
     /// Latest canonical model-request header, or `None` before one is logged.
     #[must_use]
     pub fn request_header(&self) -> Option<&EpochHeader> {
@@ -2077,6 +2461,352 @@ impl SessionReservation<'_> {
         self.session
             .append_prepared_settled(prepared, protected_events, self.reserved_row_bytes)
             .await
+    }
+
+    /// Install one Session-owned provider-attempt identity before the stream
+    /// is opened. This records no event; later chunk and closure rows must
+    /// present the returned non-cloneable token.
+    pub(crate) fn begin_attempt(
+        &mut self,
+        turn: TurnId,
+        step: StepId,
+    ) -> Result<AttemptToken, AppendError> {
+        if matches!(&self.session.mode, SessionMode::Durable { .. }) {
+            self.session.ensure_durable_active()?;
+            if self.session.has_pending_durable_operation()
+                || self.session.has_committed_durable_batch()
+            {
+                return Err(AppendError::NeedsAppendSettle);
+            }
+        }
+        if self.session.active_attempt.is_some() {
+            return Err(invalid_attempt("another provider attempt is still owned"));
+        }
+        let nonce = self.session.next_attempt_nonce;
+        let next_nonce = nonce.checked_add(1).ok_or(AppendError::SequenceExhausted)?;
+        self.session
+            .projection
+            .begin_live_attempt(turn, step)
+            .map_err(EventValidationError::from)?;
+        self.session.next_attempt_nonce = next_nonce;
+        self.session.active_attempt = Some(ActiveAttemptOwner {
+            reservation: self.owner.clone(),
+            nonce,
+            turn,
+            step,
+            phase: ActiveAttemptPhase::Open,
+        });
+        Ok(AttemptToken {
+            authority: self.session.attempt_authority.clone(),
+            reservation: self.owner.clone(),
+            nonce,
+            turn,
+            step,
+        })
+    }
+
+    /// Commit one provider-neutral chunk under the exact active token.
+    pub(crate) async fn append_attempt_chunk_settled(
+        &mut self,
+        token: &AttemptToken,
+        chunk: StreamChunk,
+    ) -> Result<AppendReceipt, AppendError> {
+        self.session
+            .validate_open_attempt_token(token, &self.owner)?;
+        let prepared = Session::prepare_event(NewEvent::log(EventKind::assistant_chunk(
+            token.turn, token.step, chunk,
+        )))?;
+        if matches!(&self.session.mode, SessionMode::Memory { .. }) {
+            return self.session.append_prepared_with_admission(
+                prepared,
+                self.reserved_events,
+                self.reserved_retained_json_bytes,
+                MemoryProjectionAdmission::AttemptChunk,
+            );
+        }
+        self.session.ensure_durable_active()?;
+        if let Some(kind) = self.session.pending_attempt_operation(token, &prepared)? {
+            if kind != AttemptOperationKind::Chunk {
+                return Err(invalid_attempt("a different attempt operation is pending"));
+            }
+            return self
+                .session
+                .settle_pending_append()
+                .await?
+                .ok_or(AppendError::DurableWriter);
+        }
+        let protected_events =
+            u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
+        let SessionMode::Durable {
+            pending_operation, ..
+        } = &mut self.session.mode
+        else {
+            return Err(AppendError::DurableAsyncRequired);
+        };
+        *pending_operation = Some(PendingDurableOperation {
+            prepared,
+            protected_events,
+            protected_row_bytes: self.reserved_row_bytes,
+            owner: DurableOperationOwner::Attempt {
+                authority: token.authority.clone(),
+                reservation: token.reservation.clone(),
+                nonce: token.nonce,
+                kind: AttemptOperationKind::Chunk,
+                claim: None,
+            },
+        });
+        self.session
+            .settle_pending_append()
+            .await?
+            .ok_or(AppendError::DurableWriter)
+    }
+
+    /// Move the terminal raw fold out to the Agent while retaining a compact
+    /// proof in Session for the one legal closure.
+    pub(crate) fn seal_attempt(
+        &mut self,
+        token: &AttemptToken,
+    ) -> Result<PreparedAttempt, AppendError> {
+        self.session
+            .validate_open_attempt_token(token, &self.owner)?;
+        self.session
+            .projection
+            .seal_live_attempt()
+            .map_err(EventValidationError::from)
+            .map_err(AppendError::from)
+    }
+
+    /// Commit the one event that consumes a sealed or interrupted attempt.
+    pub(crate) async fn append_attempt_closure_settled(
+        &mut self,
+        token: &AttemptToken,
+        disposition: AttemptDisposition,
+        event: NewEvent,
+    ) -> Result<AppendReceipt, AppendError> {
+        self.session
+            .validate_open_attempt_token(token, &self.owner)?;
+        let prepared = Session::prepare_event(event)?;
+        if matches!(&self.session.mode, SessionMode::Memory { .. }) {
+            let receipt = self.session.append_prepared_with_admission(
+                prepared,
+                self.reserved_events,
+                self.reserved_retained_json_bytes,
+                MemoryProjectionAdmission::AttemptClosure(disposition),
+            )?;
+            self.session
+                .mark_attempt_closed(token, &self.owner, &receipt, disposition)?;
+            return Ok(receipt);
+        }
+        self.session.ensure_durable_active()?;
+        if let Some(kind) = self.session.pending_attempt_operation(token, &prepared)? {
+            if kind != AttemptOperationKind::Closure(disposition) {
+                return Err(invalid_attempt("a different attempt closure is pending"));
+            }
+            let receipt = self
+                .session
+                .settle_pending_append()
+                .await?
+                .ok_or(AppendError::DurableWriter)?;
+            return Ok(receipt);
+        }
+        let protected_events =
+            u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
+        let SessionMode::Durable {
+            pending_operation, ..
+        } = &mut self.session.mode
+        else {
+            return Err(AppendError::DurableAsyncRequired);
+        };
+        *pending_operation = Some(PendingDurableOperation {
+            prepared,
+            protected_events,
+            protected_row_bytes: self.reserved_row_bytes,
+            owner: DurableOperationOwner::Attempt {
+                authority: token.authority.clone(),
+                reservation: token.reservation.clone(),
+                nonce: token.nonce,
+                kind: AttemptOperationKind::Closure(disposition),
+                claim: None,
+            },
+        });
+        let receipt = self
+            .session
+            .settle_pending_append()
+            .await?
+            .ok_or(AppendError::DurableWriter)?;
+        Ok(receipt)
+    }
+
+    /// Consume an already-protected exact claim as the closure of the active
+    /// provider attempt. The retained durable operation owns both identities,
+    /// so cancelling the wait cannot commit one while forgetting the other.
+    pub(crate) async fn settle_attempt_closure_exact_settled(
+        &mut self,
+        claim: &mut EventClaim,
+        token: &AttemptToken,
+        disposition: AttemptDisposition,
+    ) -> Result<AppendReceipt, AppendError> {
+        self.session
+            .validate_open_attempt_token(token, &self.owner)?;
+        self.validate_claim(claim)?;
+        if matches!(&self.session.mode, SessionMode::Memory { .. }) {
+            let other_events = self
+                .reserved_events
+                .checked_sub(1)
+                .ok_or(AppendError::InvalidClaim)?;
+            let other_bytes = self
+                .reserved_retained_json_bytes
+                .checked_sub(claim.reserved_retained_json_bytes)
+                .ok_or(AppendError::InvalidClaim)?;
+            let receipt = self.session.append_prepared_with_admission(
+                claim.fallback.clone(),
+                other_events,
+                other_bytes,
+                MemoryProjectionAdmission::AttemptClosure(disposition),
+            )?;
+            self.session
+                .mark_attempt_closed(token, &self.owner, &receipt, disposition)?;
+            self.finish_claim_bookkeeping(claim)?;
+            return Ok(receipt);
+        }
+
+        self.session.ensure_durable_active()?;
+        if let Some(kind) =
+            self.session
+                .pending_attempt_claim_operation(token, &self.owner, claim.token)?
+        {
+            if kind != AttemptOperationKind::Closure(disposition) {
+                return Err(invalid_attempt("a different attempt claim is pending"));
+            }
+            let receipt = self
+                .session
+                .settle_pending_append()
+                .await?
+                .ok_or(AppendError::DurableWriter)?;
+            self.finish_claim_bookkeeping(claim)?;
+            return Ok(receipt);
+        }
+
+        let other_events = self
+            .reserved_events
+            .checked_sub(1)
+            .ok_or(AppendError::InvalidClaim)?;
+        let other_row_bytes = self
+            .reserved_row_bytes
+            .checked_sub(claim.reserved_row_bytes)
+            .ok_or(AppendError::InvalidClaim)?;
+        let protected_events =
+            u64::try_from(other_events).map_err(|_| AppendError::SequenceExhausted)?;
+        let SessionMode::Durable {
+            pending_operation, ..
+        } = &mut self.session.mode
+        else {
+            return Err(AppendError::DurableAsyncRequired);
+        };
+        *pending_operation = Some(PendingDurableOperation {
+            prepared: claim.fallback.clone(),
+            protected_events,
+            protected_row_bytes: other_row_bytes,
+            owner: DurableOperationOwner::Attempt {
+                authority: token.authority.clone(),
+                reservation: token.reservation.clone(),
+                nonce: token.nonce,
+                kind: AttemptOperationKind::Closure(disposition),
+                claim: Some(AttemptClaimOwner {
+                    reservation: self.owner.clone(),
+                    token: claim.token,
+                }),
+            },
+        });
+        let receipt = self
+            .session
+            .settle_pending_append()
+            .await?
+            .ok_or(AppendError::DurableWriter)?;
+        self.finish_claim_bookkeeping(claim)?;
+        Ok(receipt)
+    }
+
+    /// Settle the reserved `step/end`, consuming the caller-owned attempt when
+    /// one is still open. Keeping the token outside `run_step` lets a caught
+    /// panic close the Session-owned fold without fabricating an assistant.
+    pub(crate) async fn settle_step_end_with_attempt_settled(
+        &mut self,
+        claim: &mut EventClaim,
+        token: Option<&AttemptToken>,
+        disposition: Option<AttemptDisposition>,
+    ) -> Result<AppendReceipt, AppendError> {
+        self.validate_claim(claim)?;
+        let EventKind::StepEnd { turn, step } = &claim.fallback.event.kind else {
+            return Err(AppendError::InvalidClaim);
+        };
+        match token {
+            Some(token) => {
+                if token.turn != *turn
+                    || token.step != *step
+                    || !matches!(
+                        disposition,
+                        Some(AttemptDisposition::Failed | AttemptDisposition::Cancelled)
+                    )
+                {
+                    return Err(invalid_attempt(
+                        "step/end does not match the open attempt disposition",
+                    ));
+                }
+                self.settle_attempt_closure_exact_settled(
+                    claim,
+                    token,
+                    disposition.expect("validated noncommitted disposition"),
+                )
+                .await
+            }
+            None => {
+                if self.session.active_attempt.is_some() || disposition.is_some() {
+                    return Err(invalid_attempt(
+                        "step/end omitted or double-closed an active attempt",
+                    ));
+                }
+                self.settle_exact_settled(claim).await
+            }
+        }
+    }
+
+    /// Retire a logically closed attempt only after a later storage barrier.
+    pub(crate) fn retire_attempt(&mut self, token: &AttemptToken) -> Result<(), AppendError> {
+        if !Arc::ptr_eq(&self.session.attempt_authority, &token.authority) {
+            return Err(invalid_attempt("attempt token belongs to another Session"));
+        }
+        if !Arc::ptr_eq(&self.owner, &token.reservation) {
+            return Err(invalid_attempt(
+                "attempt token belongs to another reservation",
+            ));
+        }
+        let Some(active) = &self.session.active_attempt else {
+            return Err(invalid_attempt("attempt token is no longer active"));
+        };
+        if !Arc::ptr_eq(&active.reservation, &self.owner)
+            || active.nonce != token.nonce
+            || active.turn != token.turn
+            || active.step != token.step
+        {
+            return Err(invalid_attempt(
+                "attempt token does not match the active owner",
+            ));
+        }
+        let ActiveAttemptPhase::Closed {
+            closed_at_barrier_epoch,
+            ..
+        } = active.phase
+        else {
+            return Err(invalid_attempt("attempt has not committed its closure"));
+        };
+        if self.session.barrier_epoch <= closed_at_barrier_epoch {
+            return Err(invalid_attempt(
+                "attempt closure has not crossed a storage barrier",
+            ));
+        }
+        self.session.active_attempt = None;
+        Ok(())
     }
 
     /// Commit a preferred event when it fits, otherwise commit the protected fallback.
@@ -2484,9 +3214,29 @@ impl SessionReservation<'_> {
         &mut self,
         replacement: ValidatedRawReplacement,
     ) -> Result<PrunePairReceipt, PrunePairAppendError> {
+        self.append_prune_pair_with_attempt(replacement, None)
+    }
+
+    fn append_prune_pair_with_attempt(
+        &mut self,
+        replacement: ValidatedRawReplacement,
+        overflow_attempt: Option<&AttemptToken>,
+    ) -> Result<PrunePairReceipt, PrunePairAppendError> {
         self.session.ensure_durable_active()?;
         if self.session.has_pending_durable_operation() {
             return Err(AppendError::NeedsAppendSettle.into());
+        }
+        match overflow_attempt {
+            Some(token) => self
+                .session
+                .validate_open_attempt_token(token, &self.owner)?,
+            None if self.session.active_attempt.is_some() => {
+                return Err(invalid_attempt(
+                    "a model-free prune cannot run while a provider attempt is active",
+                )
+                .into());
+            }
+            None => {}
         }
         let (owner, snapshot, data, outcome) = replacement.into_parts();
         if !Arc::ptr_eq(&owner, &self.owner) {
@@ -2586,11 +3336,20 @@ impl SessionReservation<'_> {
             .try_reserve_exact(pair_capacity)
             .map_err(|_| AppendError::Capacity)?;
 
+        let marker_owner = match overflow_attempt {
+            Some(token) => DurableOperationOwner::OverflowPruneMarker {
+                authority: token.authority.clone(),
+                reservation: token.reservation.clone(),
+                nonce: token.nonce,
+                target,
+            },
+            None => DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Marker { target }),
+        };
         let marker_operation = PendingDurableOperation {
             prepared: marker,
             protected_events: marker_protected_events,
             protected_row_bytes: marker_protected_rows,
-            owner: DurableOperationOwner::OwnedPrune(OwnedPrunePhase::Marker { target }),
+            owner: marker_owner,
         };
         let marker = match self.session.try_commit_durable(marker_operation) {
             DurableAppendAttempt::Committed(receipt) => receipt,
@@ -2936,6 +3695,14 @@ fn map_journal_append_error(error: JournalError) -> AppendError {
         | JournalError::AlreadyStaged
         | JournalError::FlightInProgress => AppendError::DurableWriter,
     }
+}
+
+fn invalid_attempt(detail: &'static str) -> AppendError {
+    EventValidationError::Attempt(AttemptError::Boundary {
+        event_type: "provider attempt",
+        detail,
+    })
+    .into()
 }
 
 fn map_journal_read_error(error: JournalReadError) -> SessionReadError {

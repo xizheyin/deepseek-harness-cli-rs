@@ -229,9 +229,11 @@ construct the next model request:
 
 The current Agent-private `AssistantAssembler` is extracted into the
 provider-neutral `session::attempt_anchor` owner; Session never depends back on
-Agent. The hot `AttemptAnchor` retains at most the provider's 10 MiB emitted
-content while one attempt is open and is charged to the 32 MiB resident-attempt
-budget. Immediately before each ordinary Provider dispatch, the reservation
+Agent. The hot `AttemptAnchor` retains at most 10 MiB of aggregate encoded
+provider-neutral chunk payload while one attempt is open. The separate 32 MiB
+resident-attempt credit must cover that fold plus pending journal ownership;
+the 10 MiB semantic counter alone is not a physical-memory proof. Immediately
+before each ordinary Provider dispatch, the reservation
 creates an opaque `AttemptToken`; every committed chunk for that request must
 present that token, feeds exactly one anchor, and advances its source span.
 Before max-token/error policy can transform a terminal response into the final
@@ -292,9 +294,12 @@ Cold scan instantiates the same fold and normalization code from journal chunks.
 An EOF with an open attempt feeds an `Interrupted` close into the cloned repair
 fold before synthetic `step/end`; it never asks a normal live `step/end` rule to
 silently drop the anchor. A batch already flushed to disk does not discard the
-hot anchor, and the final normalized message is not mistakenly used as the raw
-provider anchor. At no point do Agent and ValidationIndex each own a 10 MiB
-fold.
+hot anchor, and the final normalized message is not mistakenly used as the
+provider-attempt anchor. For `max-tokens`, the pinned upstream
+`BlockAssembler` removes tool-call blocks before this provider-assistant price
+is computed; Rust must not charge the discarded raw tool calls as though the
+fixed upstream retained them. At no point do Agent and ValidationIndex each
+own a 10 MiB fold.
 
 The provider-neutral stream grammar needed by both hot Agent dispatch and cold
 Session scan moves from `provider::stream` to `model::stream`; `provider`
@@ -417,8 +422,9 @@ dispatched” a property of the durable format rather than an assumption about
 the live Agent.
 
 Durable validation also enforces one attempt's existing provider envelope:
-at most 4,000 stream chunks and 10 MiB of assembled emitted content, with every
-chunk/final source in the same turn/step and a final source span of at most
+at most 4,000 stream chunks and 10 MiB across the compact-JSON encodings of the
+provider-neutral chunks, with every chunk/final source in the same turn/step
+and a final source span of at most
 4,096 unique sequences. Live append rejects one-over before growing the anchor;
 cold scan treats an artifact that could not have come through this durable
 producer contract as corrupt. This is what bounds the hot and cold
@@ -1592,9 +1598,11 @@ serialized tool schemas use the same estimator. "Compact JSON" here means
 JavaScript `JSON.stringify` text, including JavaScript number formatting; it is
 not `serde_json::to_string` byte length. The existing `ryu-js` dependency keeps
 small-exponent floats aligned. For the previous request, the
-usage candidate is input + cache-read + cache-write + output tokens. It replaces
-the full heuristic anchor only when it is at least that anchor; equivalently the
-meter keeps the larger value, then applies signed estimated deltas for later
+usage candidate is input + cache-read + cache-write + output tokens; reported
+reasoning tokens are already part of provider output and are not added again.
+The heuristic candidate is header tokens + the surface captured at
+`step/start` + the source-reconstructed provider-assistant price. The meter
+keeps the larger candidate, then applies signed estimated deltas for later
 surface changes. This is the upstream `TokenMeter` rule; the separate
 prompt-side context-pressure projection is not substituted for it. Rust tests
 include output usage and non-BMP text so neither a prompt-only sum nor UTF-8
@@ -1678,9 +1686,10 @@ tool results together. It never compacts an open tool pair or the current
 unsettled step. If no balanced, genuinely shrinking range exists, selection
 returns `None` before `compaction/start`; no failed-compaction event is
 fabricated. Ordinary pressure continues only if the request still fits. On
-provider overflow, a durable pruner replacement that advanced the captured
-surface generation is sufficient shrinking progress to replay the request once,
-even if the basic range is `None` or later summary work fails. Marker-only/no-
+provider overflow, a durable pruner replacement that advances the dedicated
+validated-replacement generation is sufficient shrinking progress to replay
+the request once, even if the basic range is `None` or later summary work
+fails. Ordinary surface events never advance this gate. Marker-only/no-
 replacement progress preserves the original context error. Cancellation always
 wins and prevents replay.
 
@@ -1861,22 +1870,22 @@ Session::append_settled(event) -> impl Future<Output = Result<AppendReceipt, App
 SessionReservation::append_settled(&mut self, event) -> impl Future<Output = Result<AppendReceipt, AppendError>>
 SessionReservation::settle_exact_settled(&mut self, claim) -> impl Future<Output = Result<AppendReceipt, AppendError>>
 SessionReservation::flush_barrier(&mut self, reason) -> impl Future<Output = Result<(), SessionIoError>>
-SessionReservation::begin_attempt(&mut self, turn, step) -> Result<AttemptToken, SessionError>
-SessionReservation::append_attempt_chunk_settled(&mut self, token, event) -> impl Future<Output = Result<AppendReceipt, AppendError>>
-SessionReservation::seal_attempt(&mut self, token, sources) -> Result<PreparedAttempt, SessionError>
+SessionReservation::begin_attempt(&mut self, turn, step) -> Result<AttemptToken, AppendError>
+SessionReservation::append_attempt_chunk_settled(&mut self, &token, chunk) -> impl Future<Output = Result<AppendReceipt, AppendError>>
+SessionReservation::seal_attempt(&mut self, &token) -> Result<PreparedAttempt, AppendError>
 SessionReservation::append_attempt_closure_settled(
     &mut self,
-    token,
+    &token,
     disposition: AttemptDisposition,
     event,
 ) -> impl Future<Output = Result<AppendReceipt, AppendError>>
 SessionReservation::settle_step_end_with_attempt_settled(
     &mut self,
     claim,
-    preferred_event,
+    token: Option<&AttemptToken>,
     disposition: Option<AttemptDisposition>,
 ) -> impl Future<Output = Result<AppendReceipt, AppendError>>
-SessionReservation::retire_attempt(&mut self, token: AttemptToken) -> Result<(), SessionError>
+SessionReservation::retire_attempt(&mut self, &token) -> Result<(), AppendError>
 SessionReservation::read_validated_surface_row(
     &mut self,
     locator,

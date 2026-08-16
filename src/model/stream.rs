@@ -1,6 +1,6 @@
 //! Strict provider-neutral whole-stream grammar shared by Session and providers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet, TryReserveError};
 
 use thiserror::Error;
 
@@ -10,18 +10,62 @@ use super::{ContentBlockKind, ContentBlockType, FinishReasonKind, StreamChunk, S
 pub const MAX_PROVIDER_STREAM_CHUNKS: usize = 4_000;
 
 /// Incremental validator for one live provider stream.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StreamValidator {
-    open: BTreeMap<u64, ContentBlockType>,
-    seen: BTreeSet<u64>,
+    open: HashMap<u64, ContentBlockType>,
+    seen: HashSet<u64>,
     usage_seen: bool,
     finished: bool,
     chunk_count: usize,
 }
 
+/// One already-validated stream-state change.
+///
+/// Session persistence prepares this value before it assigns a timestamp or
+/// journal sequence. Committing it later performs no validation and, when the
+/// validator was created with [`StreamValidator::try_bounded`], needs no table
+/// growth. That split keeps a failed clock or row encoding from half-consuming
+/// one provider chunk.
+pub(crate) struct PreparedStreamTransition {
+    kind: PreparedStreamTransitionKind,
+}
+
+enum PreparedStreamTransitionKind {
+    Continue,
+    BlockStart {
+        index: u64,
+        block_type: ContentBlockType,
+    },
+    BlockEnd {
+        index: u64,
+    },
+    Usage,
+    Finish,
+}
+
 impl StreamValidator {
+    /// Build the Session-owned validator with all per-attempt table capacity
+    /// reserved up front. Provider adapters may continue to use `Default`;
+    /// durable Session admission needs the fallible constructor so no hidden
+    /// allocation remains after an event receives its timestamp.
+    pub(crate) fn try_bounded() -> Result<Self, TryReserveError> {
+        let mut validator = Self::default();
+        validator.open.try_reserve(MAX_PROVIDER_STREAM_CHUNKS)?;
+        validator.seen.try_reserve(MAX_PROVIDER_STREAM_CHUNKS)?;
+        Ok(validator)
+    }
+
     /// Validate and commit one next chunk.
     pub fn accept(&mut self, chunk: &StreamChunk) -> Result<(), StreamProtocolError> {
+        let prepared = self.prepare(chunk)?;
+        self.commit(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        chunk: &StreamChunk,
+    ) -> Result<PreparedStreamTransition, StreamProtocolError> {
         if self.finished {
             return Err(StreamProtocolError::ChunkAfterFinish {
                 chunk_type: chunk_type(chunk).to_owned(),
@@ -36,23 +80,28 @@ impl StreamValidator {
             });
         }
 
-        match chunk.kind() {
+        let kind = match chunk.kind() {
             StreamChunkKind::BlockStart { index, block_type } => {
                 let index = index.get();
                 if self.seen.contains(&index) {
                     return Err(StreamProtocolError::ReusedBlockIndex { index });
                 }
-                self.seen.insert(index);
-                self.open.insert(index, block_type.clone());
+                PreparedStreamTransitionKind::BlockStart {
+                    index,
+                    block_type: block_type.clone(),
+                }
             }
             StreamChunkKind::TextDelta { index, .. } => {
                 self.require_open(index.get(), &ContentBlockType::Text)?;
+                PreparedStreamTransitionKind::Continue
             }
             StreamChunkKind::ReasoningDelta { index, .. } => {
                 self.require_open(index.get(), &ContentBlockType::Reasoning)?;
+                PreparedStreamTransitionKind::Continue
             }
             StreamChunkKind::ToolCallDelta { index, .. } => {
                 self.require_open(index.get(), &ContentBlockType::ToolCall)?;
+                PreparedStreamTransitionKind::Continue
             }
             StreamChunkKind::BlockEnd { index, block } => {
                 let index = index.get();
@@ -68,13 +117,13 @@ impl StreamValidator {
                         actual: type_name(&actual),
                     });
                 }
-                self.open.remove(&index);
+                PreparedStreamTransitionKind::BlockEnd { index }
             }
             StreamChunkKind::Usage { .. } => {
                 if self.usage_seen {
                     return Err(StreamProtocolError::DuplicateUsage);
                 }
-                self.usage_seen = true;
+                PreparedStreamTransitionKind::Usage
             }
             StreamChunkKind::Finish { reason, .. } => {
                 let can_leave_open = matches!(
@@ -86,16 +135,33 @@ impl StreamValidator {
                         count: self.open.len(),
                     });
                 }
-                self.finished = true;
+                PreparedStreamTransitionKind::Finish
             }
             StreamChunkKind::Other { chunk_type } => {
                 return Err(StreamProtocolError::UnknownLiveChunk {
                     chunk_type: chunk_type.clone(),
                 });
             }
+        };
+        Ok(PreparedStreamTransition { kind })
+    }
+
+    pub(crate) fn commit(&mut self, prepared: PreparedStreamTransition) {
+        match prepared.kind {
+            PreparedStreamTransitionKind::Continue => {}
+            PreparedStreamTransitionKind::BlockStart { index, block_type } => {
+                debug_assert!(!self.seen.contains(&index));
+                self.seen.insert(index);
+                self.open.insert(index, block_type);
+            }
+            PreparedStreamTransitionKind::BlockEnd { index } => {
+                debug_assert!(self.open.contains_key(&index));
+                self.open.remove(&index);
+            }
+            PreparedStreamTransitionKind::Usage => self.usage_seen = true,
+            PreparedStreamTransitionKind::Finish => self.finished = true,
         }
         self.chunk_count += 1;
-        Ok(())
     }
 
     /// Validate that the producer ended only after a terminal finish.

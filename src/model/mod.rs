@@ -13,6 +13,7 @@ pub use crate::json_value::{
     JsonValue, JsonValueError, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_JSON_VALUE_BYTES,
     NonNegativeSafeInteger, PositiveFiniteNumber,
 };
+pub(crate) use stream::PreparedStreamTransition;
 pub use stream::{MAX_PROVIDER_STREAM_CHUNKS, StreamProtocolError, StreamValidator};
 
 macro_rules! string_id {

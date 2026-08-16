@@ -38,8 +38,9 @@ use crate::{
     },
     session::{
         AppendError, ApprovalOutcome, BarrierError, Clock, ClockError, CommittedUiReceiver,
-        EventKind, EventSeq, MAX_SESSION_RETAINED_JSON_BYTES, NewEvent, Session, SessionId,
-        SessionStore, StepId, SurfaceIntent, ToolFailure, TurnEndReason, TurnId, UnixMillis,
+        EpochHeader, EventKind, EventSeq, MAX_SESSION_RETAINED_JSON_BYTES, NewEvent,
+        RequestHeaderReason, Session, SessionId, SessionStore, StepId, SurfaceIntent, ToolFailure,
+        TurnEndReason, TurnId, UnixMillis,
     },
     workspace_authority::WorkspaceAuthority,
 };
@@ -2278,12 +2279,23 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
     let chunks = tool_response();
     let turn_start = NewEvent::log(EventKind::turn_start(turn));
     let step_start = NewEvent::log(EventKind::step_start(turn, step));
+    let request_header = NewEvent::log(EventKind::RequestHeader {
+        header: EpochHeader {
+            config: LlmCallConfig::new("mock", "model").unwrap(),
+            adapter_defaults: None,
+            system: None,
+            tools: None,
+        },
+        reason: RequestHeaderReason::Initial,
+    });
     let chunk_events = chunks
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|chunk| NewEvent::log(EventKind::assistant_chunk(turn, step, chunk)))
         .collect::<Vec<_>>();
     let preamble_bytes = std::iter::once(&turn_start)
         .chain(std::iter::once(&step_start))
+        .chain(std::iter::once(&request_header))
         .chain(chunk_events.iter())
         .map(|event| Session::event_retained_json_bytes(event).unwrap())
         .sum::<usize>();
@@ -2294,11 +2306,24 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
     let mut source_seqs = Vec::new();
     session.append(turn_start).unwrap();
     session.append(step_start).unwrap();
-    for event in chunk_events {
-        source_seqs.push(session.append(event).unwrap().seq());
+    session.append(request_header).unwrap();
+    let mut reservation = session.reservation();
+    let token = reservation.begin_attempt(turn, step).unwrap();
+    for chunk in chunks {
+        source_seqs.push(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap()
+                .seq(),
+        );
     }
+    let _prepared = reservation.seal_attempt(&token).unwrap();
     assert_eq!(
-        session.remaining_budget().remaining_retained_json_bytes,
+        reservation
+            .session()
+            .remaining_budget()
+            .remaining_retained_json_bytes,
         capacity_after_preamble
     );
     let assistant = NewEvent::surface(
@@ -2341,7 +2366,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         "the session has no safe room for another agent event",
     )
     .unwrap();
-    let mut reservation = session.reservation();
+    let mut attempt_token = Some(token);
     let resolution = super::commit_tool_round(
         &mut reservation,
         &mut driver,
@@ -2350,6 +2375,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         assistant,
         vec![call],
         vec![ToolClaimProfile::shell_action()],
+        &mut attempt_token,
         &CancellationToken::new(),
         &budget_failure,
     )
