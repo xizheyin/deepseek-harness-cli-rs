@@ -1671,10 +1671,14 @@ wins and prevents replay.
 The replacement provenance list is also bounded: start and summary consume two
 entries, so one transaction shadows at most
 `MAX_SOURCE_EVENT_SEQS - 2` (currently 4,094) surface nodes. Selection enforces
-this before starting the summary call. A larger eligible prefix is split across
-at most the two permitted successful pressure transactions; exact/one-over
-tests prove the boundary. If that cannot produce an encodable request, the turn
-gets a stable context error; provenance is never silently truncated.
+this before starting the summary call. It first computes the ordinary balanced
+cut, clamps that prefix to 4,094 nodes, then moves the cut only toward the
+surface head until it is balanced again. It never moves toward the tail and
+silently exceeds the provenance bound. A larger eligible prefix is split
+across at most the two permitted successful pressure transactions;
+exact/one-over tests prove the boundary. If that cannot produce an encodable
+request, the turn gets a stable context error; provenance is never silently
+truncated.
 
 One transaction is:
 

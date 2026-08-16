@@ -19,6 +19,10 @@ use super::{
         COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
         ModelVisibleDispatchSnapshot,
     },
+    context_budget::{
+        ContextBudgetError, SurfacePriceFacts, estimate_message, estimate_request_header,
+        select_compactable_prefix,
+    },
     error::{EventValidationError, SurfaceError, TransitionError},
     event::{RECOVERY_TOOL_RESULT_ID_PREFIX, TOOL_NOT_STARTED},
     recovery::{RecoveryAdmission, RecoveryCompactionStage},
@@ -103,6 +107,7 @@ struct CompactionRecipe {
     trigger: CompactionTrigger,
     range: CompactionRange,
     shadowed_seqs: Arc<Vec<EventSeq>>,
+    shadowed_token_count: u64,
     provider: String,
     model: String,
     max_tokens: Option<NonNegativeSafeInteger>,
@@ -127,7 +132,6 @@ enum CompactionPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PruneShadowClaim {
     target_seq: EventSeq,
-    shadowed_token_count: NonNegativeSafeInteger,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -277,6 +281,7 @@ pub(crate) struct Projection {
     next_turn: TurnId,
     boundary: Boundary,
     surface_nodes: Arc<Vec<SurfaceNode>>,
+    surface_tokens: u64,
     request_header: Option<super::EpochHeader>,
     request_header_seq: Option<EventSeq>,
     request_context: Option<super::RequestContext>,
@@ -298,6 +303,8 @@ struct SurfaceNode {
     seq: EventSeq,
     kind: SurfaceNodeKind,
     message: Option<Message>,
+    estimated_tokens: u64,
+    tool_delta: i64,
     tool_result_identity: Option<Arc<serde_json::Value>>,
 }
 
@@ -337,6 +344,7 @@ impl Projection {
             next_turn: TurnId::first(),
             boundary: Boundary::Idle,
             surface_nodes: Arc::new(Vec::new()),
+            surface_tokens: 0,
             request_header: None,
             request_header_seq: None,
             request_context: None,
@@ -632,10 +640,16 @@ impl Projection {
                     if node.kind != SurfaceNodeKind::ToolResult {
                         return Err(SurfaceError::PruneTargetNotToolResult.into());
                     }
-                    next.prune_claim = Some(PruneShadowClaim {
-                        target_seq: target,
-                        shadowed_token_count: prune.shadowed_token_count(),
-                    });
+                    if self.policy == ValidationPolicy::DurableStrict
+                        && prune.shadowed_token_count().get() != node.estimated_tokens
+                    {
+                        return Err(SurfaceError::ShadowedTokenCountMismatch {
+                            expected: node.estimated_tokens,
+                            actual: prune.shadowed_token_count().get(),
+                        }
+                        .into());
+                    }
+                    next.prune_claim = Some(PruneShadowClaim { target_seq: target });
                 }
                 EventKind::UserMessage { message }
                     if matches!(event.surface_op, Some(SurfaceOp::Replace(_)))
@@ -743,17 +757,57 @@ impl Projection {
             )
             .into());
         }
-        if !self.surface_range_matches(dispatch.shadowed_range(), dispatch.shadowed_seqs())
-            || dispatch
-                .shadowed_seqs()
-                .iter()
-                .any(|shadowed| *shadowed >= start_seq)
-        {
+        if !self.pending_approvals.is_empty() || self.has_pending_durable_call() {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "compaction cannot start with unresolved approval or tool work",
+            )
+            .into());
+        }
+        let Some((range_start, range_end)) =
+            self.surface_range_indices(dispatch.shadowed_range(), dispatch.shadowed_seqs())
+        else {
             return Err(TransitionError::CompactionDispatchMismatch(
                 "shadowed range is not the selected current surface",
             )
             .into());
+        };
+        if range_start != 0
+            || dispatch
+                .shadowed_seqs()
+                .iter()
+                .any(|shadowed| *shadowed >= start_seq)
+            || dispatch.shadowed_seqs().len() > MAX_SOURCE_EVENT_SEQS - 2
+        {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "shadowed range is not a bounded oldest surface prefix",
+            )
+            .into());
         }
+        let retained_tokens = self.surface_nodes[range_end + 1..]
+            .iter()
+            .try_fold(0_u64, |total, node| {
+                total.checked_add(node.estimated_tokens)
+            })
+            .ok_or(SurfaceError::TokenAccountingOverflow)?;
+        let selected = select_compactable_prefix(
+            self.surface_nodes.as_slice(),
+            retained_tokens,
+            MAX_SOURCE_EVENT_SEQS - 2,
+            surface_price_facts,
+        )
+        .map_err(context_budget_surface_error)?;
+        if selected.map(|selected| selected.end_exclusive) != Some(range_end + 1) {
+            return Err(TransitionError::CompactionDispatchMismatch(
+                "shadowed range is not the canonical balanced prefix",
+            )
+            .into());
+        }
+        let shadowed_token_count = self.surface_nodes[..=range_end]
+            .iter()
+            .try_fold(0_u64, |total, node| {
+                total.checked_add(node.estimated_tokens)
+            })
+            .ok_or(SurfaceError::TokenAccountingOverflow)?;
         if self
             .session_id
             .as_ref()
@@ -787,12 +841,8 @@ impl Projection {
                 .into());
             }
         }
-        if !self.pending_approvals.is_empty() || self.has_pending_durable_call() {
-            return Err(TransitionError::CompactionDispatchMismatch(
-                "compaction cannot start with unresolved approval or tool work",
-            )
-            .into());
-        }
+        estimate_request_header(dispatch.system(), dispatch.tools())
+            .map_err(context_budget_surface_error)?;
         match (dispatch.trigger(), &self.boundary) {
             (CompactionTrigger::Pressure | CompactionTrigger::HardLimit, Boundary::Turn { .. })
             | (CompactionTrigger::ContextOverflow, Boundary::Step { .. }) => {}
@@ -813,6 +863,7 @@ impl Projection {
             trigger: dispatch.trigger(),
             range: dispatch.shadowed_range(),
             shadowed_seqs: Arc::new(dispatch.shadowed_seqs().to_vec()),
+            shadowed_token_count,
             provider: dispatch.prepared_call().config().provider().to_owned(),
             model: dispatch.prepared_call().config().model().to_owned(),
             max_tokens: dispatch.prepared_call().config().max_tokens(),
@@ -870,6 +921,15 @@ impl Projection {
                     .into());
                 }
                 if let Some(recipe) = &open.recipe {
+                    if self.policy == ValidationPolicy::DurableStrict
+                        && summary.shadowed_token_count().get() != recipe.shadowed_token_count
+                    {
+                        return Err(SurfaceError::ShadowedTokenCountMismatch {
+                            expected: recipe.shadowed_token_count,
+                            actual: summary.shadowed_token_count().get(),
+                        }
+                        .into());
+                    }
                     if summary.shadowed_range() != recipe.range
                         || summary.shadowed_seqs() != recipe.shadowed_seqs.as_slice()
                         || summary.provider() != recipe.provider
@@ -906,7 +966,7 @@ impl Projection {
                     range,
                     shadowed_seqs,
                     summary_blocks,
-                    ..
+                    shadowed_token_count,
                 } = &open.phase
                 else {
                     return Err(TransitionError::CompactionBodyOutOfOrder {
@@ -926,6 +986,17 @@ impl Projection {
                     )
                 {
                     return Err(SurfaceError::CompactionReplacementMismatch.into());
+                }
+                if self.policy == ValidationPolicy::DurableStrict {
+                    let replacement_tokens =
+                        estimate_message(message).map_err(context_budget_surface_error)?;
+                    if replacement_tokens >= shadowed_token_count.get() {
+                        return Err(SurfaceError::CompactionDoesNotShrink {
+                            shadowed: shadowed_token_count.get(),
+                            replacement: replacement_tokens,
+                        }
+                        .into());
+                    }
                 }
                 open.phase = CompactionPhase::Replaced {
                     summary_seq: *summary_seq,
@@ -1045,25 +1116,28 @@ impl Projection {
     }
 
     fn surface_range_matches(&self, range: CompactionRange, expected: &[EventSeq]) -> bool {
-        let Some(start) = self
+        self.surface_range_indices(range, expected).is_some()
+    }
+
+    fn surface_range_indices(
+        &self,
+        range: CompactionRange,
+        expected: &[EventSeq],
+    ) -> Option<(usize, usize)> {
+        let start = self
             .surface_nodes
             .iter()
-            .position(|node| node.seq == range.start())
-        else {
-            return false;
-        };
-        let Some(end) = self
+            .position(|node| node.seq == range.start())?;
+        let end = self
             .surface_nodes
             .iter()
-            .position(|node| node.seq == range.end())
-        else {
-            return false;
-        };
-        start <= end
+            .position(|node| node.seq == range.end())?;
+        (start <= end
             && self.surface_nodes[start..=end]
                 .iter()
                 .map(|node| node.seq)
-                .eq(expected.iter().copied())
+                .eq(expected.iter().copied()))
+        .then_some((start, end))
     }
 
     fn apply_transition(
@@ -1380,7 +1454,13 @@ impl Projection {
         self.validate_sources(event)?;
         match operation {
             SurfaceOp::Append(_) => {
-                Arc::make_mut(&mut self.surface_nodes).push(Self::surface_node(event)?);
+                let node = Self::surface_node(event)?;
+                let surface_tokens = self
+                    .surface_tokens
+                    .checked_add(node.estimated_tokens)
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                Arc::make_mut(&mut self.surface_nodes).push(node);
+                self.surface_tokens = surface_tokens;
             }
             SurfaceOp::Replace(replacement) => {
                 let start_index = self
@@ -1409,25 +1489,56 @@ impl Projection {
                 if matches!(event.kind, EventKind::ToolResult { .. }) {
                     self.validate_tool_result_rewrite(event, shadowed)?;
                 }
-                Arc::make_mut(&mut self.surface_nodes)
-                    .splice(start_index..=end_index, [Self::surface_node(event)?]);
+                let node = Self::surface_node(event)?;
+                let removed_tokens = shadowed.iter().try_fold(0_u64, |total, shadowed| {
+                    total.checked_add(shadowed.estimated_tokens)
+                });
+                let surface_tokens = self
+                    .surface_tokens
+                    .checked_sub(removed_tokens.ok_or(SurfaceError::TokenAccountingOverflow)?)
+                    .and_then(|total| total.checked_add(node.estimated_tokens))
+                    .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                Arc::make_mut(&mut self.surface_nodes).splice(start_index..=end_index, [node]);
+                self.surface_tokens = surface_tokens;
             }
         }
         Ok(())
     }
 
     fn surface_node(event: &SessionEvent) -> Result<SurfaceNode, SurfaceError> {
-        let (kind, message) = match &event.kind {
-            EventKind::UserMessage { message } => (SurfaceNodeKind::User, Some(message.clone())),
+        let (kind, message, tool_delta) = match &event.kind {
+            EventKind::UserMessage { message } => (SurfaceNodeKind::User, Some(message.clone()), 0),
             EventKind::ToolResult { message, .. } => {
-                (SurfaceNodeKind::ToolResult, Some(message.clone()))
+                (SurfaceNodeKind::ToolResult, Some(message.clone()), -1)
             }
             EventKind::AssistantMessage { message, .. } if !message.content().is_empty() => {
-                (SurfaceNodeKind::Assistant, Some(message.clone()))
+                let tool_calls = message
+                    .content()
+                    .iter()
+                    .filter(|block| {
+                        matches!(
+                            block.kind(),
+                            crate::model::ContentBlockKind::ToolCall { .. }
+                        )
+                    })
+                    .count();
+                let tool_delta =
+                    i64::try_from(tool_calls).map_err(|_| SurfaceError::TokenAccountingOverflow)?;
+                (
+                    SurfaceNodeKind::Assistant,
+                    Some(message.clone()),
+                    tool_delta,
+                )
             }
-            EventKind::AssistantMessage { .. } => (SurfaceNodeKind::Assistant, None),
+            EventKind::AssistantMessage { .. } => (SurfaceNodeKind::Assistant, None, 0),
             _ => return Err(SurfaceError::ToolResultWrongTarget),
         };
+        let estimated_tokens = message
+            .as_ref()
+            .map(estimate_message)
+            .transpose()
+            .map_err(context_budget_surface_error)?
+            .unwrap_or(0);
         let tool_result_identity = if matches!(event.kind, EventKind::ToolResult { .. }) {
             let mut identity =
                 event_data_value(event).map_err(|_| SurfaceError::ToolResultChangedIdentity)?;
@@ -1442,6 +1553,8 @@ impl Projection {
             seq: event.seq,
             kind,
             message,
+            estimated_tokens,
+            tool_delta,
             tool_result_identity,
         })
     }
@@ -1873,6 +1986,20 @@ impl Projection {
     }
 }
 
+fn surface_price_facts(node: &SurfaceNode) -> SurfacePriceFacts {
+    SurfacePriceFacts {
+        tokens: node.estimated_tokens,
+        tool_delta: node.tool_delta,
+    }
+}
+
+fn context_budget_surface_error(error: ContextBudgetError) -> SurfaceError {
+    match error {
+        ContextBudgetError::TokenOverflow => SurfaceError::TokenAccountingOverflow,
+        ContextBudgetError::UnbalancedToolSurface => SurfaceError::UnbalancedToolSurface,
+    }
+}
+
 fn event_is_immediately_after(current: EventSeq, previous: EventSeq) -> bool {
     previous.get().checked_add(1) == Some(current.get())
 }
@@ -2108,7 +2235,19 @@ mod tests {
                 json!({
                     "id": "user-before-compaction",
                     "role": "user",
-                    "content": [{ "type": "text", "text": "old context" }],
+                    "content": [{ "type": "text", "text": "x".repeat(4096) }],
+                    "source": { "kind": "user" },
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            wire_event(
+                "user/message",
+                2,
+                json!({
+                    "id": "retained-after-compaction",
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "latest context" }],
                     "source": { "kind": "user" },
                 }),
                 Some(json!("append")),
@@ -2116,21 +2255,21 @@ mod tests {
             ),
             wire_event(
                 "turn/end",
-                2,
+                3,
                 json!({ "turn": 1, "reason": { "kind": "completed" } }),
                 None,
                 None,
             ),
-            wire_event("turn/start", 3, json!({ "turn": 2 }), None, None),
+            wire_event("turn/start", 4, json!({ "turn": 2 }), None, None),
             wire_event(
                 "compaction/start",
-                4,
+                5,
                 json!({
                     "compactionId": "compact-strict-1",
                     "turn": 2,
                     "dispatch": {
                         "trigger": "pressure",
-                        "sourceSurfaceGeneration": 1,
+                        "sourceSurfaceGeneration": 2,
                         "shadowedRange": { "start": 1, "end": 1 },
                         "shadowedSeqs": [1],
                         "preparedCall": {
@@ -2164,7 +2303,7 @@ mod tests {
             ),
             wire_event(
                 "compaction/summary",
-                5,
+                6,
                 json!({
                     "compactionId": "compact-strict-1",
                     "summary": [{ "type": "text", "text": "condensed context", "kept": true }],
@@ -2175,7 +2314,7 @@ mod tests {
                     "llmStreamCall": true,
                     "shadowedRange": { "start": 1, "end": 1 },
                     "shadowedSeqs": [1],
-                    "shadowedTokenCount": 3,
+                    "shadowedTokenCount": 1032,
                     "provider": "summary-provider",
                     "model": "summary-model"
                 }),
@@ -2184,7 +2323,7 @@ mod tests {
             ),
             wire_event(
                 "user/message",
-                6,
+                7,
                 json!({
                     "id": "compaction-checkpoint",
                     "role": "user",
@@ -2200,11 +2339,11 @@ mod tests {
                     }
                 }),
                 Some(json!({ "op": "replace", "start": 1, "end": 1 })),
-                Some(vec![4, 5, 1]),
+                Some(vec![5, 6, 1]),
             ),
             wire_event(
                 "compaction/end",
-                7,
+                8,
                 json!({ "compactionId": "compact-strict-1", "turn": 2 }),
                 None,
                 None,
@@ -2473,14 +2612,14 @@ mod tests {
         assert_eq!(projection.state().open_turn(), TurnId::new(2).ok());
         assert_eq!(
             projection.state().surface_nodes(),
-            &[EventSeq::new(6).unwrap()]
+            &[EventSeq::new(7).unwrap(), EventSeq::new(2).unwrap()]
         );
-        assert_eq!(projection.messages().len(), 1);
+        assert_eq!(projection.messages().len(), 2);
 
-        let mut without_replacement = events[..6].to_vec();
+        let mut without_replacement = events[..7].to_vec();
         without_replacement.push(wire_event(
             "compaction/end",
-            6,
+            7,
             json!({ "compactionId": "compact-strict-1", "turn": 2 }),
             None,
             None,
@@ -2502,6 +2641,242 @@ mod tests {
                 TransitionError::CompactionSuccessWithoutReplacement
             )
         ));
+    }
+
+    #[test]
+    fn strict_compaction_checks_shadow_prices_and_requires_a_smaller_checkpoint() {
+        let events = strict_compaction_trace();
+        let mut projection = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        for event in &events[..6] {
+            projection = projection.with_event(event).unwrap();
+        }
+
+        let mut wrong_price = serde_json::to_value(&events[6]).unwrap();
+        wrong_price["data"]["shadowedTokenCount"] = json!(1031);
+        let wrong_price = crate::session::codec::decode_event(wrong_price, 6).unwrap();
+        assert!(matches!(
+            projection.with_event(&wrong_price).unwrap_err(),
+            crate::session::EventValidationError::Surface(
+                SurfaceError::ShadowedTokenCountMismatch {
+                    expected: 1032,
+                    actual: 1031
+                }
+            )
+        ));
+
+        let mut large_summary = serde_json::to_value(&events[6]).unwrap();
+        large_summary["data"]["summary"][0]["text"] = json!("y".repeat(4096));
+        large_summary["data"]["rawOutput"][1]["text"] = json!("y".repeat(4096));
+        let large_summary = crate::session::codec::decode_event(large_summary, 6).unwrap();
+        let summarized = projection.with_event(&large_summary).unwrap();
+
+        let mut nonshrinking = serde_json::to_value(&events[7]).unwrap();
+        nonshrinking["data"]["content"][1]["text"] = json!("y".repeat(4096));
+        let nonshrinking = crate::session::codec::decode_event(nonshrinking, 7).unwrap();
+        assert!(matches!(
+            summarized.with_event(&nonshrinking).unwrap_err(),
+            crate::session::EventValidationError::Surface(SurfaceError::CompactionDoesNotShrink {
+                shadowed: 1032,
+                replacement: _
+            })
+        ));
+    }
+
+    #[test]
+    fn strict_compaction_never_shadows_the_entire_surface() {
+        let events = strict_compaction_trace();
+        let mut projection = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        for event in &events[..5] {
+            projection = projection.with_event(event).unwrap();
+        }
+        let mut whole_surface = serde_json::to_value(&events[5]).unwrap();
+        whole_surface["data"]["dispatch"]["shadowedRange"] = json!({ "start": 1, "end": 2 });
+        whole_surface["data"]["dispatch"]["shadowedSeqs"] = json!([1, 2]);
+        let whole_surface = crate::session::codec::decode_event(whole_surface, 5).unwrap();
+
+        assert!(matches!(
+            projection.with_event(&whole_surface).unwrap_err(),
+            crate::session::EventValidationError::Transition(
+                TransitionError::CompactionDispatchMismatch(
+                    "shadowed range is not the canonical balanced prefix"
+                )
+            )
+        ));
+        assert_eq!(
+            projection.state().surface_nodes(),
+            &[EventSeq::new(1).unwrap(), EventSeq::new(2).unwrap()]
+        );
+    }
+
+    #[test]
+    fn hot_replay_and_cold_scan_keep_identical_surface_prices() {
+        let events = strict_compaction_trace();
+        let mut hot = Projection::for_session(
+            ValidationPolicy::DurableStrict,
+            SessionId::new("strict-compaction"),
+        );
+        let mut cold = hot.clone();
+        let mut compatible = Projection::empty(ValidationPolicy::MemoryCompatible);
+
+        for event in &events {
+            hot = hot.with_event(event).unwrap();
+            cold.apply_scanned_event(event).unwrap();
+            compatible = compatible.with_compatible_event(event).unwrap();
+            assert_eq!(hot.surface_tokens, cold.surface_tokens);
+            assert_eq!(hot.surface_tokens, compatible.surface_tokens);
+            assert_eq!(hot.surface_nodes, cold.surface_nodes);
+            assert_eq!(hot.surface_nodes, compatible.surface_nodes);
+        }
+
+        let messages = hot.messages();
+        assert_eq!(
+            hot.surface_tokens,
+            messages
+                .iter()
+                .try_fold(0_u64, |total, message| {
+                    total.checked_add(
+                        crate::session::context_budget::estimate_message(message).unwrap(),
+                    )
+                })
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn strict_prune_marker_uses_the_current_tool_result_price() {
+        let prefix = [
+            wire_event("turn/start", 0, json!({ "turn": 1 }), None, None),
+            wire_event("step/start", 1, json!({ "turn": 1, "step": 1 }), None, None),
+            wire_event(
+                "assistant/message",
+                2,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "assistant-prune-price",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool-call",
+                            "id": "call-prune-price",
+                            "name": "read",
+                            "arguments": "{}"
+                        }],
+                        "source": { "kind": "model", "provider": "mock", "model": "mock" }
+                    }
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            wire_event(
+                "tool/call",
+                3,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "callId": "call-prune-price",
+                    "name": "read",
+                    "arguments": "{}"
+                }),
+                None,
+                None,
+            ),
+            wire_event(
+                "tool/result",
+                4,
+                json!({
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "result-prune-price",
+                        "role": "user",
+                        "content": [{
+                            "type": "tool-result",
+                            "toolCallId": "call-prune-price",
+                            "content": [{ "type": "text", "text": "x".repeat(47) }],
+                            "isError": false
+                        }],
+                        "source": { "kind": "tool", "callId": "call-prune-price" }
+                    },
+                    "meta": { "retained": true }
+                }),
+                Some(json!("append")),
+                Some(vec![3]),
+            ),
+        ];
+        let mut projection = Projection::empty(ValidationPolicy::DurableStrict);
+        for event in &prefix {
+            projection = projection.with_event(event).unwrap();
+        }
+        let marker = |count| {
+            wire_event(
+                "compaction/prune",
+                5,
+                json!({
+                    "shadowedRange": { "start": 4, "end": 4 },
+                    "shadowedSeqs": [4],
+                    "shadowedTokenCount": count
+                }),
+                None,
+                None,
+            )
+        };
+
+        assert!(matches!(
+            projection.with_event(&marker(23)).unwrap_err(),
+            crate::session::EventValidationError::Surface(
+                SurfaceError::ShadowedTokenCountMismatch {
+                    expected: 24,
+                    actual: 23
+                }
+            )
+        ));
+        let before_tokens = projection.surface_tokens;
+        let replacement = wire_event(
+            "tool/result",
+            6,
+            json!({
+                "turn": 1,
+                "step": 1,
+                "message": {
+                    "id": "result-prune-price",
+                    "role": "user",
+                    "content": [{
+                        "type": "tool-result",
+                        "toolCallId": "call-prune-price",
+                        "content": [{
+                            "type": "text",
+                            "text": "xxxx\n\n[... tool result middle pruned ...]\n\nxxx"
+                        }],
+                        "isError": false
+                    }],
+                    "source": { "kind": "tool", "callId": "call-prune-price" }
+                },
+                "meta": { "retained": true }
+            }),
+            Some(json!({ "op": "replace", "start": 4, "end": 4 })),
+            Some(vec![4]),
+        );
+
+        let mut hot = projection.with_event(&marker(24)).unwrap();
+        hot = hot.with_event(&replacement).unwrap();
+        assert_eq!(hot.surface_tokens, before_tokens);
+        assert_eq!(
+            hot.state().surface_nodes(),
+            &[EventSeq::new(2).unwrap(), EventSeq::new(6).unwrap()]
+        );
+        assert_eq!(hot.orphan_prune_markers(), 0);
+
+        let mut cold = projection.clone();
+        cold.apply_scanned_event(&marker(24)).unwrap();
+        cold.apply_scanned_event(&replacement).unwrap();
+        assert_eq!(cold, hot);
     }
 
     #[test]
@@ -2543,12 +2918,12 @@ mod tests {
             ValidationPolicy::DurableStrict,
             SessionId::new("strict-compaction"),
         );
-        for event in &strict[..5] {
+        for event in &strict[..6] {
             projection = projection.with_event(event).unwrap();
         }
         let legacy_end = wire_event(
             "compaction/end",
-            5,
+            6,
             json!({
                 "compactionId": "compact-strict-1",
                 "turn": 2,
@@ -2572,10 +2947,10 @@ mod tests {
             ValidationPolicy::DurableStrict,
             SessionId::new("strict-compaction"),
         );
-        for event in &events[..5] {
+        for event in &events[..6] {
             projection = projection.with_event(event).unwrap();
         }
-        let inserted = wire_event("todo/write", 5, json!({ "todos": [] }), None, None);
+        let inserted = wire_event("todo/write", 6, json!({ "todos": [] }), None, None);
         assert!(matches!(
             projection.with_event(&inserted).unwrap_err(),
             crate::session::EventValidationError::Transition(
@@ -2583,9 +2958,9 @@ mod tests {
             )
         ));
 
-        let mut wrong_id = serde_json::to_value(&events[5]).unwrap();
+        let mut wrong_id = serde_json::to_value(&events[6]).unwrap();
         wrong_id["data"]["compactionId"] = json!("different");
-        let wrong_id = crate::session::codec::decode_event(wrong_id, 5).unwrap();
+        let wrong_id = crate::session::codec::decode_event(wrong_id, 6).unwrap();
         assert!(matches!(
             projection.with_event(&wrong_id).unwrap_err(),
             crate::session::EventValidationError::Transition(
@@ -2597,12 +2972,12 @@ mod tests {
             ValidationPolicy::DurableStrict,
             SessionId::new("strict-compaction"),
         );
-        for event in &events[..4] {
+        for event in &events[..5] {
             without_start = without_start.with_event(event).unwrap();
         }
         let checkpoint = wire_event(
             "user/message",
-            4,
+            5,
             json!({
                 "id": "forged-checkpoint",
                 "role": "user",
@@ -2628,17 +3003,18 @@ mod tests {
         ));
         assert_eq!(
             without_start.state().surface_nodes(),
-            &[EventSeq::new(1).unwrap()]
+            &[EventSeq::new(1).unwrap(), EventSeq::new(2).unwrap()]
         );
     }
 
     #[test]
     fn strict_compaction_cannot_start_with_unresolved_tool_or_approval_work() {
         let start = |seq: u64| {
-            let mut value = serde_json::to_value(&strict_compaction_trace()[4]).unwrap();
+            let mut value = serde_json::to_value(&strict_compaction_trace()[5]).unwrap();
             value["seq"] = json!(seq);
             value["data"]["turn"] = json!(1);
             value["data"]["dispatch"]["trigger"] = json!("context-overflow");
+            value["data"]["dispatch"]["sourceSurfaceGeneration"] = json!(1);
             value["data"]["dispatch"]["shadowedRange"] = json!({ "start": 2, "end": 2 });
             value["data"]["dispatch"]["shadowedSeqs"] = json!([2]);
             crate::session::codec::decode_event(value, seq as usize).unwrap()

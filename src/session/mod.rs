@@ -3,6 +3,7 @@
 mod clock;
 mod codec;
 mod compaction;
+mod context_budget;
 mod error;
 mod event;
 mod journal;

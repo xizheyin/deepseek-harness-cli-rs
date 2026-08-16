@@ -1261,7 +1261,19 @@ mod tests {
                 json!({
                     "id": "old-context",
                     "role": "user",
-                    "content": [{ "type": "text", "text": "old context" }],
+                    "content": [{ "type": "text", "text": "x".repeat(4096) }],
+                    "source": { "kind": "user" }
+                }),
+                Some(json!("append")),
+                None,
+            ),
+            compaction_wire_event(
+                "user/message",
+                2,
+                json!({
+                    "id": "retained-context",
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "latest context" }],
                     "source": { "kind": "user" }
                 }),
                 Some(json!("append")),
@@ -1269,21 +1281,21 @@ mod tests {
             ),
             compaction_wire_event(
                 "turn/end",
-                2,
+                3,
                 json!({ "turn": 1, "reason": { "kind": "completed" } }),
                 None,
                 None,
             ),
-            compaction_wire_event("turn/start", 3, json!({ "turn": 2 }), None, None),
+            compaction_wire_event("turn/start", 4, json!({ "turn": 2 }), None, None),
             compaction_wire_event(
                 "compaction/start",
-                4,
+                5,
                 json!({
                     "compactionId": "resume-compaction",
                     "turn": 2,
                     "dispatch": {
                         "trigger": "pressure",
-                        "sourceSurfaceGeneration": 1,
+                        "sourceSurfaceGeneration": 2,
                         "shadowedRange": { "start": 1, "end": 1 },
                         "shadowedSeqs": [1],
                         "preparedCall": {
@@ -1322,7 +1334,7 @@ mod tests {
         ) {
             events.push(compaction_wire_event(
                 "compaction/summary",
-                5,
+                6,
                 json!({
                     "compactionId": "resume-compaction",
                     "summary": [{ "type": "text", "text": "summary", "kept": true }],
@@ -1333,7 +1345,7 @@ mod tests {
                     "llmStreamCall": true,
                     "shadowedRange": { "start": 1, "end": 1 },
                     "shadowedSeqs": [1],
-                    "shadowedTokenCount": 2,
+                    "shadowedTokenCount": 1032,
                     "provider": "summary-provider",
                     "model": "summary-model"
                 }),
@@ -1344,7 +1356,7 @@ mod tests {
         if stage == RecoveryCompactionStage::Replaced {
             events.push(compaction_wire_event(
                 "user/message",
-                6,
+                7,
                 json!({
                     "id": "checkpoint",
                     "role": "user",
@@ -1363,7 +1375,7 @@ mod tests {
                     }
                 }),
                 Some(json!({ "op": "replace", "start": 1, "end": 1 })),
-                Some(vec![4, 5, 1]),
+                Some(vec![5, 6, 1]),
             ));
         }
         events
@@ -1371,15 +1383,15 @@ mod tests {
 
     fn context_overflow_compaction_prefix(stage: RecoveryCompactionStage) -> Vec<SessionEvent> {
         let pressure = compaction_orphan_prefix(stage);
-        let mut events = pressure[..4].to_vec();
+        let mut events = pressure[..5].to_vec();
         events.push(compaction_wire_event(
             "step/start",
-            4,
+            5,
             json!({ "turn": 2, "step": 1 }),
             None,
             None,
         ));
-        for event in &pressure[4..] {
+        for event in &pressure[5..] {
             let mut value = serde_json::to_value(event).unwrap();
             let shifted = event.seq().get() + 1;
             value["seq"] = json!(shifted);
@@ -1387,7 +1399,7 @@ mod tests {
                 value["data"]["dispatch"]["trigger"] = json!("context-overflow");
             }
             if matches!(event.kind(), EventKind::UserMessage { .. }) {
-                value["sourceEventSeqs"] = json!([5, 6, 1]);
+                value["sourceEventSeqs"] = json!([6, 7, 1]);
             }
             events.push(crate::session::codec::decode_event(value, shifted as usize).unwrap());
         }
@@ -1464,7 +1476,7 @@ mod tests {
                 json!({
                     "shadowedRange": { "start": 4, "end": 4 },
                     "shadowedSeqs": [4],
-                    "shadowedTokenCount": 12
+                    "shadowedTokenCount": 15
                 }),
                 None,
                 None,
@@ -1532,11 +1544,11 @@ mod tests {
             assert_eq!(projection.interrupted_compaction_stage(), None);
             assert_eq!(projection.state().open_turn(), None);
             let expected_surface = if stage == RecoveryCompactionStage::Replaced {
-                EventSeq::new(6).unwrap()
+                vec![EventSeq::new(7).unwrap(), EventSeq::new(2).unwrap()]
             } else {
-                EventSeq::new(1).unwrap()
+                vec![EventSeq::new(1).unwrap(), EventSeq::new(2).unwrap()]
             };
-            assert_eq!(projection.state().surface_nodes(), &[expected_surface]);
+            assert_eq!(projection.state().surface_nodes(), expected_surface);
 
             for event in plan.events() {
                 bytes.extend_from_slice(&encode_event_line(event).unwrap());
@@ -1574,11 +1586,11 @@ mod tests {
             );
             assert_eq!(plan.events().len(), 3);
             let expected_surface = if stage == RecoveryCompactionStage::Replaced {
-                EventSeq::new(7).unwrap()
+                vec![EventSeq::new(8).unwrap(), EventSeq::new(2).unwrap()]
             } else {
-                EventSeq::new(1).unwrap()
+                vec![EventSeq::new(1).unwrap(), EventSeq::new(2).unwrap()]
             };
-            assert_eq!(projection.state().surface_nodes(), &[expected_surface]);
+            assert_eq!(projection.state().surface_nodes(), expected_surface);
         }
 
         let prefix = context_overflow_compaction_prefix(RecoveryCompactionStage::Started);
@@ -1699,7 +1711,7 @@ mod tests {
         for event in compaction_orphan_prefix(RecoveryCompactionStage::Started) {
             bytes.extend_from_slice(&encode_event_line(&event).unwrap());
         }
-        let unrelated = compaction_wire_event("todo/write", 5, json!({ "todos": [] }), None, None);
+        let unrelated = compaction_wire_event("todo/write", 6, json!({ "todos": [] }), None, None);
         bytes.extend_from_slice(&encode_event_line(&unrelated).unwrap());
 
         assert!(matches!(scan_bytes(&bytes), Err(StoreError::Corrupt)));

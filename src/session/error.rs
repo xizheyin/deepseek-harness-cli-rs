@@ -245,6 +245,16 @@ pub enum SurfaceError {
     ToolResultWrongTarget,
     #[error("tool/result surface replacement may change only model-facing result content")]
     ToolResultChangedIdentity,
+    #[error("surface token accounting exceeded its bounded integer domain")]
+    TokenAccountingOverflow,
+    #[error("surface tool calls and results do not form balanced positional groups")]
+    UnbalancedToolSurface,
+    #[error("shadowed token count is {actual}, but the selected surface costs {expected}")]
+    ShadowedTokenCountMismatch { expected: u64, actual: u64 },
+    #[error(
+        "compaction replacement costs {replacement} tokens and does not shrink the {shadowed}-token range"
+    )]
+    CompactionDoesNotShrink { shadowed: u64, replacement: u64 },
     #[error("compaction checkpoint replacement does not exactly match its summary claim")]
     CompactionReplacementMismatch,
     #[error("compaction/prune must target one current tool/result node")]
