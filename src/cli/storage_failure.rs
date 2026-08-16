@@ -67,6 +67,7 @@ fn from_append(error: &AppendError) -> StoreError {
         AppendError::DurableRecord
         | AppendError::DurableEventLimit { .. }
         | AppendError::DurableByteLimit { .. }
+        | AppendError::DurableResidentLimit { .. }
         | AppendError::EventLimit { .. }
         | AppendError::RetainedJsonLimit { .. }
         | AppendError::ReservedEventLimit { .. }
@@ -116,6 +117,7 @@ mod tests {
             AppendError::DurableRecord,
             AppendError::DurableEventLimit { maximum: 1 },
             AppendError::DurableByteLimit { maximum: 1 },
+            AppendError::DurableResidentLimit { maximum: 1 },
         ] {
             assert_eq!(
                 from_agent(&AgentLoopError::Session(append)),

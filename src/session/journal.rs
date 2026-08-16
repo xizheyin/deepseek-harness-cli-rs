@@ -11,6 +11,8 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::resident_credit::{ChargedBytes, ResidentCreditLease, ResidentCreditPool};
+
 use super::journal_row::{JournalRowLocator, RawRowHasher};
 
 const COMMAND_CAPACITY: usize = 1;
@@ -84,6 +86,7 @@ impl JournalInbox {
 struct Flight {
     kind: FlightKind,
     ack: oneshot::Receiver<Result<JournalCursor, JournalError>>,
+    _credit: Option<ResidentCreditLease>,
 }
 
 struct ReadFlight {
@@ -99,8 +102,8 @@ enum ReadCommandError {
 }
 
 enum PendingWrite {
-    Ordinary(Vec<u8>),
-    PrunePrefix { bytes: Vec<u8>, rows: usize },
+    Ordinary(ChargedBytes),
+    PrunePrefix { bytes: ChargedBytes, rows: usize },
 }
 
 impl PendingWrite {
@@ -166,15 +169,19 @@ impl<E: Send + 'static> DeferredWriter<E> {
         })
     }
 
-    pub(super) async fn wait_ready(&mut self) -> Result<Result<JournalWriter, E>, JournalError> {
+    pub(super) async fn wait_ready(
+        &mut self,
+        resident_pool: ResidentCreditPool,
+    ) -> Result<Result<JournalWriter, E>, JournalError> {
         let startup = self.startup.as_mut().ok_or(JournalError::WriterStopped)?;
         let result = startup.await.map_err(|_| JournalError::WriterStopped);
         self.startup = None;
         match result {
-            Ok(Ok(cursor)) => Ok(Ok(JournalWriter::from_running(
+            Ok(Ok(cursor)) => Ok(Ok(JournalWriter::from_running_with_pool(
                 self.sender.take().ok_or(JournalError::WriterStopped)?,
                 self.join.take().ok_or(JournalError::WriterStopped)?,
                 cursor,
+                resident_pool,
             ))),
             Ok(Err(error)) => {
                 self.sender.take();
@@ -217,6 +224,8 @@ pub(crate) struct JournalWriter {
     poisoned: bool,
     finished: bool,
     finish_error: Option<JournalError>,
+    #[cfg(test)]
+    resident_pool: ResidentCreditPool,
 }
 
 impl std::fmt::Debug for JournalWriter {
@@ -242,21 +251,39 @@ impl JournalWriter {
             .name("dsh-session-journal".to_owned())
             .spawn(move || writer_main(file, durable_offset, receiver))
             .map_err(|_| JournalError::WriterStopped)?;
-        Ok(Self::from_running(
+        Ok(Self::from_running_with_pool(
             sender,
             join,
             JournalCursor {
                 physical_offset: durable_offset,
                 durable_offset,
             },
+            ResidentCreditPool::for_durable_session(),
         ))
     }
 
+    #[cfg(test)]
     fn from_running(
         sender: mpsc::Sender<Command>,
         join: thread::JoinHandle<()>,
         cursor: JournalCursor,
     ) -> Self {
+        Self::from_running_with_pool(
+            sender,
+            join,
+            cursor,
+            ResidentCreditPool::for_durable_session(),
+        )
+    }
+
+    fn from_running_with_pool(
+        sender: mpsc::Sender<Command>,
+        join: thread::JoinHandle<()>,
+        cursor: JournalCursor,
+        resident_pool: ResidentCreditPool,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = resident_pool;
         Self {
             sender: Some(sender),
             pending: None,
@@ -267,6 +294,8 @@ impl JournalWriter {
             poisoned: false,
             finished: false,
             finish_error: None,
+            #[cfg(test)]
+            resident_pool,
         }
     }
 
@@ -274,21 +303,27 @@ impl JournalWriter {
         handoff: JournalHandoff,
         join: thread::JoinHandle<()>,
         cursor: JournalCursor,
+        resident_pool: ResidentCreditPool,
     ) -> Self {
-        Self::from_running(handoff.sender, join, cursor)
+        Self::from_running_with_pool(handoff.sender, join, cursor, resident_pool)
+    }
+
+    #[cfg(test)]
+    pub(super) fn resident_pool(&self) -> ResidentCreditPool {
+        self.resident_pool.clone()
     }
 
     /// Move an already bounded command into owner state before any await.
-    pub(crate) fn stage(&mut self, bytes: Vec<u8>) -> Result<(), JournalError> {
+    pub(super) fn stage(&mut self, bytes: ChargedBytes) -> Result<(), JournalError> {
         self.ensure_stageable()?;
         self.pending = Some(PendingWrite::Ordinary(bytes));
         Ok(())
     }
 
     /// Stage one already validated marker-only or marker/replacement prefix.
-    pub(crate) fn stage_prune_prefix(
+    pub(super) fn stage_prune_prefix(
         &mut self,
-        bytes: Vec<u8>,
+        bytes: ChargedBytes,
         rows: usize,
     ) -> Result<(), JournalError> {
         self.ensure_stageable()?;
@@ -299,6 +334,24 @@ impl JournalWriter {
         }
         self.pending = Some(PendingWrite::PrunePrefix { bytes, rows });
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn stage_bytes_for_test(&mut self, bytes: Vec<u8>) -> Result<(), JournalError> {
+        let bytes = ChargedBytes::try_new(bytes, &self.resident_pool)
+            .map_err(|_| JournalError::Poisoned)?;
+        self.stage(bytes)
+    }
+
+    #[cfg(test)]
+    fn stage_prune_prefix_bytes_for_test(
+        &mut self,
+        bytes: Vec<u8>,
+        rows: usize,
+    ) -> Result<(), JournalError> {
+        let bytes = ChargedBytes::try_new(bytes, &self.resident_pool)
+            .map_err(|_| JournalError::Poisoned)?;
+        self.stage_prune_prefix(bytes, rows)
     }
 
     pub(crate) fn ensure_stageable(&self) -> Result<(), JournalError> {
@@ -343,15 +396,21 @@ impl JournalWriter {
         let pending = self.pending.take().ok_or(JournalError::NothingStaged)?;
         let kind = pending.kind();
         let (ack, receiver) = oneshot::channel();
-        permit.send(match pending {
-            PendingWrite::Ordinary(bytes) => Command::Append { bytes, ack },
-            PendingWrite::PrunePrefix { bytes, rows } => {
-                Command::AppendPrunePrefix { bytes, rows, ack }
+        let (command, credit) = match pending {
+            PendingWrite::Ordinary(bytes) => {
+                let (bytes, credit) = bytes.into_parts();
+                (Command::Append { bytes, ack }, credit)
             }
-        });
+            PendingWrite::PrunePrefix { bytes, rows } => {
+                let (bytes, credit) = bytes.into_parts();
+                (Command::AppendPrunePrefix { bytes, rows, ack }, credit)
+            }
+        };
+        permit.send(command);
         self.flight = Some(Flight {
             kind,
             ack: receiver,
+            _credit: Some(credit),
         });
         self.settle_flight().await
     }
@@ -512,6 +571,7 @@ impl JournalWriter {
         self.flight = Some(Flight {
             kind,
             ack: receiver,
+            _credit: None,
         });
         self.settle_flight().await
     }
@@ -659,6 +719,7 @@ fn writer_main(mut file: File, initial_offset: u64, mut receiver: mpsc::Receiver
                         poisoned = true;
                     })
                 };
+                drop(bytes);
                 let _ = ack.send(result);
             }
             Command::AppendPrunePrefix { bytes, rows, ack } => {
@@ -670,6 +731,7 @@ fn writer_main(mut file: File, initial_offset: u64, mut receiver: mpsc::Receiver
                         poisoned = true;
                     })
                 };
+                drop(bytes);
                 let _ = ack.send(result);
             }
             Command::Barrier { ack } => {
@@ -913,6 +975,7 @@ mod tests {
         ContentBlock, ContentBlockType, FinishReason, FiniteNumber, LlmCallConfig, LlmFailure,
         Message, MessageSource, NonNegativeSafeInteger, StreamChunk, TokenUsage,
     };
+    use crate::resident_credit::ChargedBytes;
     use crate::session::projection::{Projection, ValidationPolicy};
     use crate::session::{
         AppendError, AttemptDisposition, BarrierError, ClaimedAppend, Clock, ClockError,
@@ -933,7 +996,7 @@ mod tests {
     async fn append_advances_physical_and_barrier_advances_durable() {
         let (path, file) = test_file("journal-cursors");
         let mut writer = JournalWriter::start(file, 0).unwrap();
-        writer.stage(b"one\n".to_vec()).unwrap();
+        writer.stage_bytes_for_test(b"one\n".to_vec()).unwrap();
         let written = writer.flush_staged().await.unwrap();
         assert_eq!((written.physical_offset, written.durable_offset), (4, 0));
         let durable = writer.barrier().await.unwrap();
@@ -955,7 +1018,7 @@ mod tests {
         let mut writer = JournalWriter::start(file, 0).unwrap();
         let row = b"{\"type\":\"session/end-seed\"}\n".to_vec();
         let locator = JournalRowLocator::new(EventSeq::new(0).unwrap(), 0, &row).unwrap();
-        writer.stage(row.clone()).unwrap();
+        writer.stage_bytes_for_test(row.clone()).unwrap();
         assert_eq!(writer.flush_staged().await.unwrap().durable_offset, 0);
         assert_eq!(
             writer
@@ -964,7 +1027,7 @@ mod tests {
                 .unwrap(),
             row
         );
-        writer.stage(b"next\n".to_vec()).unwrap();
+        writer.stage_bytes_for_test(b"next\n".to_vec()).unwrap();
         let cursor = writer.flush_staged().await.unwrap();
         assert_eq!(cursor.physical_offset, locator.end().unwrap() + 5);
         writer.finish().await.unwrap();
@@ -1063,11 +1126,11 @@ mod tests {
         let (path, file) = test_file("journal-invalid-prune-prefix");
         let mut writer = JournalWriter::start(file, 0).unwrap();
         assert_eq!(
-            writer.stage_prune_prefix(b"\n".to_vec(), 1),
+            writer.stage_prune_prefix_bytes_for_test(b"\n".to_vec(), 1),
             Err(JournalError::Poisoned)
         );
         assert_eq!(
-            writer.stage(b"later\n".to_vec()),
+            writer.stage_bytes_for_test(b"later\n".to_vec()),
             Err(JournalError::Poisoned)
         );
         assert_eq!(writer.barrier().await, Err(JournalError::Poisoned));
@@ -1836,7 +1899,7 @@ mod tests {
             Err(JournalReadError::Cancelled)
         );
         assert!(writer.read_flight.is_none());
-        writer.stage(b"later\n".to_vec()).unwrap();
+        writer.stage_bytes_for_test(b"later\n".to_vec()).unwrap();
         assert_eq!(writer.barrier().await.unwrap().durable_offset, offset + 6);
         writer.finish().await.unwrap();
         std::fs::remove_file(path).unwrap();
@@ -2655,7 +2718,7 @@ mod tests {
             release,
             counts,
         } = gated_writer(&path, FlightKind::Append);
-        writer.stage(vec![b'x'; 64 * 1024]).unwrap();
+        writer.stage_bytes_for_test(vec![b'x'; 64 * 1024]).unwrap();
         {
             let mut wait = Box::pin(writer.flush_staged());
             poll_fn(|context| match wait.as_mut().poll(context) {
@@ -2674,6 +2737,81 @@ mod tests {
         writer.finish().await.unwrap();
         assert_eq!(counts.append.load(Ordering::SeqCst), 1);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_flight_keeps_its_resident_credit_until_settled() {
+        let (path, file) = test_file("journal-flight-resident-credit");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::Append);
+        let pool = writer.resident_pool();
+        let bytes = ChargedBytes::try_new(b"charged\n".to_vec(), &pool).unwrap();
+        writer.stage(bytes).unwrap();
+        let charged = pool.used_for_test();
+        assert!(charged > 0);
+
+        {
+            let mut flush = Box::pin(writer.flush_staged());
+            poll_fn(|context| match flush.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("flush unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::Append
+        );
+        assert_eq!(pool.used_for_test(), charged);
+
+        release.send(()).unwrap();
+        writer.settle_before_stage().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        writer.finish().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_prune_prefix_flight_keeps_its_resident_credit_until_settled() {
+        let (path, file) = test_file("journal-prune-flight-resident-credit");
+        drop(file);
+        let GatedWriter {
+            mut writer,
+            arrived,
+            release,
+            ..
+        } = gated_writer(&path, FlightKind::PrunePrefix);
+        let pool = writer.resident_pool();
+        let bytes = ChargedBytes::try_new(b"marker\nreplacement\n".to_vec(), &pool).unwrap();
+        writer.stage_prune_prefix(bytes, 2).unwrap();
+        let charged = pool.used_for_test();
+        assert!(charged > 0);
+
+        {
+            let mut flush = Box::pin(writer.flush_staged());
+            poll_fn(|context| match flush.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!("flush unexpectedly completed: {result:?}"),
+            })
+            .await;
+        }
+        assert_eq!(
+            arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
+            FlightKind::PrunePrefix
+        );
+        assert_eq!(pool.used_for_test(), charged);
+
+        release.send(()).unwrap();
+        writer.settle_before_stage().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        writer.finish().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"marker\nreplacement\n");
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2770,6 +2908,111 @@ mod tests {
         let event: serde_json::Value = serde_json::from_slice(second_line).unwrap();
         assert_eq!(event["type"], "step/start");
         assert_eq!(event["data"]["turn"], 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resident_row_limit_is_exact_and_fails_before_clock_or_session_commit() {
+        let event = NewEvent::log(EventKind::turn_start(TurnId::new(1).unwrap()));
+
+        let (probe_path, probe_file) = test_file("session-resident-row-probe");
+        let probe_writer = JournalWriter::start(probe_file, 0).unwrap();
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let mut probe = Session::new_active_for_test(
+            "session-resident-row-probe",
+            CountingClock(Arc::clone(&probe_calls)),
+            probe_writer,
+        )
+        .unwrap();
+        let probe_pool = probe.set_resident_limit_for_test(32 * 1024 * 1024);
+        probe.append_settled(event.clone()).await.unwrap();
+        let exact = probe_pool.used_for_test();
+        assert!(exact > 0);
+        probe.flush_barrier().await.unwrap();
+        assert_eq!(probe_pool.used_for_test(), 0);
+        probe.shutdown().await.unwrap();
+        std::fs::remove_file(probe_path).unwrap();
+
+        let (exact_path, exact_file) = test_file("session-resident-row-exact");
+        let exact_writer = JournalWriter::start(exact_file, 0).unwrap();
+        let exact_calls = Arc::new(AtomicUsize::new(0));
+        let mut exact_session = Session::new_active_for_test(
+            "session-resident-row-exact",
+            CountingClock(Arc::clone(&exact_calls)),
+            exact_writer,
+        )
+        .unwrap();
+        let exact_pool = exact_session.set_resident_limit_for_test(exact);
+        exact_session.append_settled(event.clone()).await.unwrap();
+        assert_eq!(exact_pool.used_for_test(), exact);
+        exact_session.flush_barrier().await.unwrap();
+        assert_eq!(exact_pool.used_for_test(), 0);
+        exact_session.shutdown().await.unwrap();
+        std::fs::remove_file(exact_path).unwrap();
+
+        let (over_path, over_file) = test_file("session-resident-row-one-over");
+        let over_writer = JournalWriter::start(over_file, 0).unwrap();
+        let over_calls = Arc::new(AtomicUsize::new(0));
+        let mut over = Session::new_active_for_test(
+            "session-resident-row-one-over",
+            CountingClock(Arc::clone(&over_calls)),
+            over_writer,
+        )
+        .unwrap();
+        let over_pool = over.set_resident_limit_for_test(exact - 1);
+        let calls_before = over_calls.load(Ordering::SeqCst);
+        let next_before = over.next_seq();
+        let error = over.append_settled(event).await.unwrap_err();
+        assert_eq!(
+            error,
+            AppendError::DurableResidentLimit { maximum: exact - 1 }
+        );
+        assert_eq!(over_calls.load(Ordering::SeqCst), calls_before);
+        assert_eq!(over.next_seq(), next_before);
+        assert_eq!(over.logical_event_count(), 0);
+        assert_eq!(over_pool.used_for_test(), 0);
+        over.shutdown().await.unwrap();
+        assert_eq!(std::fs::metadata(&over_path).unwrap().len(), 0);
+        std::fs::remove_file(over_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clock_failure_releases_the_charged_row_without_hiding_batch_capacity() {
+        let (path, file) = test_file("session-resident-row-clock-failure");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let mut session = Session::new_active_for_test(
+            "session-resident-row-clock-failure",
+            clock.clone(),
+            writer,
+        )
+        .unwrap();
+        let pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let event = NewEvent::log(EventKind::turn_start(TurnId::new(1).unwrap()));
+        let next_before = session.next_seq();
+        clock.fail_after(0);
+
+        assert!(matches!(
+            session.append_settled(event.clone()).await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(session.next_seq(), next_before);
+        assert_eq!(session.logical_event_count(), 0);
+        assert_eq!(pool.used_for_test(), 0);
+
+        session.append_settled(event).await.unwrap();
+        assert!(pool.used_for_test() > 0);
+        session.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), 0);
+        session.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read(&path)
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .filter(|row| !row.is_empty())
+                .count(),
+            1
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2929,7 +3172,7 @@ mod tests {
             release,
             counts,
         } = gated_writer(&path, FlightKind::Barrier);
-        writer.stage(b"fact\n".to_vec()).unwrap();
+        writer.stage_bytes_for_test(b"fact\n".to_vec()).unwrap();
         assert_eq!(writer.flush_staged().await.unwrap().durable_offset, 0);
         {
             let mut barrier = Box::pin(writer.barrier());

@@ -1634,6 +1634,7 @@ fn memory_event_budgets_and_durable_session_limits_are_distinct() {
         AppendError::DurableRecord,
         AppendError::DurableEventLimit { maximum: 1 },
         AppendError::DurableByteLimit { maximum: 1 },
+        AppendError::DurableResidentLimit { maximum: 1 },
     ];
     for error in &durable {
         assert!(!super::is_memory_budget_error(error));

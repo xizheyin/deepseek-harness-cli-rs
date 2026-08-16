@@ -324,6 +324,8 @@ pub enum AppendError {
     DurableEventLimit { maximum: u64 },
     #[error("the durable session reached its ordinary limit of {maximum} journal bytes")]
     DurableByteLimit { maximum: u64 },
+    #[error("the durable session reached its resident-memory limit of {maximum} bytes")]
+    DurableResidentLimit { maximum: usize },
     #[error(transparent)]
     Clock(#[from] ClockError),
     #[error(transparent)]

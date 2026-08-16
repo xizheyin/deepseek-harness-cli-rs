@@ -67,15 +67,18 @@ pub(crate) use tool_result_pruner::{
     ValidatedRawRow,
 };
 
-use crate::model::{JsonValue, Message, NonNegativeSafeInteger, StreamChunk};
+use crate::{
+    model::{JsonValue, Message, NonNegativeSafeInteger, StreamChunk},
+    resident_credit::{ChargedBytes, ChargedBytesError, ResidentCreditPool},
+};
 
 use self::{
     codec::decode_snapshot,
     journal::{JournalError, JournalReadError, MAX_PRUNE_PREFIX_BYTES},
     journal_row::JournalRowLocator,
     jsonl::{
-        DurableTimestamp, EventLineTemplate, MAX_JOURNAL_EVENT_LINE_BYTES,
-        prepared_event_line_upper_bound,
+        ChargedEventLineError, ChargedEventLineTemplate, DurableTimestamp,
+        MAX_JOURNAL_EVENT_LINE_BYTES, prepared_event_line_upper_bound,
     },
     projection::{PreparedDurableProjection, Projection, ValidationPolicy},
     store::{DeferredJournal, SessionStorage},
@@ -95,7 +98,7 @@ const MAX_DURABLE_LOGICAL_EVENTS: u64 = 1_000_000;
 const DURABLE_REPAIR_RESERVED_EVENTS: u64 = 68;
 
 struct PendingDurableBatch {
-    bytes: Vec<u8>,
+    bytes: Option<ChargedBytes>,
     event_count: usize,
     state: PendingDurableBatchState,
 }
@@ -118,7 +121,7 @@ enum PendingDurableBatchState {
 impl Default for PendingDurableBatch {
     fn default() -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: None,
             event_count: 0,
             state: PendingDurableBatchState::Empty,
         }
@@ -518,6 +521,7 @@ pub struct Session {
     next_attempt_nonce: u64,
     active_attempt: Option<ActiveAttemptOwner>,
     barrier_epoch: u64,
+    resident_pool: Option<ResidentCreditPool>,
     mode: SessionMode,
 }
 
@@ -552,6 +556,7 @@ impl Session {
             next_attempt_nonce: 1,
             active_attempt: None,
             barrier_epoch: 0,
+            resident_pool: None,
             mode: SessionMode::Memory {
                 events: Vec::new(),
                 retained_json_bytes,
@@ -565,6 +570,7 @@ impl Session {
         journal: DeferredJournal,
         header_bytes: u64,
     ) -> Self {
+        let resident_pool = journal.resident_pool();
         let projection =
             Projection::for_session(ValidationPolicy::DurableStrict, header.id().clone());
         Self {
@@ -581,6 +587,7 @@ impl Session {
             next_attempt_nonce: 1,
             active_attempt: None,
             barrier_epoch: 0,
+            resident_pool: Some(resident_pool),
             mode: SessionMode::Durable {
                 storage: SessionStorage::Deferred(journal),
                 logical_event_count: 0,
@@ -604,6 +611,7 @@ impl Session {
         let header = SessionHeader::new(id, created_at)?;
         let projection =
             Projection::for_session(ValidationPolicy::DurableStrict, header.id().clone());
+        let resident_pool = writer.resident_pool();
         Ok(Self {
             header,
             next_seq: EventSeq::from_index(0),
@@ -618,6 +626,7 @@ impl Session {
             next_attempt_nonce: 1,
             active_attempt: None,
             barrier_epoch: 0,
+            resident_pool: Some(resident_pool),
             mode: SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 logical_event_count: 0,
@@ -654,6 +663,7 @@ impl Session {
             next_attempt_nonce: 1,
             active_attempt: None,
             barrier_epoch: 0,
+            resident_pool: None,
             mode: SessionMode::Memory {
                 events: seed.to_vec(),
                 retained_json_bytes,
@@ -668,10 +678,11 @@ impl Session {
         Ok(session)
     }
 
-    pub(crate) fn new_recovered(
+    pub(in crate::session) fn new_recovered(
         seed: recovery::RecoveredSeed,
         clock: Box<dyn Clock>,
         writer: journal::JournalWriter,
+        resident_pool: ResidentCreditPool,
     ) -> Self {
         Self {
             header: seed.header,
@@ -687,6 +698,7 @@ impl Session {
             next_attempt_nonce: 1,
             active_attempt: None,
             barrier_epoch: 0,
+            resident_pool: Some(resident_pool),
             mode: SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 logical_event_count: seed.logical_event_count,
@@ -1159,6 +1171,7 @@ impl Session {
                         if !stageable
                             || pending_batch.event_count != 0
                             || pending_batch.state != PendingDurableBatchState::Empty
+                            || pending_batch.bytes.is_some()
                         {
                             return DurableAppendAttempt::NeedsStorageSettle(
                                 PendingDurableOperation {
@@ -1176,6 +1189,7 @@ impl Session {
                         if !stageable
                             || pending_batch.event_count != 0
                             || pending_batch.state != PendingDurableBatchState::Empty
+                            || pending_batch.bytes.is_none()
                         {
                             return DurableAppendAttempt::Failed(AppendError::NeedsAppendSettle);
                         }
@@ -1190,6 +1204,7 @@ impl Session {
                     }) => {
                         if !stageable
                             || pending_batch.event_count != 1
+                            || pending_batch.bytes.is_none()
                             || pending_batch.state
                                 != (PendingDurableBatchState::PruneMarker {
                                     target: *target,
@@ -1266,9 +1281,23 @@ impl Session {
             | EventKind::ToolResult { message, .. } => Some(message.clone()),
             _ => None,
         };
-        let row_template = match EventLineTemplate::new(&event) {
+        let resident_pool = match self.resident_pool.as_ref() {
+            Some(pool) => pool,
+            None => return DurableAppendAttempt::Failed(AppendError::DurablePoisoned),
+        };
+        let row_template = match ChargedEventLineTemplate::new(&event, resident_pool) {
             Ok(template) => template,
-            Err(_) => return DurableAppendAttempt::Failed(AppendError::DurableRecord),
+            Err(ChargedEventLineError::Resident(error)) => {
+                return DurableAppendAttempt::Failed(AppendError::DurableResidentLimit {
+                    maximum: error.maximum(),
+                });
+            }
+            Err(ChargedEventLineError::Capacity) => {
+                return DurableAppendAttempt::Failed(AppendError::Capacity);
+            }
+            Err(ChargedEventLineError::Encode) => {
+                return DurableAppendAttempt::Failed(AppendError::DurableRecord);
+            }
         };
         let row_template_len = row_template.encoded_len();
         let row_bytes = match u64::try_from(row_template_len) {
@@ -1279,7 +1308,6 @@ impl Session {
         let (next_accepted_upper_bound, row_offset) = match &mut self.mode {
             SessionMode::Durable {
                 accepted_journal_bytes,
-                pending_batch,
                 ..
             } => {
                 let Some(next) = accepted_journal_bytes.checked_add(row_bytes) else {
@@ -1294,13 +1322,6 @@ impl Session {
                     return DurableAppendAttempt::Failed(AppendError::DurableByteLimit {
                         maximum: ordinary_byte_max,
                     });
-                }
-                if pending_batch
-                    .bytes
-                    .try_reserve_exact(row_template_len)
-                    .is_err()
-                {
-                    return DurableAppendAttempt::Failed(AppendError::Capacity);
                 }
                 (next, *accepted_journal_bytes)
             }
@@ -1424,7 +1445,30 @@ impl Session {
                 disposition: AttemptDisposition::ContextOverflow,
             };
         }
-        pending_batch.bytes.extend_from_slice(&row);
+        match next_batch_state {
+            PendingDurableBatchState::Ordinary => {
+                if pending_batch.bytes.is_some() {
+                    *storage = SessionStorage::Failed(StoreError::Poisoned);
+                    return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+                }
+                pending_batch.bytes = Some(row);
+            }
+            PendingDurableBatchState::PruneMarker { .. }
+            | PendingDurableBatchState::PrunePair { .. } => {
+                let Some(pair) = pending_batch.bytes.as_mut() else {
+                    *storage = SessionStorage::Failed(StoreError::Poisoned);
+                    return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+                };
+                if !pair.extend_from_slice_in_place(&row) {
+                    *storage = SessionStorage::Failed(StoreError::Poisoned);
+                    return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+                }
+            }
+            PendingDurableBatchState::Empty => {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            }
+        }
         pending_batch.event_count += 1;
         pending_batch.state = next_batch_state;
         *logical_event_count = next_logical_event_count;
@@ -1472,13 +1516,13 @@ impl Session {
             SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 ..
-            } => match match batch.state {
-                PendingDurableBatchState::Ordinary => writer.stage(batch.bytes),
-                PendingDurableBatchState::PruneMarker { .. }
-                | PendingDurableBatchState::PrunePair { .. } => {
-                    writer.stage_prune_prefix(batch.bytes, batch.event_count)
+            } => match match (batch.state, batch.bytes) {
+                (PendingDurableBatchState::Ordinary, Some(bytes)) => writer.stage(bytes),
+                (PendingDurableBatchState::PruneMarker { .. }, Some(bytes))
+                | (PendingDurableBatchState::PrunePair { .. }, Some(bytes)) => {
+                    writer.stage_prune_prefix(bytes, batch.event_count)
                 }
-                PendingDurableBatchState::Empty => Err(JournalError::Poisoned),
+                (PendingDurableBatchState::Empty, _) | (_, None) => Err(JournalError::Poisoned),
             } {
                 Ok(()) => writer.flush_staged().await,
                 Err(error) => Err(error),
@@ -2202,7 +2246,7 @@ impl Session {
         else {
             panic!("the quota test seam requires an idle active durable session");
         };
-        assert!(pending_batch.bytes.is_empty());
+        assert!(pending_batch.bytes.is_none());
         assert_eq!(pending_batch.event_count, 0);
         assert!(pending_operation.is_none());
         *logical_event_count = ordinary_max - remaining_events;
@@ -2222,10 +2266,30 @@ impl Session {
         else {
             panic!("the quota test seam requires an idle active durable session");
         };
-        assert!(pending_batch.bytes.is_empty());
+        assert!(pending_batch.bytes.is_none());
         assert_eq!(pending_batch.event_count, 0);
         assert!(pending_operation.is_none());
         *accepted_journal_bytes = ordinary_max - remaining_bytes;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resident_limit_for_test(&mut self, maximum: usize) -> ResidentCreditPool {
+        let SessionMode::Durable {
+            storage: SessionStorage::Active(writer),
+            pending_batch,
+            pending_operation,
+            ..
+        } = &mut self.mode
+        else {
+            panic!("the resident-limit seam requires an idle active durable session");
+        };
+        assert!(writer.ensure_stageable().is_ok());
+        assert_eq!(pending_batch.event_count, 0);
+        assert!(pending_batch.bytes.is_none());
+        assert!(pending_operation.is_none());
+        let pool = ResidentCreditPool::with_limit_for_test(maximum);
+        self.resident_pool = Some(pool.clone());
+        pool
     }
 
     /// Number of events supplied through construction before this lifecycle began.
@@ -3290,6 +3354,12 @@ impl SessionReservation<'_> {
             .checked_add(replacement_upper)
             .ok_or(AppendError::Capacity)?;
         let pair_capacity = usize::try_from(pair_upper).map_err(|_| AppendError::Capacity)?;
+        let resident_pool = self
+            .session
+            .resident_pool
+            .as_ref()
+            .cloned()
+            .ok_or(AppendError::DurablePoisoned)?;
         let replacement_seq = self
             .session
             .next_seq
@@ -3335,10 +3405,16 @@ impl SessionReservation<'_> {
             }
             .into());
         }
-        pending_batch
-            .bytes
-            .try_reserve_exact(pair_capacity)
-            .map_err(|_| AppendError::Capacity)?;
+        let pair_bytes =
+            ChargedBytes::try_with_capacity(pair_capacity, &resident_pool).map_err(|error| {
+                match error {
+                    ChargedBytesError::Limit(error) => AppendError::DurableResidentLimit {
+                        maximum: error.maximum(),
+                    },
+                    ChargedBytesError::Capacity => AppendError::Capacity,
+                }
+            })?;
+        pending_batch.bytes = Some(pair_bytes);
 
         let marker_owner = match overflow_attempt {
             Some(token) => DurableOperationOwner::OverflowPruneMarker {
@@ -3357,8 +3433,24 @@ impl SessionReservation<'_> {
         };
         let marker = match self.session.try_commit_durable(marker_operation) {
             DurableAppendAttempt::Committed(receipt) => receipt,
-            DurableAppendAttempt::Failed(error) => return Err(error.into()),
+            DurableAppendAttempt::Failed(error) => {
+                if let SessionMode::Durable { pending_batch, .. } = &mut self.session.mode {
+                    if pending_batch.event_count == 0
+                        && pending_batch.state == PendingDurableBatchState::Empty
+                    {
+                        pending_batch.bytes = None;
+                    }
+                }
+                return Err(error.into());
+            }
             DurableAppendAttempt::NeedsStorageSettle(_) => {
+                if let SessionMode::Durable { pending_batch, .. } = &mut self.session.mode {
+                    if pending_batch.event_count == 0
+                        && pending_batch.state == PendingDurableBatchState::Empty
+                    {
+                        pending_batch.bytes = None;
+                    }
+                }
                 return Err(AppendError::NeedsAppendSettle.into());
             }
         };

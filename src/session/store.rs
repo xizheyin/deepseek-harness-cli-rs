@@ -10,7 +10,10 @@ use std::{
 use cap_std::fs::Dir;
 use thiserror::Error;
 
-use crate::workspace_authority::{WorkspaceAuthority, WorkspaceIdentity};
+use crate::{
+    resident_credit::ResidentCreditPool,
+    workspace_authority::{WorkspaceAuthority, WorkspaceIdentity},
+};
 
 use super::{
     Clock, MAX_SAFE_INTEGER, SESSION_FORMAT_VERSION, Session, SessionHeader, SessionId, UnixMillis,
@@ -247,6 +250,7 @@ impl std::fmt::Debug for SessionStorage {
 pub(super) struct DeferredJournal {
     plan: Option<MaterializePlan>,
     startup: Option<DeferredWriter<StoreError>>,
+    resident_pool: ResidentCreditPool,
 }
 
 impl DeferredJournal {
@@ -254,7 +258,12 @@ impl DeferredJournal {
         Self {
             plan: Some(plan),
             startup: None,
+            resident_pool: ResidentCreditPool::for_durable_session(),
         }
+    }
+
+    pub(super) fn resident_pool(&self) -> ResidentCreditPool {
+        self.resident_pool.clone()
     }
 
     pub(super) async fn wait_ready(&mut self) -> Result<JournalWriter, StoreError> {
@@ -267,7 +276,7 @@ impl DeferredJournal {
             .startup
             .as_mut()
             .ok_or(StoreError::WriterStopped)?
-            .wait_ready()
+            .wait_ready(self.resident_pool.clone())
             .await
             .map_err(StoreError::from)?;
         self.startup.take();

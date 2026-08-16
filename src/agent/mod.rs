@@ -4132,6 +4132,7 @@ fn is_durable_session_limit(error: &AppendError) -> bool {
         AppendError::DurableRecord
             | AppendError::DurableEventLimit { .. }
             | AppendError::DurableByteLimit { .. }
+            | AppendError::DurableResidentLimit { .. }
     )
 }
 

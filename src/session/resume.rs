@@ -15,7 +15,7 @@ use std::{
 use cap_std::fs::Dir;
 use tokio::sync::oneshot;
 
-use crate::workspace_authority::WorkspaceAuthority;
+use crate::{resident_credit::ResidentCreditPool, workspace_authority::WorkspaceAuthority};
 
 use super::{
     Clock, EventSeq, Session, SessionId, StoreError, UnixMillis,
@@ -120,6 +120,7 @@ struct CommittedParts {
     workspace: WorkspaceAuthority,
     handoff: JournalHandoff,
     cursor: JournalCursor,
+    resident_pool: ResidentCreditPool,
 }
 
 struct LockedResume {
@@ -128,6 +129,7 @@ struct LockedResume {
     file: Option<File>,
     workspace: Option<WorkspaceAuthority>,
     prepared: PreparedWork,
+    resident_pool: ResidentCreditPool,
 }
 
 struct PreparedWork {
@@ -159,6 +161,7 @@ pub(super) fn begin(
         return Err(StoreError::Io);
     }
     let cancel = Arc::new(AtomicBool::new(false));
+    let resident_pool = ResidentCreditPool::for_durable_session();
     let worker_cancel = Arc::clone(&cancel);
     let (control, commands) = mpsc::sync_channel(RESUME_COMMAND_CAPACITY);
     let (ready_ack, ready) = oneshot::channel();
@@ -173,6 +176,7 @@ pub(super) fn begin(
                 asserted_workspace,
                 recovery_time,
                 worker_cancel,
+                resident_pool,
                 ready_ack,
                 commands,
             );
@@ -298,8 +302,14 @@ impl PreparedSession {
         core.exit.take();
         let join = core.join.take().ok_or(StoreError::WriterStopped)?;
         let clock = core.clock.take().ok_or(StoreError::WriterStopped)?;
-        let writer = JournalWriter::from_handoff(committed.handoff, join, committed.cursor);
-        let session = Session::new_recovered(committed.seed, clock, writer);
+        let resident_pool = committed.resident_pool;
+        let writer = JournalWriter::from_handoff(
+            committed.handoff,
+            join,
+            committed.cursor,
+            resident_pool.clone(),
+        );
+        let session = Session::new_recovered(committed.seed, clock, writer, resident_pool);
         Ok(RecoveredSession {
             session,
             workspace: committed.workspace,
@@ -358,6 +368,7 @@ impl PreparedSession {
             committed.handoff,
             join,
             committed.cursor,
+            committed.resident_pool,
         ));
         Ok(())
     }
@@ -371,6 +382,7 @@ fn resume_worker(
     asserted_workspace: Option<PathBuf>,
     recovery_time: UnixMillis,
     cancel: Arc<AtomicBool>,
+    resident_pool: ResidentCreditPool,
     ready_ack: oneshot::Sender<Result<RecoveryReport, StoreError>>,
     commands: mpsc::Receiver<ResumeCommand>,
 ) {
@@ -381,6 +393,7 @@ fn resume_worker(
         asserted_workspace,
         recovery_time,
         cancel.as_ref(),
+        resident_pool,
     ) {
         Ok(locked) => locked,
         Err(error) => {
@@ -414,6 +427,7 @@ fn prepare_locked(
     asserted_workspace: Option<PathBuf>,
     recovery_time: UnixMillis,
     cancel: &AtomicBool,
+    resident_pool: ResidentCreditPool,
 ) -> Result<LockedResume, StoreError> {
     let root = root_plan.open_for_listing()?.ok_or(StoreError::NotFound)?;
     let mut file = open_and_lock(root.as_ref(), &filename)?;
@@ -439,6 +453,7 @@ fn prepare_locked(
         file: Some(file),
         workspace: Some(workspace.ok_or(StoreError::WorkspaceMismatch)?),
         prepared,
+        resident_pool,
     })
 }
 
@@ -499,6 +514,7 @@ fn commit_locked(
             workspace,
             handoff,
             cursor,
+            resident_pool: locked.resident_pool,
         },
         file,
         inbox,

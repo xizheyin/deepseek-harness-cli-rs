@@ -5,6 +5,10 @@ use std::io;
 use serde::ser::{SerializeMap as _, Serializer as _};
 use thiserror::Error;
 
+use crate::resident_credit::{
+    ChargedBytes, ChargedBytesError, ResidentCreditLimit, ResidentCreditPool,
+};
+
 use super::{MAX_SAFE_INTEGER, PreparedEvent, SessionEvent, SessionHeader};
 
 const MAX_TIMESTAMP_DIGITS: &[u8] = b"9007199254740991";
@@ -24,13 +28,26 @@ pub(crate) enum JsonlEncodeError {
     EventTooLarge,
     #[error("the session record could not be encoded")]
     Encode(#[from] serde_json::Error),
+    #[cfg(test)]
     #[error("the session event timestamp field could not be located")]
     TimestampTemplate,
 }
 
+#[cfg(test)]
 pub(crate) struct EventLineTemplate {
     bytes: Vec<u8>,
     timestamp_start: usize,
+}
+
+pub(crate) struct ChargedEventLineTemplate {
+    bytes: ChargedBytes,
+    timestamp_start: usize,
+}
+
+pub(crate) enum ChargedEventLineError {
+    Encode,
+    Resident(ResidentCreditLimit),
+    Capacity,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +59,7 @@ impl DurableTimestamp {
     }
 }
 
+#[cfg(test)]
 impl EventLineTemplate {
     pub(crate) fn new(event: &SessionEvent) -> Result<Self, JsonlEncodeError> {
         let bytes = encode_event_line(event)?;
@@ -57,34 +75,95 @@ impl EventLineTemplate {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(mut self, timestamp: DurableTimestamp) -> Vec<u8> {
-        let mut value = timestamp.0;
-        let mut digits = [0_u8; MAX_TIMESTAMP_DIGITS.len()];
-        let mut start = digits.len();
-        loop {
-            start -= 1;
-            digits[start] = decimal_digit(value % 10);
-            value /= 10;
-            if value == 0 {
-                break;
-            }
+        let new_len = replace_timestamp(&mut self.bytes, self.timestamp_start, timestamp);
+        self.bytes.truncate(new_len);
+        self.bytes
+    }
+}
+
+impl ChargedEventLineTemplate {
+    /// Count first, acquire resident credit, then encode directly into the one
+    /// buffer that becomes the pending journal row.
+    pub(crate) fn new(
+        event: &SessionEvent,
+        pool: &ResidentCreditPool,
+    ) -> Result<Self, ChargedEventLineError> {
+        let mut counter = CountingWriter::default();
+        serde_json::to_writer(&mut counter, event)
+            .map_err(JsonlEncodeError::Encode)
+            .map_err(|_| ChargedEventLineError::Encode)?;
+        if counter.overflowed || counter.bytes >= MAX_JOURNAL_EVENT_LINE_BYTES {
+            return Err(ChargedEventLineError::Encode);
         }
-        let actual = &digits[start..];
-        let old_end = self.timestamp_start + MAX_TIMESTAMP_DIGITS.len();
-        self.bytes[self.timestamp_start..self.timestamp_start + actual.len()]
-            .copy_from_slice(actual);
-        if actual.len() < MAX_TIMESTAMP_DIGITS.len() {
-            let new_end = self.timestamp_start + actual.len();
-            let old_len = self.bytes.len();
-            self.bytes.copy_within(old_end..old_len, new_end);
-            self.bytes
-                .truncate(old_len - (MAX_TIMESTAMP_DIGITS.len() - actual.len()));
+        let complete = counter
+            .bytes
+            .checked_add(1)
+            .ok_or(ChargedEventLineError::Capacity)?;
+        let mut bytes =
+            ChargedBytes::try_with_capacity(complete, pool).map_err(|error| match error {
+                ChargedBytesError::Limit(error) => ChargedEventLineError::Resident(error),
+                ChargedBytesError::Capacity => ChargedEventLineError::Capacity,
+            })?;
+        serde_json::to_writer(&mut bytes, event)
+            .map_err(JsonlEncodeError::Encode)
+            .map_err(|_| ChargedEventLineError::Encode)?;
+        if !bytes.push_in_place(b'\n') || bytes.len() != complete {
+            return Err(ChargedEventLineError::Capacity);
         }
+        let timestamp_start = timestamp_start(&bytes).ok_or(ChargedEventLineError::Encode)?;
+        Ok(Self {
+            bytes,
+            timestamp_start,
+        })
+    }
+
+    pub(crate) fn finish(mut self, timestamp: DurableTimestamp) -> ChargedBytes {
+        let new_len = replace_timestamp(self.bytes.as_mut_slice(), self.timestamp_start, timestamp);
+        self.bytes.truncate(new_len);
         self.bytes
     }
 
     pub(crate) fn encoded_len(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+fn timestamp_start(bytes: &[u8]) -> Option<usize> {
+    let marker = b"\"time\":9007199254740991";
+    bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|marker_start| marker_start + b"\"time\":".len())
+}
+
+fn replace_timestamp(
+    bytes: &mut [u8],
+    timestamp_start: usize,
+    timestamp: DurableTimestamp,
+) -> usize {
+    let mut value = timestamp.0;
+    let mut digits = [0_u8; MAX_TIMESTAMP_DIGITS.len()];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = decimal_digit(value % 10);
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let actual = &digits[start..];
+    let old_end = timestamp_start + MAX_TIMESTAMP_DIGITS.len();
+    bytes[timestamp_start..timestamp_start + actual.len()].copy_from_slice(actual);
+    if actual.len() < MAX_TIMESTAMP_DIGITS.len() {
+        let new_end = timestamp_start + actual.len();
+        let old_len = bytes.len();
+        bytes.copy_within(old_end..old_len, new_end);
+        old_len - (MAX_TIMESTAMP_DIGITS.len() - actual.len())
+    } else {
+        bytes.len()
     }
 }
 
