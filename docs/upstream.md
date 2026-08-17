@@ -1074,9 +1074,21 @@ the stream. A plugin-defined block-type string is charged before Clock and is
 rolled back with a rejected chunk; committed bookkeeping remains Session-owned
 through seal, closure, barrier, and explicit attempt retirement. Provider/model
 route facts share the immutable request config instead of duplicating strings.
-Typed `EventKind` allocations, attempt model payload/raw-to-surface handoff,
-cold-recovery work, and complete closure payload headroom are not charged yet,
-so the complete shared 32 MiB invariant, pressure trigger, summary
+The final `Message` of a hot durable token-owned committed assistant append now
+receives a Session-local surface lease after semantic validation and before any
+pending wait or Clock call. The authoritative charged-assistant subset has a
+separate 64 MiB steady gate; its physical lease pool is 128 MiB so old and
+candidate surfaces may coexist. Projection, receipt, outcome, and request clones
+share that wrapper lease, while every new durable node gets a fresh conservative
+lease. A dropped wait remains Session-owned, and a claim-aware Clock rejection
+restores that same leased candidate without reacquiring it; an ordinary
+non-claim Clock rejection discards the candidate and releases its lease. This
+remains a narrow substrate: memory-mode and cold-recovered messages are
+deliberately unleased, and pre-closure model values, token-usage anchors, other
+surface event types, containers/replacements, typed `EventKind` allocations,
+cold-recovery work, and complete closure payload headroom are not charged yet.
+Consequently
+the complete shared 32/64/96/192 MiB invariants, pressure trigger, summary
 dispatch/checkpoint construction, and Agent-level context-overflow interception
 and replay remain later Phase 8 slices.
 

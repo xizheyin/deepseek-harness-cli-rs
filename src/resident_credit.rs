@@ -13,6 +13,17 @@ use std::{
 /// Product limit shared by one durable attempt and its pending journal data.
 pub(super) const MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES: usize = 32 * 1024 * 1024;
 
+/// Authoritative charged allocation retained by one model-visible surface.
+pub(super) const MAX_RESIDENT_SURFACE_STEADY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Old and candidate surfaces may coexist while one replacement is prepared.
+pub(super) const MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES: usize =
+    2 * MAX_RESIDENT_SURFACE_STEADY_BYTES;
+
+/// Complete old-plus-candidate validation-index high-water.
+#[cfg(test)]
+pub(super) const MAX_VALIDATION_INDEX_HIGH_WATER_BYTES: usize = 192 * 1024 * 1024;
+
 // The counter is deliberately conservative and deterministic instead of
 // depending on allocator-specific usable-size APIs. Every non-empty backing
 // allocation pays one fixed header and is rounded to a common heap alignment.
@@ -65,6 +76,10 @@ impl ResidentCreditPool {
         Self::with_limit(MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES)
     }
 
+    pub(super) fn for_surface() -> Self {
+        Self::with_limit(MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES)
+    }
+
     fn with_limit(limit: usize) -> Self {
         Self {
             inner: Arc::new(ResidentCreditPoolInner {
@@ -105,6 +120,11 @@ impl ResidentCreditPool {
 impl ResidentCreditLease {
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn belongs_to(&self, pool: &ResidentCreditPool) -> bool {
+        Arc::ptr_eq(&self.pool, &pool.inner)
     }
 
     /// Split already charged ownership without changing the pool total.
@@ -351,8 +371,10 @@ fn round_up(value: usize, align: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChargedBytes, ResidentCreditPool, arc_inner_charge, byte_buffer_charge,
-        hash_table_backing_charge, string_backing_charge, vec_backing_charge,
+        ChargedBytes, MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES, MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES,
+        MAX_RESIDENT_SURFACE_STEADY_BYTES, MAX_VALIDATION_INDEX_HIGH_WATER_BYTES,
+        ResidentCreditPool, arc_inner_charge, byte_buffer_charge, hash_table_backing_charge,
+        string_backing_charge, vec_backing_charge,
     };
 
     #[test]
@@ -398,6 +420,29 @@ mod tests {
                 .is_some_and(|charge| charge > 4_000 * std::mem::size_of::<(u64, u64)>())
         );
         assert_eq!(hash_table_backing_charge::<u64>(usize::MAX), None);
+    }
+
+    #[test]
+    fn surface_limits_are_separate_and_keep_the_frozen_high_water_relation() {
+        assert_eq!(MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_RESIDENT_SURFACE_STEADY_BYTES, 64 * 1024 * 1024);
+        assert_eq!(
+            MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES,
+            2 * MAX_RESIDENT_SURFACE_STEADY_BYTES
+        );
+        assert_eq!(
+            MAX_VALIDATION_INDEX_HIGH_WATER_BYTES,
+            MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES + 64 * 1024 * 1024
+        );
+
+        let attempt = ResidentCreditPool::for_durable_session();
+        let surface = ResidentCreditPool::for_surface();
+        let attempt_lease = attempt.try_acquire(1).unwrap();
+        let surface_lease = surface.try_acquire(1).unwrap();
+        assert!(attempt_lease.belongs_to(&attempt));
+        assert!(!attempt_lease.belongs_to(&surface));
+        assert!(surface_lease.belongs_to(&surface));
+        assert!(!surface_lease.belongs_to(&attempt));
     }
 
     #[test]

@@ -319,6 +319,7 @@ pub(crate) struct Projection {
     boundary: Boundary,
     surface_nodes: Arc<Vec<SurfaceNode>>,
     surface_tokens: u64,
+    surface_resident_bytes: usize,
     request_header: Option<Arc<super::EpochHeader>>,
     request_header_seq: Option<EventSeq>,
     request_context: Option<super::RequestContext>,
@@ -503,6 +504,7 @@ impl Projection {
             boundary: Boundary::Idle,
             surface_nodes: Arc::new(Vec::new()),
             surface_tokens: 0,
+            surface_resident_bytes: 0,
             request_header: None,
             request_header_seq: None,
             request_context: None,
@@ -990,6 +992,10 @@ impl Projection {
 
     pub(crate) fn surface_generation(&self) -> u64 {
         self.compaction.surface_generation
+    }
+
+    pub(crate) fn surface_resident_bytes(&self) -> usize {
+        self.surface_resident_bytes
     }
 
     pub(crate) fn context_total_tokens(&self) -> Result<u64, SurfaceError> {
@@ -2317,12 +2323,22 @@ impl Projection {
         match operation {
             SurfaceOp::Append(_) => {
                 let node = Self::surface_node(event, row_binding)?;
+                let resident_bytes = node
+                    .message
+                    .as_ref()
+                    .and_then(Message::charged_surface_bytes)
+                    .unwrap_or(0);
                 let surface_tokens = self
                     .surface_tokens
                     .checked_add(node.estimated_tokens)
                     .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                let surface_resident_bytes = self
+                    .surface_resident_bytes
+                    .checked_add(resident_bytes)
+                    .ok_or(SurfaceError::ResidentAccountingOverflow)?;
                 Arc::make_mut(&mut self.surface_nodes).push(node);
                 self.surface_tokens = surface_tokens;
+                self.surface_resident_bytes = surface_resident_bytes;
             }
             SurfaceOp::Replace(replacement) => {
                 let start_index = self
@@ -2352,16 +2368,39 @@ impl Projection {
                     self.validate_tool_result_rewrite(event, shadowed)?;
                 }
                 let node = Self::surface_node(event, row_binding)?;
+                let resident_bytes = node
+                    .message
+                    .as_ref()
+                    .and_then(Message::charged_surface_bytes)
+                    .unwrap_or(0);
                 let removed_tokens = shadowed.iter().try_fold(0_u64, |total, shadowed| {
                     total.checked_add(shadowed.estimated_tokens)
                 });
+                let removed_resident_bytes =
+                    shadowed.iter().try_fold(0_usize, |total, shadowed| {
+                        total.checked_add(
+                            shadowed
+                                .message
+                                .as_ref()
+                                .and_then(Message::charged_surface_bytes)
+                                .unwrap_or(0),
+                        )
+                    });
                 let surface_tokens = self
                     .surface_tokens
                     .checked_sub(removed_tokens.ok_or(SurfaceError::TokenAccountingOverflow)?)
                     .and_then(|total| total.checked_add(node.estimated_tokens))
                     .ok_or(SurfaceError::TokenAccountingOverflow)?;
+                let surface_resident_bytes = self
+                    .surface_resident_bytes
+                    .checked_sub(
+                        removed_resident_bytes.ok_or(SurfaceError::ResidentAccountingOverflow)?,
+                    )
+                    .and_then(|total| total.checked_add(resident_bytes))
+                    .ok_or(SurfaceError::ResidentAccountingOverflow)?;
                 Arc::make_mut(&mut self.surface_nodes).splice(start_index..=end_index, [node]);
                 self.surface_tokens = surface_tokens;
+                self.surface_resident_bytes = surface_resident_bytes;
             }
         }
         Ok(())

@@ -1505,6 +1505,14 @@ mod tests {
             .unwrap();
         reservation.flush_barrier().await.unwrap();
         assert_eq!(reservation.session().context_total_tokens().unwrap(), 44);
+        let hot_messages = reservation.session().messages();
+        assert!(
+            hot_messages
+                .last()
+                .is_some_and(|message| message.charged_surface_bytes().is_some())
+        );
+        assert!(reservation.session().surface_resident_bytes_for_test() > 0);
+        drop(hot_messages);
         drop(reservation);
 
         let bytes = std::fs::read(&path).unwrap();
@@ -1520,6 +1528,12 @@ mod tests {
             cold.apply_scanned_event(&event).unwrap();
         }
         assert_eq!(cold.context_total_tokens().unwrap(), 44);
+        assert_eq!(cold.surface_resident_bytes(), 0);
+        assert!(
+            cold.messages()
+                .last()
+                .is_some_and(|message| message.charged_surface_bytes().is_none())
+        );
 
         session.shutdown().await.unwrap();
         std::fs::remove_file(path).unwrap();
@@ -2163,6 +2177,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_attempt_surface_credit_has_separate_steady_and_high_water_limits() {
+        async fn run_rejected_case(label: &str, high_water: usize, steady: usize, expected: usize) {
+            let (path, file) = test_file(label);
+            let writer = JournalWriter::start(file, 0).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let clock = CountingClock(Arc::clone(&calls));
+            let (mut session, turn, step) =
+                attempt_ready_session_with_clock(label, clock, writer).await;
+            let surface_pool = session.set_surface_resident_limits_for_test(high_water, steady);
+            let block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+            let mut reservation = session.reservation();
+            let token = reservation.begin_attempt(turn, step).unwrap();
+            for chunk in [
+                StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+                StreamChunk::block_end(0, block).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ] {
+                reservation
+                    .append_attempt_chunk_settled(&token, chunk)
+                    .await
+                    .unwrap();
+            }
+            reservation.flush_barrier().await.unwrap();
+            let closure =
+                finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+            let before_seq = reservation.session().next_seq();
+            let before_clock = calls.load(Ordering::SeqCst);
+
+            assert!(matches!(
+                reservation
+                    .append_attempt_closure_settled(
+                        &token,
+                        AttemptDisposition::Committed,
+                        closure,
+                    )
+                    .await,
+                Err(AppendError::DurableResidentLimit { maximum }) if maximum == expected
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), before_clock);
+            assert_eq!(reservation.session().next_seq(), before_seq);
+            assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+            assert_eq!(surface_pool.used_for_test(), 0);
+
+            reservation
+                .append_attempt_closure_settled(
+                    &token,
+                    AttemptDisposition::Failed,
+                    NewEvent::log(EventKind::step_end(turn, step)),
+                )
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            reservation.retire_attempt(&token).unwrap();
+            reservation
+                .append_settled(NewEvent::log(EventKind::turn_end(
+                    turn,
+                    TurnEndReason::Error {
+                        error: LlmFailure::new("surface limit", "SURFACE_LIMIT").unwrap(),
+                    },
+                )))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            drop(reservation);
+            session.shutdown().await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let probe_block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+        let probe =
+            Message::assistant("assistant", vec![probe_block], "mock", "mock-model").unwrap();
+        let charge = probe.surface_credit_bytes();
+        assert!(charge > 1);
+
+        run_rejected_case(
+            "attempt-surface-steady-one-over",
+            charge * 2,
+            charge - 1,
+            charge - 1,
+        )
+        .await;
+        run_rejected_case(
+            "attempt-surface-high-water-one-over",
+            charge - 1,
+            charge,
+            charge - 1,
+        )
+        .await;
+
+        let (path, file) = test_file("attempt-surface-exact");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-surface-exact", writer).await;
+        let attempt_pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let surface_pool = session.set_surface_resident_limits_for_test(charge, charge);
+        let block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, block).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        assert_eq!(surface_pool.used_for_test(), charge);
+        assert_eq!(
+            reservation.session().surface_resident_bytes_for_test(),
+            charge
+        );
+        let visible = reservation.session().messages();
+        assert_eq!(visible.len(), 1);
+        let committed = receipt.committed_message().unwrap();
+        assert!(committed.shares_payload_with(&visible[0]));
+        assert!(committed.shares_surface_credit_with(&visible[0]));
+
+        assert!(reservation.retire_attempt(&token).is_err());
+        reservation.flush_barrier().await.unwrap();
+        assert!(attempt_pool.used_for_test() > 0);
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(attempt_pool.used_for_test(), 0);
+        assert_eq!(surface_pool.used_for_test(), charge);
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(visible);
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(session);
+        assert_eq!(surface_pool.used_for_test(), charge);
+        drop(receipt);
+        assert_eq!(surface_pool.used_for_test(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_nonclaim_clock_rejection_releases_the_uncommitted_surface_credit() {
+        let (path, file) = test_file("attempt-surface-clock-rejection");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, step) = attempt_ready_session_with_clock(
+            "attempt-surface-clock-rejection",
+            clock.clone(),
+            writer,
+        )
+        .await;
+        let block = ContentBlock::text("surface payload".repeat(64)).unwrap();
+        let charge = Message::assistant("assistant", vec![block.clone()], "mock", "mock-model")
+            .unwrap()
+            .surface_credit_bytes();
+        let surface_pool = session.set_surface_resident_limits_for_test(charge, charge);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, block).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let before_seq = reservation.session().next_seq();
+        clock.fail_after(0);
+
+        assert!(matches!(
+            reservation
+                .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure,)
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(reservation.session().next_seq(), before_seq);
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        assert_eq!(surface_pool.used_for_test(), 0);
+
+        reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Failed,
+                NewEvent::log(EventKind::step_end(turn, step)),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Error {
+                    error: LlmFailure::new("clock failed", "CLOCK_FAILED").unwrap(),
+                },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn ordinary_durable_admission_rejects_all_attempt_rows() {
         let (path, file) = test_file("attempt-ordinary-bypass");
         let writer = JournalWriter::start(file, 0).unwrap();
@@ -2359,6 +2595,79 @@ mod tests {
                 TurnEndReason::Error {
                     error: LlmFailure::new("attempt stopped", "ATTEMPT_FAILED").unwrap(),
                 },
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_memory_attempt_commits_an_unleased_assistant_message() {
+        let mut session =
+            Session::with_clock("attempt-memory-surface-unleased", SystemClock).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::RequestHeader {
+                header: EpochHeader {
+                    config: LlmCallConfig::new("mock", "mock-model").unwrap(),
+                    adapter_defaults: None,
+                    system: None,
+                    tools: None,
+                },
+                reason: RequestHeaderReason::Initial,
+            }))
+            .unwrap();
+
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, ContentBlock::text("memory assistant").unwrap()).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        assert!(
+            receipt
+                .committed_message()
+                .is_some_and(|message| message.charged_surface_bytes().is_none())
+        );
+        assert!(
+            reservation
+                .session()
+                .messages()
+                .last()
+                .is_some_and(|message| message.charged_surface_bytes().is_none())
+        );
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
             )))
             .await
             .unwrap();
@@ -2642,6 +2951,11 @@ mod tests {
         let (path, file) = test_file("attempt-claim-drop");
         let writer = JournalWriter::start(file, 0).unwrap();
         let (mut session, turn, step) = attempt_ready_session("attempt-claim-drop", writer).await;
+        let surface_charge = Message::assistant("assistant", Vec::new(), "mock", "mock-model")
+            .unwrap()
+            .surface_credit_bytes();
+        let surface_pool =
+            session.set_surface_resident_limits_for_test(surface_charge, surface_charge);
 
         let old_storage = match &mut session.mode {
             SessionMode::Durable { storage, .. } => {
@@ -2688,11 +3002,13 @@ mod tests {
             })
             .await;
         }
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
         assert_eq!(
             arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
             FlightKind::Append
         );
         release.send(()).unwrap();
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
         assert_eq!(
             reservation.flush_barrier().await,
             Err(BarrierError::Append(AppendError::NeedsAppendSettle))
@@ -2707,6 +3023,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(surface_pool.used_for_test(), 0);
         reservation.flush_barrier().await.unwrap();
         reservation.retire_attempt(&token).unwrap();
         assert_eq!(
@@ -2764,6 +3081,11 @@ mod tests {
         let (path, file) = test_file("attempt-closure-drop");
         let writer = JournalWriter::start(file, 0).unwrap();
         let (mut session, turn, step) = attempt_ready_session("attempt-closure-drop", writer).await;
+        let surface_charge = Message::assistant("assistant", Vec::new(), "mock", "mock-model")
+            .unwrap()
+            .surface_credit_bytes();
+        let surface_pool =
+            session.set_surface_resident_limits_for_test(surface_charge, surface_charge);
 
         let old_storage = match &mut session.mode {
             SessionMode::Durable { storage, .. } => {
@@ -2811,11 +3133,13 @@ mod tests {
             })
             .await;
         }
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
         assert_eq!(
             arrived.recv_timeout(Duration::from_secs(1)).unwrap(),
             FlightKind::Append
         );
         release.send(()).unwrap();
+        assert_eq!(surface_pool.used_for_test(), surface_charge);
         let invalid_replacement = reservation
             .append_attempt_closure_settled(
                 &token,
@@ -2843,6 +3167,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(mismatch, AppendError::NeedsAppendSettle);
         reservation.flush_barrier().await.unwrap();
+        assert_eq!(surface_pool.used_for_test(), 0);
         reservation.retire_attempt(&token).unwrap();
         assert_eq!(counts.append.load(Ordering::SeqCst), 2);
         assert_eq!(counts.barrier.load(Ordering::SeqCst), 1);
@@ -2936,7 +3261,14 @@ mod tests {
     async fn an_attempt_disposition_cannot_close_with_an_unrelated_event() {
         let (path, file) = test_file("attempt-closure-kind");
         let writer = JournalWriter::start(file, 0).unwrap();
-        let (mut session, turn, step) = attempt_ready_session("attempt-closure-kind", writer).await;
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let (mut session, turn, step) = attempt_ready_session_with_clock(
+            "attempt-closure-kind",
+            CountingClock(Arc::clone(&clock_calls)),
+            writer,
+        )
+        .await;
+        let surface_pool = session.set_surface_resident_limits_for_test(1024 * 1024, 1024 * 1024);
         let mut reservation = session.reservation();
         let token = reservation.begin_attempt(turn, step).unwrap();
         reservation
@@ -2949,6 +3281,7 @@ mod tests {
         let prepared = reservation.seal_attempt(&token).unwrap();
         let closure = finish_only_assistant(turn, step, prepared);
         let before = reservation.session().next_seq();
+        let before_clock = clock_calls.load(Ordering::SeqCst);
         let error = reservation
             .append_attempt_closure_settled(
                 &token,
@@ -2964,6 +3297,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, AppendError::Validation(_)));
         assert_eq!(reservation.session().next_seq(), before);
+        assert_eq!(clock_calls.load(Ordering::SeqCst), before_clock);
+        assert_eq!(surface_pool.used_for_test(), 0);
         reservation
             .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
             .await
@@ -4256,6 +4591,13 @@ mod tests {
             .unwrap();
         session.flush_barrier().await.unwrap();
 
+        let empty_surface_charge =
+            Message::assistant("assistant", Vec::new(), "mock", "mock-model")
+                .unwrap()
+                .surface_credit_bytes();
+        let surface_pool = session
+            .set_surface_resident_limits_for_test(empty_surface_charge, empty_surface_charge);
+
         let mut reservation = session.reservation();
         let token = reservation.begin_attempt(turn, step).unwrap();
         reservation
@@ -4280,11 +4622,17 @@ mod tests {
                 .await,
             Err(AppendError::Clock(_))
         ));
+        assert_eq!(surface_pool.used_for_test(), empty_surface_charge);
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
         assert!(reservation.retire_attempt(&token).is_err());
-        reservation
+        let receipt = reservation
             .settle_attempt_closure_exact_settled(&mut claim, &token, AttemptDisposition::Committed)
             .await
             .unwrap();
+        assert_eq!(surface_pool.used_for_test(), empty_surface_charge);
+        assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        drop(receipt);
+        assert_eq!(surface_pool.used_for_test(), 0);
         reservation.flush_barrier().await.unwrap();
         reservation.retire_attempt(&token).unwrap();
         reservation

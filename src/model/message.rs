@@ -5,12 +5,18 @@ use std::{fmt, sync::Arc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
-use crate::json_value::deserialize_present_option;
+use crate::{
+    json_value::deserialize_present_option,
+    resident_credit::{
+        ResidentCreditLease, ResidentCreditLimit, ResidentCreditPool, arc_inner_charge,
+        string_backing_charge, vec_backing_charge,
+    },
+};
 
 use super::{
     AttachmentId, CallId, JsonValue, MAX_MESSAGE_CONTENT_BLOCKS, MessageId, ModelError,
-    NonNegativeSafeInteger, object, optional_json, optional_string, optional_typed,
-    required_string, shape,
+    NonNegativeSafeInteger, ResidentStringId, object, optional_json, optional_string,
+    optional_typed, required_string, shape,
 };
 
 /// Raster image formats accepted by the canonical attachment reference.
@@ -97,6 +103,14 @@ impl ImageAttachmentRef {
     #[must_use]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    fn resident_backing_bytes(&self) -> Option<usize> {
+        string_backing_charge(self.attachment_id.resident_string_capacity())?.checked_add(
+            self.name
+                .as_ref()
+                .map_or(Some(0), |name| string_backing_charge(name.capacity()))?,
+        )
     }
 }
 
@@ -231,7 +245,33 @@ impl ContentBlock {
         )
     }
 
-    #[cfg(test)]
+    fn resident_bytes(&self) -> Option<usize> {
+        let kind = match &self.inner.kind {
+            ContentBlockKind::Text { text } | ContentBlockKind::Reasoning { text } => {
+                string_backing_charge(text.capacity())?
+            }
+            ContentBlockKind::Image { attachment } => attachment.resident_backing_bytes()?,
+            ContentBlockKind::ToolCall {
+                id,
+                name,
+                arguments,
+            } => string_backing_charge(id.resident_string_capacity())?
+                .checked_add(string_backing_charge(name.capacity())?)
+                .and_then(|bytes| {
+                    bytes.checked_add(string_backing_charge(arguments.capacity())?)
+                })?,
+            ContentBlockKind::ToolResult { tool_call_id, .. } => {
+                string_backing_charge(tool_call_id.resident_string_capacity())?
+            }
+            ContentBlockKind::Other { block_type } => block_type
+                .as_ref()
+                .map_or(Some(0), |value| string_backing_charge(value.capacity()))?,
+        };
+        arc_inner_charge::<ContentBlockInner>()?
+            .checked_add(self.inner.raw.resident_bytes())?
+            .checked_add(kind)
+    }
+
     pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -421,6 +461,51 @@ impl MessageSource {
     pub fn raw(&self) -> &JsonValue {
         &self.raw
     }
+
+    fn resident_bytes(&self) -> Option<usize> {
+        let kind = match &self.kind {
+            MessageSourceKind::User => 0,
+            MessageSourceKind::Plugin {
+                plugin,
+                sections,
+                summary,
+                ..
+            } => {
+                let mut bytes = string_backing_charge(plugin.capacity())?;
+                if let Some(sections) = sections {
+                    bytes = bytes.checked_add(vec_backing_charge::<ContextSnapshotSection>(
+                        sections.capacity(),
+                    )?)?;
+                    for section in sections {
+                        bytes = bytes
+                            .checked_add(string_backing_charge(section.name.capacity())?)?
+                            .checked_add(string_backing_charge(section.text.capacity())?)?;
+                    }
+                }
+                if let Some(summary) = summary {
+                    bytes = bytes.checked_add(string_backing_charge(summary.capacity())?)?;
+                }
+                bytes
+            }
+            MessageSourceKind::Model {
+                provider,
+                model,
+                replay_state,
+            } => {
+                let mut bytes = string_backing_charge(provider.capacity())?
+                    .checked_add(string_backing_charge(model.capacity())?)?;
+                if let Some(replay_state) = replay_state {
+                    bytes = bytes.checked_add(replay_state.resident_bytes())?;
+                }
+                bytes
+            }
+            MessageSourceKind::Tool { call_id } => {
+                string_backing_charge(call_id.resident_string_capacity())?
+            }
+            MessageSourceKind::Other { kind } => string_backing_charge(kind.capacity())?,
+        };
+        self.raw.resident_bytes().checked_add(kind)
+    }
 }
 
 impl Serialize for MessageSource {
@@ -450,16 +535,42 @@ impl<'de> Deserialize<'de> for MessageSource {
 #[derive(Clone)]
 pub struct Message {
     inner: Arc<MessageInner>,
+    surface_credit: Option<Arc<ResidentCreditLease>>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
 struct MessageInner {
     id: MessageId,
     role: MessageRole,
     content: Vec<ContentBlock>,
     source: MessageSource,
     raw: JsonValue,
+    resident_bytes: usize,
 }
+
+impl fmt::Debug for MessageInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MessageInner")
+            .field("id", &self.id)
+            .field("role", &self.role)
+            .field("content", &self.content)
+            .field("source", &self.source)
+            .field("raw", &self.raw)
+            .finish()
+    }
+}
+
+impl PartialEq for MessageInner {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.role == other.role
+            && self.content == other.content
+            && self.source == other.source
+            && self.raw == other.raw
+    }
+}
+
+impl Eq for MessageInner {}
 
 impl std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -599,6 +710,8 @@ impl Message {
         source: MessageSource,
         raw: JsonValue,
     ) -> Self {
+        let resident_bytes =
+            message_resident_bytes(&id, &content, content.capacity(), &source, &raw);
         Self {
             inner: Arc::new(MessageInner {
                 id,
@@ -606,7 +719,9 @@ impl Message {
                 content,
                 source,
                 raw,
+                resident_bytes,
             }),
+            surface_credit: None,
         }
     }
 
@@ -638,6 +753,46 @@ impl Message {
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
         &self.inner.raw
+    }
+
+    /// Complete immutable payload graph retained by this Message wrapper.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.inner.resident_bytes
+    }
+
+    pub(crate) fn surface_credit_bytes(&self) -> usize {
+        self.resident_bytes()
+            .checked_add(arc_inner_charge::<ResidentCreditLease>().unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Charge this Session's surface owner while sharing the immutable payload.
+    pub(crate) fn try_with_new_surface_credit(
+        &self,
+        pool: &ResidentCreditPool,
+    ) -> Result<Self, ResidentCreditLimit> {
+        let credit = Arc::new(pool.try_acquire(self.surface_credit_bytes())?);
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            surface_credit: Some(credit),
+        })
+    }
+
+    pub(crate) fn charged_surface_bytes(&self) -> Option<usize> {
+        self.surface_credit.as_ref().map(|credit| credit.bytes())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_payload_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_surface_credit_with(&self, other: &Self) -> bool {
+        match (&self.surface_credit, &other.surface_credit) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (Some(_), None) | (None, Some(_)) | (None, None) => false,
+        }
     }
 
     pub(crate) fn validate_tool_result(&self) -> Result<&CallId, ModelError> {
@@ -699,6 +854,32 @@ impl Message {
         }
         Ok(())
     }
+}
+
+fn message_resident_bytes(
+    id: &MessageId,
+    content: &[ContentBlock],
+    content_capacity: usize,
+    source: &MessageSource,
+    raw: &JsonValue,
+) -> usize {
+    let charge = (|| {
+        let mut bytes = arc_inner_charge::<MessageInner>()?
+            .checked_add(string_backing_charge(id.resident_string_capacity())?)?
+            .checked_add(vec_backing_charge::<ContentBlock>(content_capacity)?)?;
+        for (index, block) in content.iter().enumerate() {
+            if content[..index]
+                .iter()
+                .any(|prior| prior.shares_allocation_with(block))
+            {
+                continue;
+            }
+            bytes = bytes.checked_add(block.resident_bytes()?)?;
+        }
+        bytes = bytes.checked_add(source.resident_bytes()?)?;
+        bytes.checked_add(raw.resident_bytes())
+    })();
+    charge.unwrap_or(usize::MAX)
 }
 
 impl Serialize for Message {
@@ -859,6 +1040,15 @@ fn parse_message_source(value: &Value) -> Result<MessageSourceKind, ModelError> 
 mod tests {
     use std::sync::Arc;
 
+    use serde_json::json;
+
+    use crate::{
+        model::ResidentStringId,
+        resident_credit::{
+            ResidentCreditPool, arc_inner_charge, string_backing_charge, vec_backing_charge,
+        },
+    };
+
     use super::{ContentBlock, Message, MessageSource};
 
     #[test]
@@ -890,5 +1080,134 @@ mod tests {
             serde_json::to_value(&block).unwrap(),
             serde_json::to_value(&cloned).unwrap()
         );
+    }
+
+    #[test]
+    fn message_resident_charge_covers_typed_raw_and_shared_block_allocations() {
+        let block =
+            ContentBlock::tool_call("call-1", "search", "{\"query\":\"resident ownership\"}")
+                .unwrap();
+        let source = MessageSource::model_with_replay_state(
+            "mock",
+            "model",
+            Some(super::JsonValue::new(json!({ "cursor": [1, 2, 3] })).unwrap()),
+        )
+        .unwrap();
+        let message = Message::new(
+            "message-1",
+            super::MessageRole::Assistant,
+            vec![block.clone(), block],
+            source,
+        )
+        .unwrap();
+
+        let expected = arc_inner_charge::<super::MessageInner>()
+            .unwrap()
+            .checked_add(
+                string_backing_charge(message.inner.id.resident_string_capacity()).unwrap(),
+            )
+            .unwrap()
+            .checked_add(
+                vec_backing_charge::<ContentBlock>(message.inner.content.capacity()).unwrap(),
+            )
+            .unwrap()
+            .checked_add(message.inner.content[0].resident_bytes().unwrap())
+            .unwrap()
+            .checked_add(message.inner.source.resident_bytes().unwrap())
+            .unwrap()
+            .checked_add(message.inner.raw.resident_bytes())
+            .unwrap();
+        assert_eq!(message.resident_bytes(), expected);
+        assert!(message.resident_bytes() > message.source().raw().resident_bytes());
+        assert!(
+            message.resident_bytes()
+                > message.content()[0]
+                    .raw()
+                    .resident_bytes()
+                    .saturating_mul(2)
+        );
+    }
+
+    #[test]
+    fn surface_credit_is_session_local_and_shallow_clones_share_one_lease() {
+        let message = Message::assistant(
+            "message-1",
+            vec![ContentBlock::text("payload".repeat(256)).unwrap()],
+            "mock",
+            "model",
+        )
+        .unwrap();
+        let charge = message
+            .resident_bytes()
+            .checked_add(arc_inner_charge::<super::ResidentCreditLease>().unwrap())
+            .unwrap();
+        let first_pool = ResidentCreditPool::with_limit_for_test(charge * 2);
+        let charged = message.try_with_new_surface_credit(&first_pool).unwrap();
+        let cloned = charged.clone();
+        let second_node = charged.try_with_new_surface_credit(&first_pool).unwrap();
+
+        assert!(message.shares_payload_with(&charged));
+        assert!(charged.shares_payload_with(&cloned));
+        assert!(charged.shares_payload_with(&second_node));
+        assert!(charged.shares_surface_credit_with(&cloned));
+        assert!(!charged.shares_surface_credit_with(&second_node));
+        assert_eq!(charged.charged_surface_bytes(), Some(charge));
+        assert_eq!(first_pool.used_for_test(), charge * 2);
+        assert!(!message.shares_surface_credit_with(&message.clone()));
+        assert!(message.try_with_new_surface_credit(&first_pool).is_err());
+
+        let second_pool = ResidentCreditPool::with_limit_for_test(charge);
+        let second = charged.try_with_new_surface_credit(&second_pool).unwrap();
+        assert!(charged.shares_payload_with(&second));
+        assert!(!charged.shares_surface_credit_with(&second));
+        assert_eq!(first_pool.used_for_test(), charge * 2);
+        assert_eq!(second_pool.used_for_test(), charge);
+
+        drop(charged);
+        assert_eq!(first_pool.used_for_test(), charge * 2);
+        drop(cloned);
+        assert_eq!(first_pool.used_for_test(), charge);
+        drop(second_node);
+        assert_eq!(first_pool.used_for_test(), 0);
+        drop(second);
+        assert_eq!(second_pool.used_for_test(), 0);
+    }
+
+    #[test]
+    fn resident_capacity_and_surface_credit_do_not_change_message_semantics() {
+        let compact = Message::assistant(
+            "message-1",
+            vec![ContentBlock::text("same text").unwrap()],
+            "mock",
+            "model",
+        )
+        .unwrap();
+        let mut roomy_text = String::with_capacity(4096);
+        roomy_text.push_str("same text");
+        let mut roomy_id = String::with_capacity(4096);
+        roomy_id.push_str("message-1");
+        let roomy = Message::assistant(
+            roomy_id,
+            vec![ContentBlock::text(roomy_text).unwrap()],
+            "mock",
+            "model",
+        )
+        .unwrap();
+        assert_eq!(compact, roomy);
+        assert_eq!(format!("{compact:?}"), format!("{roomy:?}"));
+        assert_eq!(
+            serde_json::to_value(&compact).unwrap(),
+            serde_json::to_value(&roomy).unwrap()
+        );
+        assert!(roomy.resident_bytes() > compact.resident_bytes());
+
+        let charge = roomy.surface_credit_bytes();
+        let pool = ResidentCreditPool::with_limit_for_test(charge);
+        let charged = roomy.try_with_new_surface_credit(&pool).unwrap();
+        let decoded: Message =
+            serde_json::from_value(serde_json::to_value(&charged).unwrap()).unwrap();
+        assert_eq!(charged, decoded);
+        assert_eq!(decoded.charged_surface_bytes(), None);
+        assert_eq!(format!("{charged:?}"), format!("{decoded:?}"));
     }
 }

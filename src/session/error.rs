@@ -251,6 +251,8 @@ pub enum SurfaceError {
     ToolResultChangedIdentity,
     #[error("surface token accounting exceeded its bounded integer domain")]
     TokenAccountingOverflow,
+    #[error("surface resident accounting exceeded its bounded integer domain")]
+    ResidentAccountingOverflow,
     #[error("surface tool calls and results do not form balanced positional groups")]
     UnbalancedToolSurface,
     #[error("shadowed token count is {actual}, but the selected surface costs {expected}")]

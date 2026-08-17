@@ -806,10 +806,13 @@ and the turn's bounded tool-result additions before the next compaction point.
 Its charged-allocation counter includes message/container storage and actual
 string/vector capacities, not only compact JSON bytes. The 64 MiB surface charge
 plus the 32 MiB identity/other-index charge forms the 96 MiB
-`ValidationIndex` cap. Building a replacement charges both old and candidate
-surface until the atomic swap, but the combined index plus candidate scratch
-must remain within the explicit 192 MiB transient high-water; a failed
-preflight leaves the old surface authoritative.
+`ValidationIndex` cap. The surface itself therefore uses a 128 MiB physical
+lease pool so the authoritative 64 MiB old surface and one 64 MiB candidate may
+coexist; `pool.used` is not the steady counter because a receipt/outcome may
+temporarily retain a replaced message. Building a replacement charges both old
+and candidate surface until the atomic swap, but the combined index plus
+candidate scratch must remain within the explicit 192 MiB transient high-water;
+a failed preflight leaves the old surface authoritative.
 
 The durable Agent reserves worst-case assistant-projection headroom before a
 Provider dispatch and tool-result projection headroom before
@@ -953,7 +956,14 @@ the already charged fallback instead. A pre-commit rejection moves the same
 owners back to `Ready` when fallback remains legal. `PreferredOnly`, used after
 an irreversible tool side effect, transfers the reserved row to the exact
 preferred result and keeps that result in the Session-owned pending operation;
-it can never substitute the fallback. Claim growth allocates a replacement row
+it can never substitute the fallback. For this exact `PreferredOnly` result, a
+transient durable Clock rejection is retried once from the same owner. If that
+retry is also rejected, the Agent returns the original Clock cause instead of
+attempting a `step/end` that cannot pass the still-pending truthful result;
+shutdown or cold recovery retains responsibility for the open tail.
+Cancellation likewise leaves the candidate in Session until the same claim
+resumes or shutdown takes over. A panicking injected clock is normalized to the
+same pre-commit Clock rejection. Claim growth allocates a replacement row
 before changing any counter, while rebind changes only the prepared payload and
 preserves the row allocation. Durable live-attempt admission also precharges the fixed
 bookkeeping high-water before opening the stream: the validator's open/seen
@@ -967,17 +977,34 @@ a normal live Session it is released by `retire_attempt`; dropping the Session
 also releases it through Rust ownership. It deliberately excludes `ContentBlock`,
 usage, finish/replay, and successful-message allocations: those values cross
 into the long-lived model-visible surface and cannot honestly be released with
-attempt bookkeeping. Typed `EventKind` allocations, this model-payload/raw
-handoff, cold recovery, complete closure payload headroom, and the rest of the
-complete 32 MiB proof remain later implementation slices. A transient durable
-clock rejection is retried once from that exact owner.
-If that retry is also rejected, the Agent returns the original Clock cause
-instead of attempting a `step/end` that cannot pass the still-pending truthful
-result; shutdown or cold recovery retains responsibility for the open tail.
-Cancellation likewise leaves the candidate in Session until the same claim
-resumes or shutdown takes over. A panicking injected clock is normalized to the
-same pre-commit clock rejection, so it cannot strand a stream candidate in
-front of the Agent's reserved failure closure. The public synchronous `append`
+attempt bookkeeping.
+
+The current next partial slice charges only the final `Message` graph of a hot,
+durable, token-owned `Committed` assistant append. After exact attempt/surface
+validation and before installing a pending operation, Clock call, sequence
+advance, or projection change, Session checks the authoritative 64 MiB charged
+assistant subset and acquires a fresh lease from its separate 128 MiB surface
+high-water pool. `Message` caches a deterministic charge for its immutable
+inner, typed string/vector backing, unique content-block inners, and independent
+block/source/message raw JSON graphs. A new durable node always receives a fresh
+conservative lease. A dropped wait leaves that leased `PreparedEvent` in the
+Session-owned pending operation, while a claim-aware Clock rejection restores
+the same leased candidate to its claim; neither path charges the candidate
+twice. An ordinary non-claim Clock rejection instead discards the uncommitted
+candidate and releases its lease. Projection, `AppendReceipt`, `TurnOutcome`,
+and later request handles use shallow `Message` clones that share both inner and
+lease. An empty assistant has zero authoritative steady delta because it is not
+model-visible, but its transient receipt candidate remains charged until its
+last owner drops.
+Retiring the 32 MiB attempt bookkeeping lease cannot release this surface
+lease.
+
+This is not yet a complete attempt-to-surface proof. Pre-closure
+`ContentBlock`/usage/finish/replay ownership, the token-usage anchor, typed
+`EventKind` and Agent tool-planning allocations, user/tool-result/checkpoint
+surface nodes, surface containers, replacement transfer, cold recovery, and
+complete closure headroom remain later slices. The full 32/64/96/192 MiB
+invariants therefore remain unimplemented. The public synchronous `append`
 remains the finite memory-mode seam;
 calling it on durable mode returns an async-required error before state change.
 Durable `remaining_budget()` is likewise unavailable/fallible because the old

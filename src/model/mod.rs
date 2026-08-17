@@ -63,6 +63,28 @@ macro_rules! string_id {
     };
 }
 
+pub(crate) trait ResidentStringId {
+    fn resident_string_capacity(&self) -> usize;
+}
+
+impl ResidentStringId for AttachmentId {
+    fn resident_string_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+impl ResidentStringId for CallId {
+    fn resident_string_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+impl ResidentStringId for MessageId {
+    fn resident_string_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
 string_id!(
     /// Stable identity carried by one message across log and model boundaries.
     MessageId
