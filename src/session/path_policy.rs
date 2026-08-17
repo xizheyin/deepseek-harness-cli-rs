@@ -550,10 +550,12 @@ fn linux_fchmodat2_empty_path(fd: &std::os::fd::OwnedFd) -> Result<(), StoreErro
     // SAFETY: `fd` is an owned O_PATH descriptor captured with NOFOLLOW. The
     // empty path is a fixed NUL-terminated byte string, no pointer is retained,
     // and the syscall result is checked before the descriptor is reused.
+    // `libc` does not expose SYS_fchmodat2 on every Linux architecture, so the
+    // syscall number comes from the architecture-specific kernel UAPI table.
     #[allow(unsafe_code)]
     let result = unsafe {
         libc::syscall(
-            libc::SYS_fchmodat2,
+            linux_raw_sys::general::__NR_fchmodat2 as libc::c_long,
             fd.as_raw_fd(),
             c"".as_ptr(),
             rustix::fs::Mode::RWXU.as_raw_mode() as libc::mode_t,
