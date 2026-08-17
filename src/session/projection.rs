@@ -2,18 +2,23 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     sync::Arc,
 };
 
-use crate::model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger};
+use crate::{
+    model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger, TokenUsage},
+    resident_credit::{ResidentCreditLease, arc_inner_charge},
+};
 
 use super::{
     ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionId, CompactionRange,
     CompactionTrigger, EventKind, EventSeq, MAX_SAFE_INTEGER, MAX_SOURCE_EVENT_SEQS, SessionEvent,
     SessionId, StepId, SurfaceOp, TurnId,
     attempt_anchor::{
-        AttemptDisposition, AttemptError, AttemptProjection, CommittedAttemptFacts,
-        PreparedAttempt, PreparedAttemptChunk, PreparedLiveAttempt, RecoveryAttemptProof,
+        AttemptDisposition, AttemptError, AttemptProjection, AttemptResidentChange,
+        CommittedAttemptFacts, PreparedAttempt, PreparedAttemptChunk, PreparedLiveAttempt,
+        RecoveryAttemptProof,
     },
     compaction::{
         COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
@@ -87,9 +92,41 @@ enum TokenBaseline {
     },
     Usage {
         tokens: u64,
-        usage: crate::model::TokenUsage,
+        anchor: TokenUsageAnchor,
     },
 }
+
+#[derive(Clone)]
+struct TokenUsageAnchor {
+    usage: TokenUsage,
+    resident_credit: Option<Arc<ResidentCreditLease>>,
+}
+
+impl TokenUsageAnchor {
+    fn resident_charge_bytes(&self) -> usize {
+        self.usage
+            .resident_bytes()
+            .checked_add(arc_inner_charge::<ResidentCreditLease>().unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl fmt::Debug for TokenUsageAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenUsageAnchor")
+            .field("usage", &self.usage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TokenUsageAnchor {
+    fn eq(&self, other: &Self) -> bool {
+        self.usage == other.usage
+    }
+}
+
+impl Eq for TokenUsageAnchor {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DurableDeclaredCall {
@@ -405,6 +442,48 @@ impl PreparedDurableProjection {
             Self::AttemptChunk { prepared, .. } => prepared.resident_bookkeeping_bytes(),
             Self::Replace { .. } => 0,
         }
+    }
+
+    pub(super) fn attempt_payload_resident_change(&self) -> AttemptResidentChange {
+        match self {
+            Self::AttemptChunk { prepared, .. } => prepared.resident_payload_change(),
+            Self::Replace { .. } => AttemptResidentChange::None,
+        }
+    }
+
+    pub(super) fn token_anchor_usage_resident_bytes(&self) -> usize {
+        match self {
+            Self::Replace { projection, .. } => projection
+                .token_anchor
+                .as_ref()
+                .and_then(|anchor| match &anchor.baseline {
+                    TokenBaseline::Usage { anchor, .. } => Some(anchor.resident_charge_bytes()),
+                    TokenBaseline::Estimated { .. } => None,
+                })
+                .unwrap_or(0),
+            Self::AttemptChunk { .. } => 0,
+        }
+    }
+
+    pub(super) fn install_token_anchor_usage_credit(
+        &mut self,
+        credit: Arc<ResidentCreditLease>,
+    ) -> bool {
+        let Self::Replace { projection, .. } = self else {
+            return false;
+        };
+        let Some(TokenMeasurementAnchor {
+            baseline: TokenBaseline::Usage { anchor, .. },
+            ..
+        }) = projection.token_anchor.as_mut()
+        else {
+            return false;
+        };
+        if anchor.resident_credit.is_some() || credit.bytes() != anchor.resident_charge_bytes() {
+            return false;
+        }
+        anchor.resident_credit = Some(credit);
+        true
     }
 
     pub(super) fn commit_memory(self, current: &mut Projection) -> bool {
@@ -996,6 +1075,30 @@ impl Projection {
 
     pub(crate) fn surface_resident_bytes(&self) -> usize {
         self.surface_resident_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_anchor_resident_bytes_for_test(&self) -> usize {
+        self.token_anchor
+            .as_ref()
+            .and_then(|anchor| match &anchor.baseline {
+                TokenBaseline::Usage { anchor, .. } => {
+                    anchor.resident_credit.as_ref().map(|credit| credit.bytes())
+                }
+                TokenBaseline::Estimated { .. } => None,
+            })
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_token_anchor_credit_for_test(&mut self) {
+        if let Some(TokenMeasurementAnchor {
+            baseline: TokenBaseline::Usage { anchor, .. },
+            ..
+        }) = self.token_anchor.as_mut()
+        {
+            anchor.resident_credit = None;
+        }
     }
 
     pub(crate) fn context_total_tokens(&self) -> Result<u64, SurfaceError> {
@@ -2270,7 +2373,10 @@ impl Projection {
                 let baseline = if usage_tokens >= estimated {
                     TokenBaseline::Usage {
                         tokens: usage_tokens,
-                        usage: usage.clone(),
+                        anchor: TokenUsageAnchor {
+                            usage: usage.clone(),
+                            resident_credit: None,
+                        },
                     }
                 } else {
                     TokenBaseline::Estimated { tokens: estimated }

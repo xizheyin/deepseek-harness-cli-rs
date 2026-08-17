@@ -5,12 +5,15 @@ use std::{fmt, sync::Arc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
-use crate::json_value::deserialize_present_option;
+use crate::{
+    json_value::deserialize_present_option,
+    resident_credit::{arc_inner_charge, string_backing_charge},
+};
 
 use super::{
     CallId, ContentBlock, FiniteNumber, JsonValue, ModelError, NonNegativeSafeInteger,
-    PositiveFiniteNumber, ProviderRequestId, ReasoningEffortId, TrueMarker, object, optional_json,
-    optional_string, optional_typed, required_string, required_typed, shape,
+    PositiveFiniteNumber, ProviderRequestId, ReasoningEffortId, ResidentStringId, TrueMarker,
+    object, optional_json, optional_string, optional_typed, required_string, required_typed, shape,
 };
 
 /// Serializable provider or transport failure facts.
@@ -145,6 +148,24 @@ impl LlmFailure {
     #[cfg(test)]
     pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let charge = (|| {
+            arc_inner_charge::<LlmFailureInner>()?
+                .checked_add(string_backing_charge(self.inner.message.capacity())?)?
+                .checked_add(string_backing_charge(self.inner.code.capacity())?)?
+                .checked_add(
+                    self.inner
+                        .request_id
+                        .as_ref()
+                        .map_or(Some(0), |request_id| {
+                            string_backing_charge(request_id.resident_string_capacity())
+                        })?,
+                )?
+                .checked_add(self.inner.raw.resident_bytes())
+        })();
+        charge.unwrap_or(usize::MAX)
     }
 }
 
@@ -286,6 +307,29 @@ impl FinishReason {
     pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_strong_count_for_test(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let charge = (|| {
+            let kind = match &self.inner.kind {
+                FinishReasonKind::Stop
+                | FinishReasonKind::ToolCalls
+                | FinishReasonKind::MaxTokens => 0,
+                FinishReasonKind::Aborted { failure } | FinishReasonKind::Error { failure } => {
+                    failure.resident_bytes()
+                }
+                FinishReasonKind::Other { kind } => string_backing_charge(kind.capacity())?,
+            };
+            arc_inner_charge::<FinishReasonInner>()?
+                .checked_add(self.inner.raw.resident_bytes())?
+                .checked_add(kind)
+        })();
+        charge.unwrap_or(usize::MAX)
+    }
 }
 
 impl fmt::Debug for FinishReason {
@@ -418,6 +462,10 @@ impl TokenUsage {
         )?;
         usage.raw = raw;
         Ok(usage)
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.raw.resident_bytes()
     }
 }
 
@@ -668,6 +716,72 @@ impl StreamChunk {
     #[cfg(test)]
     pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Complete dynamic graph temporarily owned by one typed stream chunk.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let charge = (|| {
+            let kind = match &self.inner.kind {
+                StreamChunkKind::BlockStart { block_type, .. } => match block_type {
+                    ContentBlockType::Other(value) => string_backing_charge(value.capacity())?,
+                    ContentBlockType::Text
+                    | ContentBlockType::Reasoning
+                    | ContentBlockType::Image
+                    | ContentBlockType::ToolCall
+                    | ContentBlockType::ToolResult => 0,
+                },
+                StreamChunkKind::TextDelta { text, .. }
+                | StreamChunkKind::ReasoningDelta { text, .. } => {
+                    string_backing_charge(text.capacity())?
+                }
+                StreamChunkKind::ToolCallDelta {
+                    id,
+                    name,
+                    arguments_delta,
+                    ..
+                } => string_backing_charge(id.resident_string_capacity())?
+                    .checked_add(
+                        name.as_ref()
+                            .map_or(Some(0), |name| string_backing_charge(name.capacity()))?,
+                    )?
+                    .checked_add(string_backing_charge(arguments_delta.capacity())?)?,
+                StreamChunkKind::BlockEnd { block, .. } => block.resident_bytes()?,
+                StreamChunkKind::Usage { usage } => usage.resident_bytes(),
+                StreamChunkKind::Finish {
+                    reason,
+                    replay_state,
+                } => reason
+                    .resident_bytes()
+                    .checked_add(replay_state.as_ref().map_or(0, JsonValue::resident_bytes))?,
+                StreamChunkKind::Other { chunk_type } => {
+                    string_backing_charge(chunk_type.capacity())?
+                }
+            };
+            arc_inner_charge::<StreamChunkInner>()?
+                .checked_add(self.inner.raw.resident_bytes())?
+                .checked_add(kind)
+        })();
+        charge.unwrap_or(usize::MAX)
+    }
+
+    /// Child graph that moves from the pending chunk into the attempt fold.
+    pub(crate) fn attempt_retained_resident_bytes(&self) -> usize {
+        match &self.inner.kind {
+            StreamChunkKind::BlockEnd { block, .. } => block.resident_bytes().unwrap_or(usize::MAX),
+            StreamChunkKind::Usage { usage } => usage.resident_bytes(),
+            StreamChunkKind::Finish {
+                reason,
+                replay_state,
+            } => reason
+                .resident_bytes()
+                .checked_add(replay_state.as_ref().map_or(0, JsonValue::resident_bytes))
+                .unwrap_or(usize::MAX),
+            StreamChunkKind::BlockStart { .. }
+            | StreamChunkKind::TextDelta { .. }
+            | StreamChunkKind::ReasoningDelta { .. }
+            | StreamChunkKind::ToolCallDelta { .. }
+            | StreamChunkKind::Other { .. } => 0,
+        }
     }
 }
 
@@ -1127,7 +1241,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{FinishReason, JsonValue, LlmCallConfig, LlmFailure, StreamChunk, ToolSchema};
+    use super::{
+        ContentBlock, FinishReason, JsonValue, LlmCallConfig, LlmFailure, NonNegativeSafeInteger,
+        StreamChunk, TokenUsage, ToolSchema,
+    };
 
     #[test]
     fn provider_request_prefix_values_clone_shallowly() {
@@ -1172,5 +1289,38 @@ mod tests {
             serde_json::to_value(&chunk).unwrap(),
             serde_json::to_value(&chunk_clone).unwrap()
         );
+    }
+
+    #[test]
+    fn stream_chunk_charge_separates_ephemeral_and_attempt_retained_graphs() {
+        let block = ContentBlock::text("retained block".repeat(1024)).unwrap();
+        let block_charge = block.resident_bytes().unwrap();
+        let block_end = StreamChunk::block_end(0, block).unwrap();
+        assert_eq!(block_end.attempt_retained_resident_bytes(), block_charge);
+        assert!(block_end.resident_bytes() > block_charge);
+
+        let usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(10_000).unwrap(),
+            NonNegativeSafeInteger::new(500).unwrap(),
+            Some(NonNegativeSafeInteger::new(200).unwrap()),
+            Some(NonNegativeSafeInteger::new(100).unwrap()),
+            Some(NonNegativeSafeInteger::new(300).unwrap()),
+        )
+        .unwrap();
+        let usage_charge = usage.resident_bytes();
+        let usage_chunk = StreamChunk::usage(usage).unwrap();
+        assert_eq!(usage_chunk.attempt_retained_resident_bytes(), usage_charge);
+        assert!(usage_chunk.resident_bytes() > usage_charge);
+
+        let failure = LlmFailure::new("provider failure".repeat(1024), "TEST_FAILURE").unwrap();
+        let reason = FinishReason::error(failure).unwrap();
+        let replay = JsonValue::new(json!({ "cursor": "x".repeat(4096) })).unwrap();
+        let retained = reason
+            .resident_bytes()
+            .checked_add(replay.resident_bytes())
+            .unwrap();
+        let finish = StreamChunk::finish(reason, Some(replay)).unwrap();
+        assert_eq!(finish.attempt_retained_resident_bytes(), retained);
+        assert!(finish.resident_bytes() > retained);
     }
 }

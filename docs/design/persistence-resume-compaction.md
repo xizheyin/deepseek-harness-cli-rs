@@ -965,21 +965,49 @@ Cancellation likewise leaves the candidate in Session until the same claim
 resumes or shutdown takes over. A panicking injected clock is normalized to the
 same pre-commit Clock rejection. Claim growth allocates a replacement row
 before changing any counter, while rebind changes only the prepared payload and
-preserves the row allocation. Durable live-attempt admission also precharges the fixed
-bookkeeping high-water before opening the stream: the validator's open/seen
-tables, ordered block/source vectors, and partial-block table. The route shares
-the immutable request-config allocation rather than copying provider/model
-strings. A plugin-defined block type acquires its new retained string credit
-after stream validation but before the Clock; rejection drops that delta, while
-commit merges it into the Session-owned active-attempt lease. That lease stays
-owned through seal, logical closure, and the following durable barrier. During
-a normal live Session it is released by `retire_attempt`; dropping the Session
-also releases it through Rust ownership. It deliberately excludes `ContentBlock`,
-usage, finish/replay, and successful-message allocations: those values cross
-into the long-lived model-visible surface and cannot honestly be released with
-attempt bookkeeping.
+preserves the row allocation. Durable live-attempt admission also precharges
+the fixed bookkeeping high-water before opening the stream: the validator's
+open/seen tables, ordered block/source vectors, partial-block table, and one
+small resident account. The route shares the immutable request-config
+allocation rather than copying provider/model strings.
 
-The current next partial slice charges only the final `Message` graph of a hot,
+After exact stream validation, each hot durable chunk charges its complete
+typed `StreamChunk` graph before the Clock. The independent event
+`original_data` tree remains separately charged. A committed `block-end`, usage
+sample, or finish splits the already charged child graph from the transient
+chunk owner and moves that credit into the Session-owned attempt account;
+text/reasoning/tool deltas leave no typed payload in the fold. Usage replacement
+releases the previous sample, successful finish additionally charges the
+assembled content-vector backing, and error/aborted finish releases completed
+blocks that the fold discards. Resident-limit and Clock rejection drop the
+candidate leases without changing sequence, projection, or the active account.
+A plugin-defined block type follows the same validate-before-credit,
+Clock-before-commit rule for its retained string.
+
+Seal moves the raw content/usage/finish/replay values into
+`PreparedAttemptParts` and gives that handoff a shared guard for the same
+attempt account; Session keeps another guard with the compact closure proof.
+This prevents cancellation or panic between seal and closure from returning
+the 32 MiB credit early. A committed assistant obtains its separate surface
+lease, and a selected provider-usage token baseline obtains a separate
+non-surface-index lease, before the logical closure and Clock. The attempt
+account remains pinned through closure and the following durable barrier.
+During a normal live Session `retire_attempt` releases the Session guard;
+dropping the Session also releases it through Rust ownership, and any still-live
+sealed handoff keeps the account charged until its own last guard drops.
+Before a retry waits or writes `llm/retry-started`, Agent drops the failed
+attempt's assembled payload and moved source vector while Session still holds
+the guard. A successful path likewise drops its attempt-only finish reason
+before constructing the final message, so a long-running tool body cannot keep
+that graph alive after attempt retirement.
+
+This is still a partial physical-owner proof. In particular, an error/aborted
+`LlmFailure` cloned into `StepOutcome`/`TurnEndReason` can outlive attempt
+retirement and does not yet carry a destination index/event lease. The
+temporary semantic-preflight projection, Agent tool-planning copies, and typed
+payloads of non-chunk `EventKind` variants are also not covered by this slice.
+
+The committed-message partial slice charges only the final `Message` graph of a hot,
 durable, token-owned `Committed` assistant append. After exact attempt/surface
 validation and before installing a pending operation, Clock call, sequence
 advance, or projection change, Session checks the authoritative 64 MiB charged
@@ -999,13 +1027,22 @@ last owner drops.
 Retiring the 32 MiB attempt bookkeeping lease cannot release this surface
 lease.
 
-This is not yet a complete attempt-to-surface proof. Pre-closure
-`ContentBlock`/usage/finish/replay ownership, the token-usage anchor, typed
-`EventKind` and Agent tool-planning allocations, user/tool-result/checkpoint
-surface nodes, surface containers, replacement transfer, cold recovery, and
-complete closure headroom remain later slices. The full 32/64/96/192 MiB
-invariants therefore remain unimplemented. The public synchronous `append`
-remains the finite memory-mode seam;
+For the selected provider-usage baseline, the hot committed projection charges
+the retained `TokenUsage` raw graph plus its shared lease from a separate
+32 MiB authoritative non-surface-index gate and 64 MiB old-plus-candidate
+physical pool. Estimated baselines retain no usage graph. Projection cloning,
+Clock rejection, and atomic replacement preserve old/candidate ownership; the
+new anchor survives attempt retirement and releases only when its last
+projection owner disappears. Memory and cold-recovered anchors remain
+deliberately uncharged in this checkpoint.
+
+This is not yet a complete attempt-to-surface proof. Typed payloads before the
+durable chunk admission boundary, the terminal-failure alias described above,
+typed non-chunk `EventKind` and Agent tool-planning allocations,
+user/tool-result/checkpoint surface nodes, surface containers, replacement
+transfer, cold recovery, and complete closure headroom remain later slices.
+The full 32/64/96/192 MiB invariants therefore remain unimplemented. The public
+synchronous `append` remains the finite memory-mode seam;
 calling it on durable mode returns an async-required error before state change.
 Durable `remaining_budget()` is likewise unavailable/fallible because the old
 4,096/16 MiB answer describes only memory mode. Journal quota uses exact
@@ -1167,7 +1204,10 @@ writer may be opened solely to surface a recovery warning before mutation:
 
 1. read and validate the complete header line;
 2. scan records with a fixed line buffer, validating JSON, sequence continuity,
-   event shape, and projection transitions;
+   event shape, and projection transitions. Its 9 MiB row/scratch bound is an
+   independent scan limit in the current partial implementation; the first and
+   second cold scans, their reconstructed attempt fold, and recovery suffix do
+   not yet consume the shared 32 MiB live attempt/journal credit;
 3. remember the byte offset after every complete valid record;
 4. ignore a final fragment with no LF and select the preceding valid offset as
    the recovery truncation target;

@@ -85,6 +85,12 @@ impl ResidentStringId for MessageId {
     }
 }
 
+impl ResidentStringId for ProviderRequestId {
+    fn resident_string_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
 string_id!(
     /// Stable identity carried by one message across log and model boundaries.
     MessageId

@@ -20,6 +20,13 @@ pub(super) const MAX_RESIDENT_SURFACE_STEADY_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES: usize =
     2 * MAX_RESIDENT_SURFACE_STEADY_BYTES;
 
+/// Non-surface validation facts such as the latest usage anchor.
+pub(super) const MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The old and candidate non-surface index may coexist during validation.
+pub(super) const MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES: usize =
+    2 * MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES;
+
 /// Complete old-plus-candidate validation-index high-water.
 #[cfg(test)]
 pub(super) const MAX_VALIDATION_INDEX_HIGH_WATER_BYTES: usize = 192 * 1024 * 1024;
@@ -80,6 +87,10 @@ impl ResidentCreditPool {
         Self::with_limit(MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES)
     }
 
+    pub(super) fn for_index_other() -> Self {
+        Self::with_limit(MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES)
+    }
+
     fn with_limit(limit: usize) -> Self {
         Self {
             inner: Arc::new(ResidentCreditPoolInner {
@@ -120,6 +131,10 @@ impl ResidentCreditPool {
 impl ResidentCreditLease {
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn shares_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pool, &other.pool)
     }
 
     #[cfg(test)]
@@ -371,10 +386,11 @@ fn round_up(value: usize, align: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChargedBytes, MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES, MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES,
-        MAX_RESIDENT_SURFACE_STEADY_BYTES, MAX_VALIDATION_INDEX_HIGH_WATER_BYTES,
-        ResidentCreditPool, arc_inner_charge, byte_buffer_charge, hash_table_backing_charge,
-        string_backing_charge, vec_backing_charge,
+        ChargedBytes, MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES,
+        MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES, MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
+        MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES, MAX_RESIDENT_SURFACE_STEADY_BYTES,
+        MAX_VALIDATION_INDEX_HIGH_WATER_BYTES, ResidentCreditPool, arc_inner_charge,
+        byte_buffer_charge, hash_table_backing_charge, string_backing_charge, vec_backing_charge,
     };
 
     #[test]
@@ -426,6 +442,11 @@ mod tests {
     fn surface_limits_are_separate_and_keep_the_frozen_high_water_relation() {
         assert_eq!(MAX_RESIDENT_ATTEMPT_JOURNAL_BYTES, 32 * 1024 * 1024);
         assert_eq!(MAX_RESIDENT_SURFACE_STEADY_BYTES, 64 * 1024 * 1024);
+        assert_eq!(MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES, 32 * 1024 * 1024);
+        assert_eq!(
+            MAX_RESIDENT_INDEX_OTHER_HIGH_WATER_BYTES,
+            2 * MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES
+        );
         assert_eq!(
             MAX_RESIDENT_SURFACE_HIGH_WATER_BYTES,
             2 * MAX_RESIDENT_SURFACE_STEADY_BYTES
@@ -437,12 +458,16 @@ mod tests {
 
         let attempt = ResidentCreditPool::for_durable_session();
         let surface = ResidentCreditPool::for_surface();
+        let index_other = ResidentCreditPool::for_index_other();
         let attempt_lease = attempt.try_acquire(1).unwrap();
         let surface_lease = surface.try_acquire(1).unwrap();
+        let index_other_lease = index_other.try_acquire(1).unwrap();
         assert!(attempt_lease.belongs_to(&attempt));
         assert!(!attempt_lease.belongs_to(&surface));
         assert!(surface_lease.belongs_to(&surface));
         assert!(!surface_lease.belongs_to(&attempt));
+        assert!(index_other_lease.belongs_to(&index_other));
+        assert!(!index_other_lease.belongs_to(&attempt));
     }
 
     #[test]

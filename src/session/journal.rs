@@ -975,15 +975,18 @@ mod tests {
         ContentBlock, ContentBlockType, FinishReason, FiniteNumber, LlmCallConfig, LlmFailure,
         Message, MessageSource, NonNegativeSafeInteger, StreamChunk, StreamChunkKind, TokenUsage,
     };
-    use crate::resident_credit::{ChargedBytes, string_backing_charge};
+    use crate::resident_credit::{
+        ChargedBytes, ResidentCreditLease, arc_inner_charge, string_backing_charge,
+        vec_backing_charge,
+    };
     use crate::session::projection::{Projection, ValidationPolicy};
     use crate::session::{
         AppendError, AttemptDisposition, BarrierError, ClaimedAppend, Clock, ClockError,
         EpochHeader, EventClaim, EventKind, EventSeq, EventValidationError, LlmRetryEvent,
         LlmRetryStartedEvent, NewEvent, PreparedAttempt, PrunePairAppendError, RequestHeaderReason,
-        RetryId, RetryNumber, Session, SessionMode, SessionStorage, StepId, SurfaceIntent,
-        SystemClock, TodoItem, TodoStatus, ToolResultPruneConfig, TransitionError, TurnEndReason,
-        TurnId, UnixMillis, journal_row::JournalRowLocator,
+        RetryId, RetryNumber, Session, SessionMode, SessionReservation, SessionStorage, StepId,
+        SurfaceIntent, SystemClock, TodoItem, TodoStatus, ToolResultPruneConfig, TransitionError,
+        TurnEndReason, TurnId, UnixMillis, journal_row::JournalRowLocator,
     };
 
     use super::{
@@ -1505,6 +1508,13 @@ mod tests {
             .unwrap();
         reservation.flush_barrier().await.unwrap();
         assert_eq!(reservation.session().context_total_tokens().unwrap(), 44);
+        assert!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test()
+                > 0
+        );
         let hot_messages = reservation.session().messages();
         assert!(
             hot_messages
@@ -1528,6 +1538,7 @@ mod tests {
             cold.apply_scanned_event(&event).unwrap();
         }
         assert_eq!(cold.context_total_tokens().unwrap(), 44);
+        assert_eq!(cold.token_anchor_resident_bytes_for_test(), 0);
         assert_eq!(cold.surface_resident_bytes(), 0);
         assert!(
             cold.messages()
@@ -2177,6 +2188,655 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_payload_credit_rolls_back_then_moves_through_seal_once() {
+        let (path, file) = test_file("attempt-payload-transfer");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, step) =
+            attempt_ready_session_with_clock("attempt-payload-transfer", clock.clone(), writer)
+                .await;
+        let limit = 32 * 1024 * 1024;
+        let pool = session.set_resident_limit_for_test(limit);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        let baseline = reservation
+            .session()
+            .active_attempt_resident_bytes_for_test()
+            .unwrap();
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(0)
+        );
+
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(pool.used_for_test(), baseline);
+
+        let semantic_filler = pool.try_acquire(limit - baseline).unwrap();
+        let clock_before = clock.calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(
+                    &token,
+                    StreamChunk::block_end(1, ContentBlock::text("wrong block index").unwrap(),)
+                        .unwrap(),
+                )
+                .await,
+            Err(AppendError::Validation(_))
+        ));
+        assert_eq!(clock.calls.load(Ordering::SeqCst), clock_before);
+        assert_eq!(pool.used_for_test(), limit);
+        drop(semantic_filler);
+
+        let block = ContentBlock::text("retained payload".repeat(4096)).unwrap();
+        let block_charge = block.resident_bytes().unwrap();
+        let chunk = StreamChunk::block_end(0, block).unwrap();
+        let typed_charge = chunk.resident_bytes();
+        assert_eq!(chunk.attempt_retained_resident_bytes(), block_charge);
+        let prepared = Session::prepare_event(NewEvent::log(EventKind::assistant_chunk(
+            turn,
+            step,
+            chunk.clone(),
+        )))
+        .unwrap();
+        let original_charge = prepared.original_data.resident_bytes();
+        drop(prepared);
+        let filler_bytes = limit
+            .checked_sub(baseline + original_charge + typed_charge - 1)
+            .unwrap();
+        let filler = pool.try_acquire(filler_bytes).unwrap();
+        let clock_before = clock.calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::DurableResidentLimit { maximum }) if maximum == limit
+        ));
+        assert_eq!(clock.calls.load(Ordering::SeqCst), clock_before);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(0)
+        );
+        assert_eq!(pool.used_for_test(), baseline + filler.bytes());
+        drop(filler);
+
+        clock.fail_after(0);
+        assert!(matches!(
+            reservation
+                .append_attempt_chunk_settled(&token, chunk.clone())
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(pool.used_for_test(), baseline);
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(0)
+        );
+
+        reservation
+            .append_attempt_chunk_settled(&token, chunk)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(block_charge)
+        );
+        assert_eq!(pool.used_for_test(), baseline + block_charge);
+
+        let reason = FinishReason::stop().unwrap();
+        let finish_charge = reason.resident_bytes();
+        let content_vec_charge = vec_backing_charge::<ContentBlock>(1).unwrap();
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(reason.clone(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let expected_payload = block_charge + finish_charge + content_vec_charge;
+        assert_eq!(
+            reservation
+                .session()
+                .active_attempt_payload_bytes_for_test(),
+            Some(expected_payload)
+        );
+
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let parts = prepared.into_parts();
+        assert!(parts.usage.is_none());
+        assert_eq!(parts.finish, reason);
+        assert!(parts.replay_state.is_none());
+        let guard = parts
+            .resident_guard
+            .expect("a durable sealed attempt must pin its resident account");
+        let guarded_bytes = guard.total_bytes();
+        let assistant =
+            Message::assistant("assistant", parts.content, "mock", "mock-model").unwrap();
+        let receipt = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::surface(
+                    EventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message: assistant,
+                        usage: None,
+                    },
+                    SurfaceIntent::append().with_sources(parts.sources),
+                ),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert_eq!(pool.used_for_test(), guarded_bytes);
+        drop(guard);
+        assert_eq!(pool.used_for_test(), 0);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(receipt);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_token_anchor_has_its_own_limit_and_outlives_attempt_retirement() {
+        fn usage() -> TokenUsage {
+            TokenUsage::from_parts(
+                NonNegativeSafeInteger::new(50_000).unwrap(),
+                NonNegativeSafeInteger::new(2_000).unwrap(),
+                Some(NonNegativeSafeInteger::new(500).unwrap()),
+                Some(NonNegativeSafeInteger::new(250).unwrap()),
+                Some(NonNegativeSafeInteger::new(1_000).unwrap()),
+            )
+            .unwrap()
+        }
+
+        let usage_charge = usage()
+            .resident_bytes()
+            .checked_add(arc_inner_charge::<ResidentCreditLease>().unwrap())
+            .unwrap();
+        assert!(usage_charge > 1);
+
+        async fn rejected_case(label: &str, high_water: usize, steady: usize, expected: usize) {
+            let (path, file) = test_file(label);
+            let writer = JournalWriter::start(file, 0).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (mut session, turn, step) =
+                attempt_ready_session_with_clock(label, CountingClock(Arc::clone(&calls)), writer)
+                    .await;
+            let anchor_pool =
+                session.set_validation_other_resident_limits_for_test(high_water, steady);
+            let mut reservation = session.reservation();
+            let token = reservation.begin_attempt(turn, step).unwrap();
+            for chunk in [
+                StreamChunk::usage(usage()).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ] {
+                reservation
+                    .append_attempt_chunk_settled(&token, chunk)
+                    .await
+                    .unwrap();
+            }
+            reservation.flush_barrier().await.unwrap();
+            let closure =
+                finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+            let seq_before = reservation.session().next_seq();
+            let clock_before = calls.load(Ordering::SeqCst);
+            assert!(matches!(
+                reservation
+                    .append_attempt_closure_settled(
+                        &token,
+                        AttemptDisposition::Committed,
+                        closure,
+                    )
+                    .await,
+                Err(AppendError::DurableResidentLimit { maximum }) if maximum == expected
+            ));
+            assert_eq!(reservation.session().next_seq(), seq_before);
+            assert_eq!(calls.load(Ordering::SeqCst), clock_before);
+            assert_eq!(anchor_pool.used_for_test(), 0);
+            reservation
+                .append_attempt_closure_settled(
+                    &token,
+                    AttemptDisposition::Failed,
+                    NewEvent::log(EventKind::step_end(turn, step)),
+                )
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            reservation.retire_attempt(&token).unwrap();
+            reservation
+                .append_settled(NewEvent::log(EventKind::turn_end(
+                    turn,
+                    TurnEndReason::Error {
+                        error: LlmFailure::new("token anchor limit", "TOKEN_ANCHOR_LIMIT").unwrap(),
+                    },
+                )))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            drop(reservation);
+            session.shutdown().await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+
+        rejected_case(
+            "attempt-token-anchor-steady-one-over",
+            usage_charge * 2,
+            usage_charge - 1,
+            usage_charge - 1,
+        )
+        .await;
+        rejected_case(
+            "attempt-token-anchor-high-water-one-over",
+            usage_charge - 1,
+            usage_charge,
+            usage_charge - 1,
+        )
+        .await;
+
+        {
+            let (path, file) = test_file("attempt-token-anchor-replacement-one-over");
+            let writer = JournalWriter::start(file, 0).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (mut session, turn, first_step) = attempt_ready_session_with_clock(
+                "attempt-token-anchor-replacement-one-over",
+                CountingClock(Arc::clone(&calls)),
+                writer,
+            )
+            .await;
+            let anchor_pool = session
+                .set_validation_other_resident_limits_for_test(usage_charge * 2 - 1, usage_charge);
+            let mut reservation = session.reservation();
+            commit_empty_attempt(&mut reservation, turn, first_step, Some(usage())).await;
+            assert_eq!(anchor_pool.used_for_test(), usage_charge);
+            reservation
+                .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+                .await
+                .unwrap();
+            let second_step = StepId::new(2).unwrap();
+            reservation
+                .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+
+            let token = reservation.begin_attempt(turn, second_step).unwrap();
+            for chunk in [
+                StreamChunk::usage(usage()).unwrap(),
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            ] {
+                reservation
+                    .append_attempt_chunk_settled(&token, chunk)
+                    .await
+                    .unwrap();
+            }
+            reservation.flush_barrier().await.unwrap();
+            let closure =
+                finish_only_assistant(turn, second_step, reservation.seal_attempt(&token).unwrap());
+            let seq_before = reservation.session().next_seq();
+            let clock_before = calls.load(Ordering::SeqCst);
+            let context_before = reservation.session().context_total_tokens().unwrap();
+            assert!(matches!(
+                reservation
+                    .append_attempt_closure_settled(
+                        &token,
+                        AttemptDisposition::Committed,
+                        closure,
+                    )
+                    .await,
+                Err(AppendError::DurableResidentLimit { maximum })
+                    if maximum == usage_charge * 2 - 1
+            ));
+            assert_eq!(reservation.session().next_seq(), seq_before);
+            assert_eq!(calls.load(Ordering::SeqCst), clock_before);
+            assert_eq!(
+                reservation.session().context_total_tokens().unwrap(),
+                context_before
+            );
+            assert_eq!(anchor_pool.used_for_test(), usage_charge);
+            assert_eq!(
+                reservation
+                    .session()
+                    .projection
+                    .token_anchor_resident_bytes_for_test(),
+                usage_charge
+            );
+            reservation
+                .append_attempt_closure_settled(
+                    &token,
+                    AttemptDisposition::Failed,
+                    NewEvent::log(EventKind::step_end(turn, second_step)),
+                )
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            reservation.retire_attempt(&token).unwrap();
+            assert_eq!(anchor_pool.used_for_test(), usage_charge);
+            reservation
+                .append_settled(NewEvent::log(EventKind::turn_end(
+                    turn,
+                    TurnEndReason::Error {
+                        error: LlmFailure::new("token anchor limit", "TOKEN_ANCHOR_LIMIT").unwrap(),
+                    },
+                )))
+                .await
+                .unwrap();
+            reservation.flush_barrier().await.unwrap();
+            drop(reservation);
+            session.shutdown().await.unwrap();
+            drop(session);
+            assert_eq!(anchor_pool.used_for_test(), 0);
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let (path, file) = test_file("attempt-token-anchor-exact");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let (mut session, turn, step) =
+            attempt_ready_session("attempt-token-anchor-exact", writer).await;
+        let attempt_pool = session.set_resident_limit_for_test(32 * 1024 * 1024);
+        let anchor_pool =
+            session.set_validation_other_resident_limits_for_test(usage_charge * 2, usage_charge);
+        let mut reservation = session.reservation();
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        for chunk in [
+            StreamChunk::usage(usage()).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let prepared = reservation.seal_attempt(&token).unwrap();
+        let parts = prepared.into_parts();
+        assert_eq!(parts.finish, FinishReason::stop().unwrap());
+        assert!(parts.replay_state.is_none());
+        let guard = parts
+            .resident_guard
+            .expect("the sealed attempt must keep its typed payload credit");
+        let assistant =
+            Message::assistant("assistant", parts.content, "mock", "mock-model").unwrap();
+        let receipt = reservation
+            .append_attempt_closure_settled(
+                &token,
+                AttemptDisposition::Committed,
+                NewEvent::surface(
+                    EventKind::AssistantMessage {
+                        turn,
+                        step,
+                        message: assistant,
+                        usage: parts.usage,
+                    },
+                    SurfaceIntent::append().with_sources(parts.sources),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        assert_eq!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test(),
+            usage_charge
+        );
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        assert!(attempt_pool.used_for_test() > 0);
+        drop(guard);
+        assert_eq!(attempt_pool.used_for_test(), 0);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        drop(receipt);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, step)))
+            .await
+            .unwrap();
+        let second_step = StepId::new(2).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        commit_empty_attempt(&mut reservation, turn, second_step, Some(usage())).await;
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, second_step)))
+            .await
+            .unwrap();
+        let third_step = StepId::new(3).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, third_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let token = reservation.begin_attempt(turn, third_step).unwrap();
+        for chunk in [
+            StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+            StreamChunk::block_end(0, ContentBlock::text("estimated anchor").unwrap()).unwrap(),
+            StreamChunk::usage(TokenUsage::new(0, 0).unwrap()).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure =
+            finish_only_assistant(turn, third_step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        drop(receipt);
+        assert_eq!(anchor_pool.used_for_test(), 0);
+        assert_eq!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test(),
+            0
+        );
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, third_step)))
+            .await
+            .unwrap();
+        let fourth_step = StepId::new(4).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, fourth_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        commit_empty_attempt(&mut reservation, turn, fourth_step, Some(usage())).await;
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        let projection_clone = reservation.session().projection.clone();
+        assert_eq!(projection_clone, reservation.session().projection);
+        let mut uncharged_projection = projection_clone.clone();
+        uncharged_projection.clear_token_anchor_credit_for_test();
+        assert_eq!(uncharged_projection, projection_clone);
+        assert_eq!(
+            uncharged_projection.token_anchor_resident_bytes_for_test(),
+            0
+        );
+        drop(uncharged_projection);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        let projection_debug = format!("{projection_clone:?}");
+        assert!(!projection_debug.contains("resident_credit"));
+        assert!(!projection_debug.contains("ResidentCreditLease"));
+
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, fourth_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(session);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        drop(projection_clone);
+        assert_eq!(anchor_pool.used_for_test(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_token_anchor_clock_rejection_preserves_the_old_owner() {
+        let old_usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(50_000).unwrap(),
+            NonNegativeSafeInteger::new(2_000).unwrap(),
+            Some(NonNegativeSafeInteger::new(500).unwrap()),
+            Some(NonNegativeSafeInteger::new(250).unwrap()),
+            Some(NonNegativeSafeInteger::new(1_000).unwrap()),
+        )
+        .unwrap();
+        let new_usage = TokenUsage::from_parts(
+            NonNegativeSafeInteger::new(60_000).unwrap(),
+            NonNegativeSafeInteger::new(3_000).unwrap(),
+            Some(NonNegativeSafeInteger::new(500).unwrap()),
+            Some(NonNegativeSafeInteger::new(250).unwrap()),
+            Some(NonNegativeSafeInteger::new(1_000).unwrap()),
+        )
+        .unwrap();
+        let usage_charge = old_usage
+            .resident_bytes()
+            .checked_add(arc_inner_charge::<ResidentCreditLease>().unwrap())
+            .unwrap();
+        assert_eq!(new_usage.resident_bytes(), old_usage.resident_bytes());
+        let (path, file) = test_file("attempt-token-anchor-clock-rollback");
+        let writer = JournalWriter::start(file, 0).unwrap();
+        let clock = FailingClock::new();
+        let (mut session, turn, first_step) = attempt_ready_session_with_clock(
+            "attempt-token-anchor-clock-rollback",
+            clock.clone(),
+            writer,
+        )
+        .await;
+        let anchor_pool =
+            session.set_validation_other_resident_limits_for_test(usage_charge * 2, usage_charge);
+        let mut reservation = session.reservation();
+        commit_empty_attempt(&mut reservation, turn, first_step, Some(old_usage)).await;
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, first_step)))
+            .await
+            .unwrap();
+        let second_step = StepId::new(2).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_start(turn, second_step)))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+
+        let token = reservation.begin_attempt(turn, second_step).unwrap();
+        for chunk in [
+            StreamChunk::usage(new_usage).unwrap(),
+            StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+        ] {
+            reservation
+                .append_attempt_chunk_settled(&token, chunk)
+                .await
+                .unwrap();
+        }
+        reservation.flush_barrier().await.unwrap();
+        let closure =
+            finish_only_assistant(turn, second_step, reservation.seal_attempt(&token).unwrap());
+        let mut claims = reservation.claim_batch(vec![closure]).unwrap();
+        let mut claim = claims.remove(0);
+        let seq_before = reservation.session().next_seq();
+        let context_before = reservation.session().context_total_tokens().unwrap();
+        let projection_before = reservation.session().projection.clone();
+        clock.fail_after(0);
+        assert!(matches!(
+            reservation
+                .settle_attempt_closure_exact_settled(
+                    &mut claim,
+                    &token,
+                    AttemptDisposition::Committed,
+                )
+                .await,
+            Err(AppendError::Clock(_))
+        ));
+        assert_eq!(reservation.session().next_seq(), seq_before);
+        assert_eq!(
+            reservation.session().context_total_tokens().unwrap(),
+            context_before
+        );
+        assert_eq!(reservation.session().projection, projection_before);
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        drop(projection_before);
+
+        let receipt = reservation
+            .settle_attempt_closure_exact_settled(&mut claim, &token, AttemptDisposition::Committed)
+            .await
+            .unwrap();
+        assert_eq!(anchor_pool.used_for_test(), usage_charge);
+        assert!(reservation.session().context_total_tokens().unwrap() > context_before);
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::step_end(turn, second_step)))
+            .await
+            .unwrap();
+        reservation
+            .append_settled(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        drop(reservation);
+        session.shutdown().await.unwrap();
+        drop(session);
+        assert_eq!(anchor_pool.used_for_test(), 0);
+        drop(receipt);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn committed_attempt_surface_credit_has_separate_steady_and_high_water_limits() {
         async fn run_rejected_case(label: &str, high_water: usize, steady: usize, expected: usize) {
             let (path, file) = test_file(label);
@@ -2632,6 +3292,7 @@ mod tests {
         for chunk in [
             StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
             StreamChunk::block_end(0, ContentBlock::text("memory assistant").unwrap()).unwrap(),
+            StreamChunk::usage(TokenUsage::new(50_000, 2_000).unwrap()).unwrap(),
             StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
         ] {
             reservation
@@ -2657,6 +3318,14 @@ mod tests {
                 .is_some_and(|message| message.charged_surface_bytes().is_none())
         );
         assert_eq!(reservation.session().surface_resident_bytes_for_test(), 0);
+        assert_eq!(
+            reservation
+                .session()
+                .projection
+                .token_anchor_resident_bytes_for_test(),
+            0
+        );
+        assert!(reservation.session().context_total_tokens().unwrap() > 0);
 
         reservation.flush_barrier().await.unwrap();
         reservation.retire_attempt(&token).unwrap();
@@ -5357,19 +6026,50 @@ mod tests {
     }
 
     fn finish_only_assistant(turn: TurnId, step: StepId, prepared: PreparedAttempt) -> NewEvent {
-        let (content, usage, finish, replay_state, sources) = prepared.into_parts();
-        assert_eq!(finish, FinishReason::stop().unwrap());
-        assert!(replay_state.is_none());
-        let message = Message::assistant("assistant", content, "mock", "mock-model").unwrap();
+        let parts = prepared.into_parts();
+        assert_eq!(parts.finish, FinishReason::stop().unwrap());
+        assert!(parts.replay_state.is_none());
+        let message = Message::assistant("assistant", parts.content, "mock", "mock-model").unwrap();
         NewEvent::surface(
             EventKind::AssistantMessage {
                 turn,
                 step,
                 message,
-                usage,
+                usage: parts.usage,
             },
-            SurfaceIntent::append().with_sources(sources),
+            SurfaceIntent::append().with_sources(parts.sources),
         )
+    }
+
+    async fn commit_empty_attempt(
+        reservation: &mut SessionReservation<'_>,
+        turn: TurnId,
+        step: StepId,
+        usage: Option<TokenUsage>,
+    ) {
+        let token = reservation.begin_attempt(turn, step).unwrap();
+        if let Some(usage) = usage {
+            reservation
+                .append_attempt_chunk_settled(&token, StreamChunk::usage(usage).unwrap())
+                .await
+                .unwrap();
+        }
+        reservation
+            .append_attempt_chunk_settled(
+                &token,
+                StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+            )
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        let closure = finish_only_assistant(turn, step, reservation.seal_attempt(&token).unwrap());
+        let receipt = reservation
+            .append_attempt_closure_settled(&token, AttemptDisposition::Committed, closure)
+            .await
+            .unwrap();
+        reservation.flush_barrier().await.unwrap();
+        reservation.retire_attempt(&token).unwrap();
+        drop(receipt);
     }
 
     async fn prunable_session(
@@ -5443,10 +6143,11 @@ mod tests {
             .await
             .unwrap();
         let prepared = reservation.seal_attempt(&token).unwrap();
-        let (content, usage, finish, replay_state, sources) = prepared.into_parts();
-        assert_eq!(finish, FinishReason::tool_calls().unwrap());
-        assert!(replay_state.is_none());
-        let assistant = Message::assistant("assistant-1", content, "mock", "mock-model").unwrap();
+        let parts = prepared.into_parts();
+        assert_eq!(parts.finish, FinishReason::tool_calls().unwrap());
+        assert!(parts.replay_state.is_none());
+        let assistant =
+            Message::assistant("assistant-1", parts.content, "mock", "mock-model").unwrap();
         reservation
             .append_attempt_closure_settled(
                 &token,
@@ -5456,9 +6157,9 @@ mod tests {
                         turn,
                         step,
                         message: assistant,
-                        usage,
+                        usage: parts.usage,
                     },
-                    SurfaceIntent::append().with_sources(sources),
+                    SurfaceIntent::append().with_sources(parts.sources),
                 ),
             )
             .await

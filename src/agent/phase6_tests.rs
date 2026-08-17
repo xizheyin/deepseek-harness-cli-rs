@@ -29,7 +29,7 @@ use crate::{
     model::{
         ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, JsonValue, LlmCallConfig,
         LlmCallConfigAdapterDefaults, LlmFailure, MAX_JSON_VALUE_BYTES, Message, MessageSource,
-        StreamChunk, ToolSchema,
+        StreamChunk, StreamChunkKind, ToolSchema,
     },
     provider::{
         ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
@@ -71,6 +71,46 @@ impl Clock for IncrementingClock {
         let value = *next;
         *next += 1;
         UnixMillis::new(value).map_err(|error| ClockError::new(error.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct FinishSamplingClock(Arc<Mutex<FinishSamplingClockState>>);
+
+struct FinishSamplingClockState {
+    next: i64,
+    probe: FinishReason,
+    samples: Vec<(i64, usize)>,
+}
+
+impl FinishSamplingClock {
+    fn new(next: i64, probe: FinishReason) -> Self {
+        Self(Arc::new(Mutex::new(FinishSamplingClockState {
+            next,
+            probe,
+            samples: Vec::new(),
+        })))
+    }
+
+    fn strong_count_at(&self, time: i64) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .samples
+            .iter()
+            .find_map(|(sample_time, count)| (*sample_time == time).then_some(*count))
+            .expect("the journal timestamp must have one Clock sample")
+    }
+}
+
+impl Clock for FinishSamplingClock {
+    fn now(&self) -> Result<UnixMillis, ClockError> {
+        let mut state = self.0.lock().unwrap();
+        let time = state.next;
+        state.next += 1;
+        let count = state.probe.allocation_strong_count_for_test();
+        state.samples.push((time, count));
+        UnixMillis::new(time).map_err(|error| ClockError::new(error.to_string()))
     }
 }
 
@@ -175,6 +215,7 @@ struct ScriptedProvider {
     attempts: Mutex<VecDeque<Vec<StreamChunk>>>,
     requests: Mutex<Vec<Vec<Message>>>,
     panic_clock_on_stream: Option<PanicWhenArmedClock>,
+    retry_policy: RetryPolicy,
 }
 
 struct PruneThenFitProvider {
@@ -286,11 +327,22 @@ impl ScriptedProvider {
             attempts: Mutex::new(attempts.into()),
             requests: Mutex::new(Vec::new()),
             panic_clock_on_stream: None,
+            retry_policy: RetryPolicy::normal(
+                0,
+                vec!["SERVER".to_owned()],
+                RetryBackoff::new(1.0, 1.0, 0.0).unwrap(),
+            )
+            .unwrap(),
         }
     }
 
     fn with_clock_panic_on_stream(mut self, clock: PanicWhenArmedClock) -> Self {
         self.panic_clock_on_stream = Some(clock);
+        self
+    }
+
+    fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
         self
     }
 
@@ -314,14 +366,7 @@ impl ModelProvider for ScriptedProvider {
             LlmCallConfigAdapterDefaults::default(),
             Some(crate::model::NonNegativeSafeInteger::new(4_096).unwrap()),
         )
-        .with_retry_policy(
-            RetryPolicy::normal(
-                0,
-                vec!["SERVER".to_owned()],
-                RetryBackoff::new(1.0, 1.0, 0.0).unwrap(),
-            )
-            .unwrap(),
-        ))
+        .with_retry_policy(self.retry_policy.clone()))
     }
 
     fn preflight_request(
@@ -1251,6 +1296,152 @@ async fn a_durable_clock_rejection_retries_the_exact_started_tool_result() {
     let journal_text = std::fs::read_to_string(&journal).unwrap();
     assert!(journal_text.contains("clock-retried started result"));
     assert!(!journal_text.contains("TOOL_OUTPUT_BUDGET_EXCEEDED"));
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_tool_execution_drops_the_attempt_only_finish_alias() {
+    let finish_chunk = StreamChunk::finish(
+        FinishReason::from_value(json!({
+            "kind": "provider-extension",
+            "padding": "x".repeat(1024 * 1024),
+        }))
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+    let finish_probe = match finish_chunk.kind() {
+        StreamChunkKind::Finish { reason, .. } => reason.clone(),
+        _ => unreachable!("the fixture is a finish chunk"),
+    };
+    let response = vec![
+        StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+        StreamChunk::block_end(
+            0,
+            ContentBlock::tool_call(
+                "call-1",
+                "bash",
+                r#"{"command":"printf fixture","description":"fixture"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        finish_chunk,
+    ];
+    assert_eq!(finish_probe.allocation_strong_count_for_test(), 2);
+
+    let running = Arc::new(Semaphore::new(0));
+    let cleanup_entered = Arc::new(Semaphore::new(0));
+    let cleanup_release = Arc::new(Semaphore::new(0));
+    let (tools, _) = ScriptedActions::one(ActionScript::StopThenCleanup(StopThenCleanup {
+        running: running.clone(),
+        cleanup_entered: cleanup_entered.clone(),
+        cleanup_release: cleanup_release.clone(),
+    }));
+    let (session, _journal, root, workspace) =
+        durable_session_with_event_room("agent-tool-finish-alias", 512).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![response]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+
+    let outcome = {
+        let turn = agent.run_turn(TurnProposal::Enter(vec![user()]), cancellation.clone());
+        tokio::pin!(turn);
+        tokio::select! {
+            biased;
+            permit = running.acquire() => drop(permit.unwrap()),
+            result = &mut turn => panic!("turn ended before Action started: {result:?}"),
+        }
+        assert_eq!(finish_probe.allocation_strong_count_for_test(), 1);
+        cancellation.cancel();
+        tokio::select! {
+            biased;
+            permit = cleanup_entered.acquire() => drop(permit.unwrap()),
+            result = &mut turn => panic!("turn ended before cleanup was released: {result:?}"),
+        }
+        cleanup_release.add_permits(1);
+        turn.await.unwrap()
+    };
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    agent.shutdown().await.unwrap();
+    drop(agent);
+    assert_eq!(finish_probe.allocation_strong_count_for_test(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_retry_started_drops_the_previous_attempt_finish_alias() {
+    let finish_chunk = StreamChunk::finish(
+        FinishReason::error(LlmFailure::new("x".repeat(1024 * 1024), "SERVER").unwrap()).unwrap(),
+        None,
+    )
+    .unwrap();
+    let finish_probe = match finish_chunk.kind() {
+        StreamChunkKind::Finish { reason, .. } => reason.clone(),
+        _ => unreachable!("the fixture is a finish chunk"),
+    };
+    let clock = FinishSamplingClock::new(1_000, finish_probe);
+    let (session, journal, root, workspace) =
+        durable_session_with_clock("agent-retry-finish-alias", 512, clock.clone()).await;
+    let retry_policy = RetryPolicy::normal(
+        1,
+        vec!["SERVER".to_owned()],
+        RetryBackoff::new(1.0, 1.0, 0.0).unwrap(),
+    )
+    .unwrap();
+    let provider = Arc::new(
+        ScriptedProvider::new(vec![vec![finish_chunk], text_response()])
+            .with_retry_policy(retry_policy),
+    );
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    agent.shutdown().await.unwrap();
+    let rows = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let retry_started_time = rows
+        .iter()
+        .find(|row| row["type"] == "llm/retry-started")
+        .and_then(|row| row["time"].as_i64())
+        .expect("the retry policy must emit retry-started");
+    assert_eq!(clock.strong_count_at(retry_started_time), 1);
+
     drop(agent);
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(workspace).unwrap();
@@ -2651,6 +2842,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         vec![call],
         vec![ToolClaimProfile::shell_action()],
         &mut attempt_token,
+        None,
         &CancellationToken::new(),
         &budget_failure,
     )

@@ -33,11 +33,12 @@ use crate::{
     },
     session::{
         AppendError, AppendReceipt, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome,
-        ApprovalRequestId, AttemptDisposition, AttemptToken, BarrierError, ClaimedAppend,
-        EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent, LlmRetryStartedEvent,
-        NewEvent, PreparedAttempt, RequestContext, RequestHeaderReason, RetryId, RetryNumber,
-        Session, SessionReadError, SessionReservation, StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN,
-        ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause, TurnEndReason, TurnId,
+        ApprovalRequestId, AttemptDisposition, AttemptResidentGuard, AttemptToken, BarrierError,
+        ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
+        LlmRetryStartedEvent, NewEvent, PreparedAttempt, RequestContext, RequestHeaderReason,
+        RetryId, RetryNumber, Session, SessionReadError, SessionReservation, StepId, SurfaceIntent,
+        TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause,
+        TurnEndReason, TurnId,
     },
 };
 
@@ -1791,13 +1792,15 @@ async fn run_step(
             StreamOutcome::Finished(prepared) => prepared,
         };
 
-        let (content, usage, finish, replay_state, source_seqs) = prepared_attempt.into_parts();
+        let prepared = prepared_attempt.into_parts();
         let assembled = AssembledAssistant {
-            content,
-            usage,
-            finish,
-            replay_state,
+            content: prepared.content,
+            usage: prepared.usage,
+            finish: prepared.finish,
+            replay_state: prepared.replay_state,
+            _resident_guard: prepared.resident_guard,
         };
+        let source_seqs = prepared.sources;
 
         // Cancellation can race with the provider's final item. Re-check it
         // before publishing an assistant message or starting any tool work.
@@ -1914,6 +1917,11 @@ async fn run_step(
                 }
                 Err(error) => return Err(error.into()),
             }
+            // The retry row now owns every fact needed after the failed
+            // attempt. Drop every moved-out attempt payload while the Session
+            // guard still covers it, before waiting for durable dispatch.
+            drop(assembled);
+            drop(source_seqs);
             let barrier = dispatch_barrier(reservation).await?;
             reservation.retire_attempt(token)?;
             attempt_token.take();
@@ -2098,25 +2106,32 @@ async fn commit_successful_attempt(
     turn: TurnId,
     step: StepId,
     config: LlmCallConfig,
-    mut assembled: AssembledAssistant,
+    assembled: AssembledAssistant,
     source_seqs: Vec<EventSeq>,
     attempt_token: &mut Option<AttemptToken>,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<StepResolution, AgentLoopError> {
-    let max_tokens = matches!(assembled.finish.kind(), FinishReasonKind::MaxTokens);
+    let AssembledAssistant {
+        mut content,
+        usage,
+        finish,
+        replay_state,
+        _resident_guard: resident_guard,
+    } = assembled;
+    let max_tokens = matches!(finish.kind(), FinishReasonKind::MaxTokens);
+    // FinishReason is attempt-only on every successful path. Release this
+    // alias while the Session attempt owner still covers the allocation, so
+    // tool execution cannot outlive the credit that accounted for it.
+    drop(finish);
     if max_tokens {
-        assembled.content = without_tool_calls(assembled.content);
+        content = without_tool_calls(content);
     }
     let message = Message::new(
         next_id(driver.runtime, AgentIdKind::Message)?,
         MessageRole::Assistant,
-        assembled.content,
-        MessageSource::model_with_replay_state(
-            config.provider(),
-            config.model(),
-            assembled.replay_state,
-        )?,
+        content,
+        MessageSource::model_with_replay_state(config.provider(), config.model(), replay_state)?,
     )?;
     let tool_calls = message
         .content()
@@ -2164,7 +2179,7 @@ async fn commit_successful_attempt(
             turn,
             step,
             message,
-            usage: assembled.usage,
+            usage,
         },
         SurfaceIntent::append().with_sources(source_seqs),
     );
@@ -2187,6 +2202,7 @@ async fn commit_successful_attempt(
         let barrier = dispatch_barrier(reservation).await?;
         reservation.retire_attempt(token)?;
         attempt_token.take();
+        drop(resident_guard);
         if barrier == DispatchBarrier::ObserverUnavailable {
             driver.observer_unavailable = true;
             return Ok(StepResolution::new(StepOutcome::Error(
@@ -2209,6 +2225,7 @@ async fn commit_successful_attempt(
         tool_calls,
         claim_profiles,
         attempt_token,
+        resident_guard,
         cancellation,
         budget_failure,
     )
@@ -2264,6 +2281,7 @@ async fn commit_tool_round(
     calls: Vec<ToolCall>,
     claim_profiles: Vec<ToolClaimProfile>,
     attempt_token: &mut Option<AttemptToken>,
+    resident_guard: Option<AttemptResidentGuard>,
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<StepResolution, AgentLoopError> {
@@ -2377,6 +2395,7 @@ async fn commit_tool_round(
     let barrier = dispatch_barrier(reservation).await?;
     reservation.retire_attempt(token)?;
     attempt_token.take();
+    drop(resident_guard);
     if barrier == DispatchBarrier::ObserverUnavailable {
         driver.observer_unavailable = true;
     }

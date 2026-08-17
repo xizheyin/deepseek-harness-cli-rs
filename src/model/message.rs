@@ -245,7 +245,7 @@ impl ContentBlock {
         )
     }
 
-    fn resident_bytes(&self) -> Option<usize> {
+    pub(crate) fn resident_bytes(&self) -> Option<usize> {
         let kind = match &self.inner.kind {
             ContentBlockKind::Text { text } | ContentBlockKind::Reasoning { text } => {
                 string_backing_charge(text.capacity())?

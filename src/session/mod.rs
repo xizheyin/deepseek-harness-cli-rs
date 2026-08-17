@@ -73,8 +73,9 @@ pub(crate) use tool_result_pruner::{
 use crate::{
     model::{JsonValue, Message, NonNegativeSafeInteger, StreamChunk},
     resident_credit::{
-        ChargedBytes, ChargedBytesError, MAX_RESIDENT_SURFACE_STEADY_BYTES, ResidentCreditLease,
-        ResidentCreditPool,
+        ChargedBytes, ChargedBytesError, MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
+        MAX_RESIDENT_SURFACE_STEADY_BYTES, ResidentCreditLease, ResidentCreditPool,
+        arc_inner_charge,
     },
 };
 
@@ -97,6 +98,8 @@ struct PreparedEvent {
     original_data: JsonValue,
     retained_json_bytes: usize,
     resident_credit: Option<ResidentCreditLease>,
+    attempt_payload_credit: Option<ResidentCreditLease>,
+    attempt_payload_resident_bytes: usize,
     surface_credit_prepared: bool,
 }
 
@@ -110,6 +113,8 @@ impl PreparedEvent {
             original_data: self.original_data.clone(),
             retained_json_bytes: self.retained_json_bytes,
             resident_credit: None,
+            attempt_payload_credit: None,
+            attempt_payload_resident_bytes: 0,
             surface_credit_prepared: false,
         }
     }
@@ -256,6 +261,8 @@ enum PendingAppendOutcome {
 struct PendingDurableCommit {
     retained_json_bytes: usize,
     resident_credit: Option<ResidentCreditLease>,
+    attempt_payload_credit: Option<ResidentCreditLease>,
+    attempt_payload_resident_bytes: usize,
     surface_credit_prepared: bool,
     reserved_row: Option<ChargedBytes>,
     encoded_row: Option<ChargedEventLineTemplate>,
@@ -277,6 +284,8 @@ impl PendingDurableCommit {
                 original_data,
                 retained_json_bytes: self.retained_json_bytes,
                 resident_credit: self.resident_credit,
+                attempt_payload_credit: self.attempt_payload_credit,
+                attempt_payload_resident_bytes: self.attempt_payload_resident_bytes,
                 surface_credit_prepared: self.surface_credit_prepared,
             },
             reserved_row,
@@ -711,11 +720,145 @@ struct ActiveAttemptOwner {
     step: StepId,
     phase: ActiveAttemptPhase,
     /// Attempt-only tables, vectors, and extension-type strings.
-    ///
-    /// Model payloads intentionally remain outside this partial slice: after
-    /// a successful closure they move into the long-lived surface and need a
-    /// separate surface lease rather than this 32 MiB attempt/journal pool.
     resident_bookkeeping_credit: Option<ResidentCreditLease>,
+    /// Typed provider payload retained by the hot attempt fold.
+    ///
+    /// A sealed assistant receives another guard, so cancellation cannot
+    /// release this account before a committed Message and usage anchor have
+    /// acquired their longer-lived credits.
+    resident_payload_guard: Option<AttemptResidentGuard>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptResidentGuard(Arc<AttemptResidentAccount>);
+
+#[derive(Debug)]
+struct AttemptResidentAccount {
+    credit: ResidentCreditLease,
+    control_bytes: usize,
+    block_bytes: usize,
+    usage_bytes: usize,
+    terminal_bytes: usize,
+}
+
+impl AttemptResidentAccount {
+    fn new(credit: ResidentCreditLease, control_bytes: usize) -> Self {
+        debug_assert_eq!(credit.bytes(), control_bytes);
+        Self {
+            credit,
+            control_bytes,
+            block_bytes: 0,
+            usage_bytes: 0,
+            terminal_bytes: 0,
+        }
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.block_bytes
+            .checked_add(self.usage_bytes)
+            .and_then(|bytes| bytes.checked_add(self.terminal_bytes))
+            .unwrap_or(usize::MAX)
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        self.credit.bytes()
+    }
+
+    fn install(
+        &mut self,
+        change: attempt_anchor::AttemptResidentChange,
+        retained: Option<ResidentCreditLease>,
+        newly_allocated: Option<ResidentCreditLease>,
+    ) -> Result<(), ()> {
+        let retained_bytes = retained.as_ref().map_or(0, ResidentCreditLease::bytes);
+        let new_bytes = newly_allocated
+            .as_ref()
+            .map_or(0, ResidentCreditLease::bytes);
+        if retained
+            .as_ref()
+            .is_some_and(|credit| !self.credit.shares_pool_with(credit))
+            || newly_allocated
+                .as_ref()
+                .is_some_and(|credit| !self.credit.shares_pool_with(credit))
+        {
+            return Err(());
+        }
+        match change {
+            attempt_anchor::AttemptResidentChange::None => {
+                if retained_bytes != 0 || new_bytes != 0 {
+                    return Err(());
+                }
+            }
+            attempt_anchor::AttemptResidentChange::BlockEnd {
+                retained_bytes: expected,
+            } => {
+                if retained_bytes != expected || new_bytes != 0 {
+                    return Err(());
+                }
+                self.block_bytes = self.block_bytes.checked_add(expected).ok_or(())?;
+            }
+            attempt_anchor::AttemptResidentChange::Usage {
+                retained_bytes: expected,
+            } => {
+                if retained_bytes != expected || new_bytes != 0 {
+                    return Err(());
+                }
+                if self.usage_bytes != 0 {
+                    drop(self.credit.split_off(self.usage_bytes).map_err(|_| ())?);
+                }
+                self.usage_bytes = expected;
+            }
+            attempt_anchor::AttemptResidentChange::Finish {
+                retained_bytes: expected,
+                new_bytes: expected_new,
+                keeps_blocks,
+            } => {
+                if retained_bytes != expected
+                    || new_bytes != expected_new
+                    || self.terminal_bytes != 0
+                {
+                    return Err(());
+                }
+                if !keeps_blocks && self.block_bytes != 0 {
+                    drop(self.credit.split_off(self.block_bytes).map_err(|_| ())?);
+                    self.block_bytes = 0;
+                }
+                self.terminal_bytes = expected.checked_add(expected_new).ok_or(())?;
+            }
+        }
+        if let Some(credit) = retained {
+            self.credit.merge(credit).map_err(|_| ())?;
+        }
+        if let Some(credit) = newly_allocated {
+            self.credit.merge(credit).map_err(|_| ())?;
+        }
+        debug_assert_eq!(
+            self.credit.bytes(),
+            self.control_bytes.saturating_add(self.payload_bytes())
+        );
+        Ok(())
+    }
+}
+
+impl AttemptResidentGuard {
+    fn new(account: AttemptResidentAccount) -> Self {
+        Self(Arc::new(account))
+    }
+
+    fn get_mut(&mut self) -> Option<&mut AttemptResidentAccount> {
+        Arc::get_mut(&mut self.0)
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        self.0.total_bytes()
+    }
+
+    #[cfg(test)]
+    fn payload_bytes(&self) -> usize {
+        self.0.payload_bytes()
+    }
 }
 
 /// Exclusive append view that prevents ordinary events from consuming claims.
@@ -779,6 +922,8 @@ pub struct Session {
     resident_pool: Option<ResidentCreditPool>,
     surface_resident_pool: Option<ResidentCreditPool>,
     surface_resident_steady_limit: usize,
+    validation_other_resident_pool: Option<ResidentCreditPool>,
+    validation_other_resident_steady_limit: usize,
     mode: SessionMode,
 }
 
@@ -816,6 +961,8 @@ impl Session {
             resident_pool: None,
             surface_resident_pool: None,
             surface_resident_steady_limit: MAX_RESIDENT_SURFACE_STEADY_BYTES,
+            validation_other_resident_pool: None,
+            validation_other_resident_steady_limit: MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
             mode: SessionMode::Memory {
                 events: Vec::new(),
                 retained_json_bytes,
@@ -849,6 +996,8 @@ impl Session {
             resident_pool: Some(resident_pool),
             surface_resident_pool: Some(ResidentCreditPool::for_surface()),
             surface_resident_steady_limit: MAX_RESIDENT_SURFACE_STEADY_BYTES,
+            validation_other_resident_pool: Some(ResidentCreditPool::for_index_other()),
+            validation_other_resident_steady_limit: MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
             mode: SessionMode::Durable {
                 storage: SessionStorage::Deferred(journal),
                 logical_event_count: 0,
@@ -890,6 +1039,8 @@ impl Session {
             resident_pool: Some(resident_pool),
             surface_resident_pool: Some(ResidentCreditPool::for_surface()),
             surface_resident_steady_limit: MAX_RESIDENT_SURFACE_STEADY_BYTES,
+            validation_other_resident_pool: Some(ResidentCreditPool::for_index_other()),
+            validation_other_resident_steady_limit: MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
             mode: SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 logical_event_count: 0,
@@ -929,6 +1080,8 @@ impl Session {
             resident_pool: None,
             surface_resident_pool: None,
             surface_resident_steady_limit: MAX_RESIDENT_SURFACE_STEADY_BYTES,
+            validation_other_resident_pool: None,
+            validation_other_resident_steady_limit: MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
             mode: SessionMode::Memory {
                 events: seed.to_vec(),
                 retained_json_bytes,
@@ -966,6 +1119,8 @@ impl Session {
             resident_pool: Some(resident_pool),
             surface_resident_pool: Some(ResidentCreditPool::for_surface()),
             surface_resident_steady_limit: MAX_RESIDENT_SURFACE_STEADY_BYTES,
+            validation_other_resident_pool: Some(ResidentCreditPool::for_index_other()),
+            validation_other_resident_steady_limit: MAX_RESIDENT_INDEX_OTHER_STEADY_BYTES,
             mode: SessionMode::Durable {
                 storage: SessionStorage::Active(writer),
                 logical_event_count: seed.logical_event_count,
@@ -1564,11 +1719,15 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
             surface_credit_prepared,
         } = prepared;
         let mut commit = PendingDurableCommit {
             retained_json_bytes,
             resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
             surface_credit_prepared,
             reserved_row,
             encoded_row: None,
@@ -1590,6 +1749,8 @@ impl Session {
                             original_data,
                             retained_json_bytes: commit.retained_json_bytes,
                             resident_credit: commit.resident_credit,
+                            attempt_payload_credit: commit.attempt_payload_credit,
+                            attempt_payload_resident_bytes: commit.attempt_payload_resident_bytes,
                             surface_credit_prepared: commit.surface_credit_prepared,
                         },
                         reserved_row: commit.reserved_row,
@@ -1625,10 +1786,50 @@ impl Session {
                 self.projection.prepare_durable_event(&event)
             }
         };
-        let prepared_projection = match prepared_projection {
+        let mut prepared_projection = match prepared_projection {
             Ok(projection) => projection,
             Err(error) => return commit.reject(event, error.into()),
         };
+        let charges_new_token_anchor = matches!(
+            &commit.owner,
+            DurableOperationOwner::Attempt {
+                kind: AttemptOperationKind::Closure(AttemptDisposition::Committed),
+                ..
+            }
+        );
+        let token_anchor_resident_bytes = if charges_new_token_anchor {
+            prepared_projection.token_anchor_usage_resident_bytes()
+        } else {
+            0
+        };
+        if token_anchor_resident_bytes > self.validation_other_resident_steady_limit {
+            return commit.reject(
+                event,
+                AppendError::DurableResidentLimit {
+                    maximum: self.validation_other_resident_steady_limit,
+                },
+            );
+        }
+        if token_anchor_resident_bytes != 0 {
+            let Some(pool) = self.validation_other_resident_pool.as_ref() else {
+                return commit.reject(event, AppendError::DurablePoisoned);
+            };
+            let credit = match pool.try_acquire(token_anchor_resident_bytes) {
+                Ok(credit) => Arc::new(credit),
+                Err(error) => {
+                    return commit.reject(
+                        event,
+                        AppendError::DurableResidentLimit {
+                            maximum: error.maximum(),
+                        },
+                    );
+                }
+            };
+            if !prepared_projection.install_token_anchor_usage_credit(credit) {
+                return commit.reject(event, AppendError::DurablePoisoned);
+            }
+        }
+        let attempt_payload_change = prepared_projection.attempt_payload_resident_change();
         let committed_message = match event.kind() {
             EventKind::UserMessage { message }
             | EventKind::AssistantMessage { message, .. }
@@ -1654,6 +1855,48 @@ impl Session {
             None
         } else {
             match resident_pool.try_acquire(attempt_bookkeeping_bytes) {
+                Ok(credit) => Some(credit),
+                Err(error) => {
+                    return commit.reject(
+                        event,
+                        AppendError::DurableResidentLimit {
+                            maximum: error.maximum(),
+                        },
+                    );
+                }
+            }
+        };
+        let (expected_retained_payload, new_attempt_payload_bytes) = match attempt_payload_change {
+            attempt_anchor::AttemptResidentChange::None => (0, 0),
+            attempt_anchor::AttemptResidentChange::BlockEnd { retained_bytes }
+            | attempt_anchor::AttemptResidentChange::Usage { retained_bytes } => {
+                (retained_bytes, 0)
+            }
+            attempt_anchor::AttemptResidentChange::Finish {
+                retained_bytes,
+                new_bytes,
+                ..
+            } => (retained_bytes, new_bytes),
+        };
+        if commit
+            .attempt_payload_credit
+            .as_ref()
+            .map_or(0, ResidentCreditLease::bytes)
+            != expected_retained_payload
+            || (matches!(
+                commit.owner,
+                DurableOperationOwner::Attempt {
+                    kind: AttemptOperationKind::Chunk,
+                    ..
+                }
+            ) && commit.attempt_payload_resident_bytes == 0)
+        {
+            return commit.reject(event, AppendError::DurablePoisoned);
+        }
+        let mut new_attempt_payload_credit = if new_attempt_payload_bytes == 0 {
+            None
+        } else {
+            match resident_pool.try_acquire(new_attempt_payload_bytes) {
                 Ok(credit) => Some(credit),
                 Err(error) => {
                     return commit.reject(
@@ -1827,6 +2070,34 @@ impl Session {
                 return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
             };
             if credit.merge(delta).is_err() {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            }
+        }
+        if !matches!(
+            attempt_payload_change,
+            attempt_anchor::AttemptResidentChange::None
+        ) {
+            let Some(active) = &mut self.active_attempt else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            let Some(guard) = &mut active.resident_payload_guard else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            let Some(account) = guard.get_mut() else {
+                *storage = SessionStorage::Failed(StoreError::Poisoned);
+                return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
+            };
+            if account
+                .install(
+                    attempt_payload_change,
+                    commit.attempt_payload_credit.take(),
+                    new_attempt_payload_credit.take(),
+                )
+                .is_err()
+            {
                 *storage = SessionStorage::Failed(StoreError::Poisoned);
                 return DurableAppendAttempt::Failed(AppendError::DurablePoisoned);
             }
@@ -2312,15 +2583,18 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit: None,
+            attempt_payload_credit: None,
+            attempt_payload_resident_bytes: 0,
             surface_credit_prepared: false,
         })
     }
 
     /// Charge the independently retained raw JSON tree before a durable
-    /// operation can own the candidate across an await. Typed event payloads
-    /// and attempt-retained values join this same owner in later Phase 8
-    /// slices; keeping this lease on `PreparedEvent` already makes rejection
-    /// and cancellation transfer the exact raw allocation without recharging.
+    /// operation can own the candidate across an await. Hot assistant chunks
+    /// add their typed transient graph and retained-child handoff separately;
+    /// other typed event variants remain a later Phase 8 slice. Keeping these
+    /// leases on `PreparedEvent` makes rejection and cancellation move the
+    /// exact allocations without recharging.
     fn charge_prepared_event(
         &self,
         mut prepared: PreparedEvent,
@@ -2329,7 +2603,7 @@ impl Session {
             return Ok(prepared);
         }
         if let Some(credit) = &prepared.resident_credit {
-            debug_assert_eq!(credit.bytes(), prepared.original_data.resident_bytes());
+            debug_assert!(credit.bytes() >= prepared.original_data.resident_bytes());
             return Ok(prepared);
         }
         let pool = self
@@ -2342,6 +2616,97 @@ impl Session {
                 maximum: error.maximum(),
             })?;
         prepared.resident_credit = Some(credit);
+        Ok(prepared)
+    }
+
+    fn charge_attempt_chunk_payload(
+        &self,
+        mut prepared: PreparedEvent,
+    ) -> Result<PreparedEvent, AppendError> {
+        if !matches!(self.mode, SessionMode::Durable { .. })
+            || prepared.attempt_payload_resident_bytes != 0
+        {
+            return Ok(prepared);
+        }
+        let EventKind::AssistantChunk { chunk, .. } = &prepared.event.kind else {
+            return Err(invalid_attempt(
+                "attempt payload credit requires an assistant chunk",
+            ));
+        };
+        let total = chunk.resident_bytes();
+        let retained = chunk.attempt_retained_resident_bytes();
+        if retained > total {
+            return Err(AppendError::Capacity);
+        }
+        let pool = self
+            .resident_pool
+            .as_ref()
+            .ok_or(AppendError::DurablePoisoned)?;
+        let mut credit =
+            pool.try_acquire(total)
+                .map_err(|error| AppendError::DurableResidentLimit {
+                    maximum: error.maximum(),
+                })?;
+        let retained_credit = if retained == 0 {
+            None
+        } else {
+            Some(
+                credit
+                    .split_off(retained)
+                    .map_err(|_| AppendError::Capacity)?,
+            )
+        };
+        let Some(original_credit) = prepared.resident_credit.as_mut() else {
+            return Err(AppendError::DurablePoisoned);
+        };
+        original_credit
+            .merge(credit)
+            .map_err(|_| AppendError::DurablePoisoned)?;
+        prepared.attempt_payload_credit = retained_credit;
+        prepared.attempt_payload_resident_bytes = total;
+        Ok(prepared)
+    }
+
+    fn validate_attempt_chunk_prepared(
+        &self,
+        prepared: PreparedEvent,
+    ) -> Result<PreparedEvent, (AppendError, PreparedEvent)> {
+        let seq = match self.next_seq {
+            Some(seq) => seq,
+            None => return Err((AppendError::SequenceExhausted, prepared)),
+        };
+        let placeholder_time = match UnixMillis::new(0) {
+            Ok(time) => time,
+            Err(_) => return Err((AppendError::SequenceExhausted, prepared)),
+        };
+        let PreparedEvent {
+            event,
+            original_data,
+            retained_json_bytes,
+            resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
+            surface_credit_prepared,
+        } = prepared;
+        let candidate = SessionEvent::from_new(seq, placeholder_time, event, original_data);
+        let validation = self
+            .projection
+            .prepare_durable_attempt_chunk(&candidate)
+            .map(|_| ())
+            .map_err(AppendError::from);
+        let (event, original_data) = candidate.into_new();
+        let prepared = PreparedEvent {
+            event,
+            original_data,
+            retained_json_bytes,
+            resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
+            surface_credit_prepared,
+        };
+        if let Err(error) = validation {
+            return Err((error, prepared));
+        }
         Ok(prepared)
     }
 
@@ -2366,6 +2731,8 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
             surface_credit_prepared,
         } = prepared;
         let candidate = SessionEvent::from_new(seq, placeholder_time, event, original_data);
@@ -2380,6 +2747,8 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
             surface_credit_prepared,
         };
         if let Err(error) = validation {
@@ -2493,6 +2862,8 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit: None,
+            attempt_payload_credit: None,
+            attempt_payload_resident_bytes: 0,
             surface_credit_prepared: false,
         })
     }
@@ -2731,6 +3102,8 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
             surface_credit_prepared,
         } = prepared;
         let candidate = SessionEvent::from_new(seq, time, event, original_data);
@@ -2741,6 +3114,8 @@ impl Session {
             original_data,
             retained_json_bytes,
             resident_credit,
+            attempt_payload_credit,
+            attempt_payload_resident_bytes,
             surface_credit_prepared,
         })
     }
@@ -2923,6 +3298,32 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_validation_other_resident_limits_for_test(
+        &mut self,
+        high_water: usize,
+        steady: usize,
+    ) -> ResidentCreditPool {
+        let SessionMode::Durable {
+            storage: SessionStorage::Active(writer),
+            pending_batch,
+            pending_operation,
+            ..
+        } = &mut self.mode
+        else {
+            panic!("the validation-index seam requires an idle active durable session");
+        };
+        assert!(writer.ensure_stageable().is_ok());
+        assert_eq!(pending_batch.event_count, 0);
+        assert!(pending_batch.bytes.is_none());
+        assert!(pending_operation.is_none());
+        assert_eq!(self.projection.token_anchor_resident_bytes_for_test(), 0);
+        let pool = ResidentCreditPool::with_limit_for_test(high_water);
+        self.validation_other_resident_pool = Some(pool.clone());
+        self.validation_other_resident_steady_limit = steady;
+        pool
+    }
+
+    #[cfg(test)]
     pub(crate) fn surface_resident_bytes_for_test(&self) -> usize {
         self.projection.surface_resident_bytes()
     }
@@ -2930,15 +3331,49 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn attempt_bookkeeping_baseline_for_test() -> usize {
         attempt_anchor::AttemptProjection::bookkeeping_baseline_for_test()
+            .checked_add(
+                arc_inner_charge::<AttemptResidentAccount>()
+                    .expect("the bounded attempt account charge must fit usize"),
+            )
+            .expect("the bounded attempt baseline must fit usize")
     }
 
     #[cfg(test)]
     pub(crate) fn active_attempt_bookkeeping_bytes_for_test(&self) -> Option<usize> {
         self.active_attempt.as_ref().map(|attempt| {
+            let bookkeeping = attempt
+                .resident_bookkeeping_credit
+                .as_ref()
+                .map_or(0, ResidentCreditLease::bytes);
+            let control = attempt
+                .resident_payload_guard
+                .as_ref()
+                .map_or(0, |guard| guard.0.control_bytes);
+            bookkeeping.saturating_add(control)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_attempt_payload_bytes_for_test(&self) -> Option<usize> {
+        self.active_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.resident_payload_guard.as_ref())
+            .map(AttemptResidentGuard::payload_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_attempt_resident_bytes_for_test(&self) -> Option<usize> {
+        self.active_attempt.as_ref().map(|attempt| {
             attempt
                 .resident_bookkeeping_credit
                 .as_ref()
                 .map_or(0, ResidentCreditLease::bytes)
+                .saturating_add(
+                    attempt
+                        .resident_payload_guard
+                        .as_ref()
+                        .map_or(0, AttemptResidentGuard::total_bytes),
+                )
         })
     }
 
@@ -3380,19 +3815,37 @@ impl SessionReservation<'_> {
             .projection
             .prepare_live_attempt(turn, step)
             .map_err(EventValidationError::from)?;
-        let resident_bookkeeping_credit = match self.session.resident_pool.as_ref() {
-            Some(pool) => Some(
-                pool.try_acquire(
-                    prepared
+        let (resident_bookkeeping_credit, resident_payload_guard) =
+            match self.session.resident_pool.as_ref() {
+                Some(pool) => {
+                    let bookkeeping_bytes = prepared
                         .resident_bookkeeping_bytes()
-                        .map_err(EventValidationError::from)?,
-                )
-                .map_err(|error| AppendError::DurableResidentLimit {
-                    maximum: error.maximum(),
-                })?,
-            ),
-            None => None,
-        };
+                        .map_err(EventValidationError::from)?;
+                    let control_bytes = arc_inner_charge::<AttemptResidentAccount>()
+                        .ok_or(AppendError::Capacity)?;
+                    let total = bookkeeping_bytes
+                        .checked_add(control_bytes)
+                        .ok_or(AppendError::Capacity)?;
+                    let mut credit = pool.try_acquire(total).map_err(|error| {
+                        AppendError::DurableResidentLimit {
+                            maximum: error.maximum(),
+                        }
+                    })?;
+                    let control_credit = credit.split_off(control_bytes).map_err(|error| {
+                        AppendError::DurableResidentLimit {
+                            maximum: error.maximum(),
+                        }
+                    })?;
+                    (
+                        Some(credit),
+                        Some(AttemptResidentGuard::new(AttemptResidentAccount::new(
+                            control_credit,
+                            control_bytes,
+                        ))),
+                    )
+                }
+                None => (None, None),
+            };
         prepared
             .commit(&mut self.session.projection)
             .map_err(EventValidationError::from)?;
@@ -3404,6 +3857,7 @@ impl SessionReservation<'_> {
             step,
             phase: ActiveAttemptPhase::Open,
             resident_bookkeeping_credit,
+            resident_payload_guard,
         });
         Ok(AttemptToken {
             authority: self.session.attempt_authority.clone(),
@@ -3445,7 +3899,10 @@ impl SessionReservation<'_> {
         self.session.ensure_durable_active()?;
         let prepared = self
             .session
-            .charge_prepared_event(Session::prepare_event(event)?)?;
+            .validate_attempt_chunk_prepared(Session::prepare_event(event)?)
+            .map_err(|(error, _prepared)| error)?;
+        let prepared = self.session.charge_prepared_event(prepared)?;
+        let prepared = self.session.charge_attempt_chunk_payload(prepared)?;
         let protected_events =
             u64::try_from(self.reserved_events).map_err(|_| AppendError::SequenceExhausted)?;
         let SessionMode::Durable {
@@ -3481,11 +3938,18 @@ impl SessionReservation<'_> {
     ) -> Result<PreparedAttempt, AppendError> {
         self.session
             .validate_open_attempt_token(token, &self.owner)?;
-        self.session
+        let prepared = self
+            .session
             .projection
             .seal_live_attempt()
             .map_err(EventValidationError::from)
-            .map_err(AppendError::from)
+            .map_err(AppendError::from)?;
+        let guard = self
+            .session
+            .active_attempt
+            .as_ref()
+            .and_then(|active| active.resident_payload_guard.clone());
+        Ok(prepared.with_resident_guard(guard))
     }
 
     /// Commit the one event that consumes a sealed or interrupted attempt.

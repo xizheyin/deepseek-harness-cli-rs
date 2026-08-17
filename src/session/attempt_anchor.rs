@@ -283,19 +283,30 @@ impl OpenAttempt {
             });
         }
         let mut next_usage = None;
-        let operation = match chunk.kind() {
-            StreamChunkKind::BlockStart { index, .. } => {
-                PreparedChunkOperation::BlockStart { index: index.get() }
-            }
-            StreamChunkKind::BlockEnd { index, block } => PreparedChunkOperation::BlockEnd {
-                index: index.get(),
-                block: block.clone(),
-            },
+        let (operation, resident_payload_change) = match chunk.kind() {
+            StreamChunkKind::BlockStart { index, .. } => (
+                PreparedChunkOperation::BlockStart { index: index.get() },
+                AttemptResidentChange::None,
+            ),
+            StreamChunkKind::BlockEnd { index, block } => (
+                PreparedChunkOperation::BlockEnd {
+                    index: index.get(),
+                    block: block.clone(),
+                },
+                AttemptResidentChange::BlockEnd {
+                    retained_bytes: block.resident_bytes().ok_or(AttemptError::Capacity)?,
+                },
+            ),
             StreamChunkKind::Usage { usage } => {
                 next_usage = Some(usage_projection.with_sample(self.turn, self.step, usage)?);
-                PreparedChunkOperation::Usage {
-                    usage: usage.clone(),
-                }
+                (
+                    PreparedChunkOperation::Usage {
+                        usage: usage.clone(),
+                    },
+                    AttemptResidentChange::Usage {
+                        retained_bytes: usage.resident_bytes(),
+                    },
+                )
             }
             StreamChunkKind::Finish {
                 reason,
@@ -330,17 +341,36 @@ impl OpenAttempt {
                     .as_ref()
                     .map(|_| self.provider_assistant_tokens(reason))
                     .transpose()?;
-                PreparedChunkOperation::Finish {
-                    reason: reason.clone(),
-                    replay_state: replay_state.clone(),
-                    content,
-                    normalized_digest,
-                    provider_assistant_tokens,
-                }
+                let retained_bytes = reason
+                    .resident_bytes()
+                    .checked_add(replay_state.as_ref().map_or(0, JsonValue::resident_bytes))
+                    .ok_or(AttemptError::Capacity)?;
+                let new_bytes = content.as_ref().map_or(Ok(0), |content| {
+                    vec_backing_charge::<ContentBlock>(content.capacity())
+                        .ok_or(AttemptError::Capacity)
+                })?;
+                let keeps_blocks = content.is_some();
+                (
+                    PreparedChunkOperation::Finish {
+                        reason: reason.clone(),
+                        replay_state: replay_state.clone(),
+                        content,
+                        normalized_digest,
+                        provider_assistant_tokens,
+                    },
+                    AttemptResidentChange::Finish {
+                        retained_bytes,
+                        new_bytes,
+                        keeps_blocks,
+                    },
+                )
             }
             StreamChunkKind::TextDelta { .. }
             | StreamChunkKind::ReasoningDelta { .. }
-            | StreamChunkKind::ToolCallDelta { .. } => PreparedChunkOperation::Continue,
+            | StreamChunkKind::ToolCallDelta { .. } => (
+                PreparedChunkOperation::Continue,
+                AttemptResidentChange::None,
+            ),
             StreamChunkKind::Other { .. } => {
                 return Err(AttemptError::Boundary {
                     event_type: "assistant/chunk",
@@ -357,6 +387,7 @@ impl OpenAttempt {
             operation,
             next_usage,
             resident_bookkeeping_bytes,
+            resident_payload_change,
         })
     }
 
@@ -458,6 +489,7 @@ pub(super) struct PreparedExistingChunk {
     operation: PreparedChunkOperation,
     next_usage: Option<UsageProjection>,
     resident_bookkeeping_bytes: usize,
+    resident_payload_change: AttemptResidentChange,
 }
 
 enum PreparedChunkOperation {
@@ -478,6 +510,22 @@ enum PreparedChunkOperation {
         content: Option<Vec<ContentBlock>>,
         normalized_digest: Option<[u8; 32]>,
         provider_assistant_tokens: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AttemptResidentChange {
+    None,
+    BlockEnd {
+        retained_bytes: usize,
+    },
+    Usage {
+        retained_bytes: usize,
+    },
+    Finish {
+        retained_bytes: usize,
+        new_bytes: usize,
+        keeps_blocks: bool,
     },
 }
 
@@ -588,6 +636,13 @@ impl PreparedAttemptChunk {
             Self::Continue(prepared) => prepared.resident_bookkeeping_bytes,
         }
     }
+
+    pub(super) fn resident_payload_change(&self) -> AttemptResidentChange {
+        match self {
+            Self::Replace { .. } => AttemptResidentChange::None,
+            Self::Continue(prepared) => prepared.resident_payload_change,
+        }
+    }
 }
 
 pub(super) struct PreparedLiveAttempt {
@@ -624,32 +679,43 @@ impl PreparedLiveAttempt {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct PreparedAttempt {
     content: Vec<ContentBlock>,
     usage: Option<TokenUsage>,
     finish: FinishReason,
     replay_state: Option<JsonValue>,
     sources: Vec<EventSeq>,
+    resident_guard: Option<super::AttemptResidentGuard>,
+}
+
+pub(crate) struct PreparedAttemptParts {
+    pub(crate) content: Vec<ContentBlock>,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) finish: FinishReason,
+    pub(crate) replay_state: Option<JsonValue>,
+    pub(crate) sources: Vec<EventSeq>,
+    pub(crate) resident_guard: Option<super::AttemptResidentGuard>,
 }
 
 impl PreparedAttempt {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<ContentBlock>,
-        Option<TokenUsage>,
-        FinishReason,
-        Option<JsonValue>,
-        Vec<EventSeq>,
-    ) {
-        (
-            self.content,
-            self.usage,
-            self.finish,
-            self.replay_state,
-            self.sources,
-        )
+    pub(crate) fn into_parts(self) -> PreparedAttemptParts {
+        PreparedAttemptParts {
+            content: self.content,
+            usage: self.usage,
+            finish: self.finish,
+            replay_state: self.replay_state,
+            sources: self.sources,
+            resident_guard: self.resident_guard,
+        }
+    }
+
+    pub(super) fn with_resident_guard(
+        mut self,
+        guard: Option<super::AttemptResidentGuard>,
+    ) -> Self {
+        self.resident_guard = guard;
+        self
     }
 }
 
@@ -960,6 +1026,7 @@ impl AttemptProjection {
             finish: reason,
             replay_state,
             sources,
+            resident_guard: None,
         };
         self.state = AttemptState::Sealed(sealed);
         Ok(prepared)
@@ -1543,15 +1610,15 @@ mod tests {
         .unwrap();
 
         let prepared = projection.take_prepared().unwrap();
-        let (content, usage, finish, replay, sources) = prepared.into_parts();
-        assert!(content.is_empty());
-        assert_eq!(usage, None);
-        assert!(matches!(finish.kind(), FinishReasonKind::Stop));
-        assert_eq!(replay, None);
-        assert_eq!(sources, vec![EventSeq::new(4).unwrap()]);
+        let parts = prepared.into_parts();
+        assert!(parts.content.is_empty());
+        assert_eq!(parts.usage, None);
+        assert!(matches!(parts.finish.kind(), FinishReasonKind::Stop));
+        assert_eq!(parts.replay_state, None);
+        assert_eq!(parts.sources, vec![EventSeq::new(4).unwrap()]);
 
         let (committed, facts) = projection
-            .assistant(&assistant_event(5, vec![], None, sources))
+            .assistant(&assistant_event(5, vec![], None, parts.sources))
             .unwrap();
         assert_eq!(facts.provider_assistant_tokens(), 0);
         assert_eq!(
@@ -1576,14 +1643,14 @@ mod tests {
         .unwrap();
 
         let prepared = projection.take_prepared().unwrap();
-        let (_, _, _, prepared_replay, sources) = prepared.into_parts();
-        assert_eq!(prepared_replay, Some(replay));
+        let parts = prepared.into_parts();
+        assert_eq!(parts.replay_state, Some(replay));
 
         let changed = assistant_event_with_replay(
             5,
             vec![],
             None,
-            sources.clone(),
+            parts.sources.clone(),
             Some(JsonValue::new(json!({"number": 2, "nested": [true, null]})).unwrap()),
         );
         assert_eq!(
@@ -1595,7 +1662,7 @@ mod tests {
             5,
             vec![],
             None,
-            sources,
+            parts.sources,
             Some(JsonValue::new(json!({"number": 1, "nested": [true, null]})).unwrap()),
         );
         projection.assistant(&equivalent).unwrap();
@@ -1676,15 +1743,20 @@ mod tests {
             commit_chunk(&mut projection, seq, chunk).unwrap();
         }
         let prepared = projection.take_prepared().unwrap();
-        let (_, _, _, _, sources) = prepared.into_parts();
+        let parts = prepared.into_parts();
 
-        let forged = assistant_event(25, vec![text.clone(), forged_call], None, sources.clone());
+        let forged = assistant_event(
+            25,
+            vec![text.clone(), forged_call],
+            None,
+            parts.sources.clone(),
+        );
         assert_eq!(
             projection.assistant(&forged),
             Err(AttemptError::ContentMismatch)
         );
         let (_, facts) = projection
-            .assistant(&assistant_event(25, vec![text], None, sources))
+            .assistant(&assistant_event(25, vec![text], None, parts.sources))
             .unwrap();
         assert_eq!(facts.provider_assistant_tokens(), 10);
     }
@@ -1724,13 +1796,16 @@ mod tests {
         }
 
         let prepared = projection.take_prepared().unwrap();
-        let (content, actual_usage, finish, replay, sources) = prepared.into_parts();
-        assert!(content.is_empty());
-        assert_eq!(actual_usage, Some(usage));
-        assert!(matches!(finish.kind(), FinishReasonKind::Error { .. }));
-        assert_eq!(replay, None);
+        let parts = prepared.into_parts();
+        assert!(parts.content.is_empty());
+        assert_eq!(parts.usage, Some(usage));
+        assert!(matches!(
+            parts.finish.kind(),
+            FinishReasonKind::Error { .. }
+        ));
+        assert_eq!(parts.replay_state, None);
         assert_eq!(
-            sources,
+            parts.sources,
             vec![EventSeq::new(30).unwrap(), EventSeq::new(31).unwrap()]
         );
 
