@@ -385,6 +385,20 @@ struct SurfaceNode {
     tool_result: Option<ToolResultOrigin>,
 }
 
+/// One balanced oldest surface prefix that a live Agent may summarize.
+///
+/// Projection owns the tool-call/result pairing rules, so callers receive an
+/// already-safe candidate instead of trying to reproduce those rules.
+pub(crate) struct CompactionCandidate {
+    pub(crate) source_surface_generation: u64,
+    pub(crate) range: super::CompactionRange,
+    pub(crate) shadowed_seqs: Vec<EventSeq>,
+    pub(crate) shadowed_token_count: u64,
+    pub(crate) messages: Vec<Message>,
+    pub(crate) request_header_seq: Option<EventSeq>,
+    pub(crate) request_context_seq: Option<EventSeq>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToolResultOrigin {
     Memory {
@@ -1143,6 +1157,52 @@ impl Projection {
         } else {
             Ok(baseline.saturating_sub(anchor.surface_tokens - self.surface_tokens))
         }
+    }
+
+    pub(crate) fn compaction_candidate(
+        &self,
+        retain_tokens: u64,
+    ) -> Result<Option<CompactionCandidate>, SurfaceError> {
+        let Some(selected) = select_compactable_prefix(
+            self.surface_nodes.as_slice(),
+            retain_tokens,
+            MAX_SOURCE_EVENT_SEQS - 2,
+            surface_price_facts,
+        )
+        .map_err(context_budget_surface_error)?
+        else {
+            return Ok(None);
+        };
+        let shadowed = &self.surface_nodes[..selected.end_exclusive];
+        let Some(first) = shadowed.first() else {
+            return Ok(None);
+        };
+        let Some(last) = shadowed.last() else {
+            return Ok(None);
+        };
+        let mut shadowed_seqs = Vec::new();
+        shadowed_seqs
+            .try_reserve_exact(shadowed.len())
+            .map_err(|_| SurfaceError::ResidentAccountingOverflow)?;
+        shadowed_seqs.extend(shadowed.iter().map(|node| node.seq));
+        let mut messages = Vec::new();
+        messages
+            .try_reserve_exact(shadowed.len())
+            .map_err(|_| SurfaceError::ResidentAccountingOverflow)?;
+        messages.extend(shadowed.iter().filter_map(|node| node.message.clone()));
+        Ok(Some(CompactionCandidate {
+            source_surface_generation: self.compaction.surface_generation,
+            range: super::CompactionRange::new(first.seq, last.seq),
+            shadowed_seqs,
+            shadowed_token_count: selected.shadowed_token_count,
+            messages,
+            request_header_seq: self.request_header_seq,
+            request_context_seq: self.request_context_seq,
+        }))
+    }
+
+    pub(crate) fn estimated_message_tokens(message: &Message) -> Result<u64, SurfaceError> {
+        estimate_message(message).map_err(context_budget_surface_error)
     }
 
     pub(crate) fn has_unresolved_surface_tool_calls(&self) -> bool {

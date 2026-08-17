@@ -177,6 +177,20 @@ fn text_sse(text: &str) -> String {
     )
 }
 
+fn text_sse_with_usage(text: &str, prompt_tokens: u64, completion_tokens: u64) -> String {
+    let delta = serde_json::json!({
+        "choices": [{ "delta": { "content": text } }]
+    });
+    let finish = serde_json::json!({
+        "choices": [{ "delta": {}, "finish_reason": "stop" }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        }
+    });
+    format!("data: {delta}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
+}
+
 fn spawn_response_server(bodies: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
     listener
@@ -808,7 +822,13 @@ fn a_real_script_session_resumes_from_its_stored_workspace_and_model() {
         .stderr(Stdio::piped());
     let second = OwnedScriptChild::new(second.spawn().expect("resume should spawn"))
         .wait_with_output(Duration::from_secs(10));
-    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(
+        second.status.success(),
+        "status={:?}, stdout-bytes={}, stderr={:?}",
+        second.status.code(),
+        second.stdout.len(),
+        stderr(&second)
+    );
     assert_eq!(stdout(&second), "second durable answer\n");
     assert_eq!(stderr(&second), "");
 
@@ -861,6 +881,128 @@ fn a_real_script_session_resumes_from_its_stored_workspace_and_model() {
 
     std::fs::remove_dir_all(workspace).unwrap();
     std::fs::remove_dir_all(caller_workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_real_resumed_script_compacts_once_and_continues_the_same_prompt() {
+    let workspace = script_workspace("resume-auto-compaction");
+    let old_answer = format!("OLD_PREFIX_SENTINEL {}", "o".repeat(8_000));
+    let recent_prompt = format!("RECENT_TAIL_PROMPT_SENTINEL {}", "r".repeat(660_000));
+    let recent_answer = "RECENT_TAIL_ANSWER_SENTINEL";
+    let target_prompt = "TARGET_PROMPT_SENTINEL continue the same task";
+    let summary = "SUMMARY_CHECKPOINT_SENTINEL: preserve the earlier requirements";
+    let final_answer = "continued after the automatic summary";
+    let (base_url, server) = spawn_response_server(vec![
+        text_sse_with_usage(&old_answer, 640_000, 2_000),
+        text_sse_with_usage(recent_answer, 650_000, 165_000),
+        text_sse_with_usage(summary, 1_000, 50),
+        text_sse(final_answer),
+    ]);
+
+    let first = run_script(
+        &base_url,
+        &workspace,
+        "OLD_PROMPT_SENTINEL establish context",
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stdout(&first).starts_with("OLD_PREFIX_SENTINEL "));
+    assert_eq!(stderr(&first), "");
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let mut second = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    second
+        .args(["--resume", &session_id, "--no-color"])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DEEPSEEK_API_KEY", "test-key-for-loopback-only")
+        .env("DSH_SESSION_ROOT", &root)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut second = OwnedScriptChild::new(second.spawn().expect("second turn should spawn"));
+    second
+        .child_mut()
+        .stdin
+        .take()
+        .expect("second turn stdin should be piped")
+        .write_all(format!("{recent_prompt}\n").as_bytes())
+        .expect("large bounded prompt should write");
+    let second = second.wait_with_output(Duration::from_secs(15));
+    assert!(
+        second.status.success(),
+        "status={:?}, stdout-bytes={}, stderr={:?}",
+        second.status.code(),
+        second.stdout.len(),
+        stderr(&second)
+    );
+    assert_eq!(stdout(&second), format!("{recent_answer}\n"));
+    assert_eq!(stderr(&second), "");
+
+    let mut third = resume_script_command(&base_url, &root, &session_id, target_prompt);
+    third.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let third = OwnedScriptChild::new(third.spawn().expect("compacting turn should spawn"))
+        .wait_with_output(Duration::from_secs(15));
+    assert!(third.status.success(), "{}", stderr(&third));
+    assert_eq!(stdout(&third), format!("{final_answer}\n"));
+    assert_eq!(stderr(&third), "");
+
+    let requests = server.join().expect("loopback server should join");
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[2]
+            .to_ascii_lowercase()
+            .contains("x-deepseek-harness-compact: 1\r\n")
+    );
+    let summary_request = request_json(&requests[2]);
+    assert_eq!(summary_request["max_tokens"], 8_192);
+    let summary_wire = summary_request.to_string();
+    assert!(summary_wire.contains("Summarize the selected older conversation prefix"));
+    assert!(summary_wire.contains("OLD_PREFIX_SENTINEL"));
+    assert!(!summary_wire.contains(target_prompt));
+
+    let continued_request = request_json(&requests[3]);
+    let continued_wire = continued_request.to_string();
+    assert!(continued_wire.contains("SUMMARY_CHECKPOINT_SENTINEL"));
+    assert!(continued_wire.contains("RECENT_TAIL_PROMPT_SENTINEL"));
+    assert!(continued_wire.contains(target_prompt));
+    assert!(!continued_wire.contains("OLD_PREFIX_SENTINEL"));
+
+    let rows = std::fs::read_to_string(only_journal_path(&root))
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .position(|row| row["type"] == "compaction/start")
+        .expect("one automatic compaction should start");
+    assert_eq!(
+        rows[start..start + 4]
+            .iter()
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "compaction/start",
+            "compaction/summary",
+            "user/message",
+            "compaction/end",
+        ]
+    );
+    assert!(rows[start + 3]["data"]["error"].is_null());
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["type"] == "compaction/start")
+            .count(),
+        1
+    );
+
+    std::fs::remove_dir_all(workspace).unwrap();
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

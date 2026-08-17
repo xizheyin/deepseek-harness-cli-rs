@@ -2,6 +2,7 @@
 
 mod approval;
 mod assembler;
+mod compaction;
 mod error;
 #[cfg(test)]
 mod phase6_tests;
@@ -60,6 +61,7 @@ pub use tool::{
 };
 
 use assembler::{AssembledAssistant, without_tool_calls};
+use compaction::{CompactionOutcome, compact_once, pressure_reached, retained_token_target};
 use retry::{RetryDecision, decide, policy_key};
 
 pub const MAX_AGENT_STEPS_PER_TURN: usize = 64;
@@ -888,6 +890,38 @@ enum HardLimitPruneOutcome {
     TurnError(LlmFailure),
 }
 
+fn preparation_context_window(preparation: &AttemptPreparation, session: &Session) -> Option<u64> {
+    match preparation {
+        AttemptPreparation::Ready(preflighted) => preflighted.prepared_call().context_window(),
+        AttemptPreparation::PreparedFailure { prepared, .. }
+        | AttemptPreparation::HardLimit {
+            prepared: Some(prepared),
+        } => prepared.context_window(),
+        AttemptPreparation::DeferredFailure(_)
+        | AttemptPreparation::HardLimit { prepared: None } => session
+            .request_context()
+            .and_then(RequestContext::context_window),
+    }
+    .map(|window| window.get())
+}
+
+fn pre_step_compaction_trigger(
+    preparation: &AttemptPreparation,
+    session: &Session,
+    context_window: Option<u64>,
+) -> Option<crate::session::CompactionTrigger> {
+    if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+        return Some(crate::session::CompactionTrigger::HardLimit);
+    }
+    (matches!(preparation, AttemptPreparation::Ready(_))
+        && context_window.is_some_and(|window| {
+            session
+                .context_total_tokens()
+                .is_ok_and(|total| pressure_reached(total, window))
+        }))
+    .then_some(crate::session::CompactionTrigger::Pressure)
+}
+
 struct PreflightedRequest {
     proposed: LlmCallConfig,
     messages: Vec<Message>,
@@ -1116,6 +1150,7 @@ async fn run_entered_turn(
     cancellation: &CancellationToken,
     budget_failure: &LlmFailure,
 ) -> Result<TurnEndReason, AgentLoopError> {
+    let mut summary_attempted = false;
     loop {
         if cancellation.is_cancelled() {
             return Ok(TurnEndReason::Aborted {
@@ -1198,12 +1233,116 @@ async fn run_entered_turn(
                     }
                     HardLimitPruneOutcome::NoProgress => {}
                 }
-                if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+            }
+
+            let mut context_window =
+                preparation_context_window(&preparation, reservation.session());
+            let mut trigger =
+                pre_step_compaction_trigger(&preparation, reservation.session(), context_window);
+            if summary_attempted && trigger == Some(crate::session::CompactionTrigger::Pressure) {
+                trigger = None;
+            }
+            if trigger == Some(crate::session::CompactionTrigger::Pressure) {
+                match prune_hard_limited_request(reservation, driver, cancellation, budget_failure)
+                    .await?
+                {
+                    HardLimitPruneOutcome::Progress => {
+                        preparation = prepare_conversation_request(
+                            reservation.session(),
+                            driver,
+                            messages.as_slice(),
+                        )?;
+                        context_window =
+                            preparation_context_window(&preparation, reservation.session());
+                        trigger = pre_step_compaction_trigger(
+                            &preparation,
+                            reservation.session(),
+                            context_window,
+                        );
+                    }
+                    HardLimitPruneOutcome::NoProgress => {}
+                    HardLimitPruneOutcome::Cancelled => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Aborted {
+                            reason: TurnEndCancelCause::User,
+                        });
+                    }
+                    HardLimitPruneOutcome::TurnError(error) => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error { error });
+                    }
+                }
+                if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                    unstarted.release(reservation)?;
+                    return Ok(reason);
+                }
+            }
+            if summary_attempted {
+                if trigger == Some(crate::session::CompactionTrigger::HardLimit) {
                     unstarted.release(reservation)?;
                     return Ok(TurnEndReason::Error {
                         error: context_limit_failure()?,
                     });
                 }
+                trigger = None;
+            }
+            if let Some(trigger) = trigger {
+                let was_hard_limit = trigger == crate::session::CompactionTrigger::HardLimit;
+                let attempts_before_summary = driver.counters.attempts;
+                let outcome = compact_once(
+                    reservation,
+                    driver,
+                    turn,
+                    trigger,
+                    retained_token_target(context_window),
+                    cancellation,
+                    budget_failure,
+                )
+                .await?;
+                summary_attempted |= driver.counters.attempts > attempts_before_summary;
+                match outcome {
+                    CompactionOutcome::Progress => {
+                        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+                            unstarted.release(reservation)?;
+                            return Ok(reason);
+                        }
+                        preparation = prepare_conversation_request(
+                            reservation.session(),
+                            driver,
+                            messages.as_slice(),
+                        )?;
+                    }
+                    CompactionOutcome::NoProgress if was_hard_limit => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error {
+                            error: context_limit_failure()?,
+                        });
+                    }
+                    CompactionOutcome::NoProgress => {}
+                    CompactionOutcome::AdvisoryFailure(_) if was_hard_limit => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error {
+                            error: context_limit_failure()?,
+                        });
+                    }
+                    CompactionOutcome::AdvisoryFailure(_) => {}
+                    CompactionOutcome::Cancelled => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Aborted {
+                            reason: TurnEndCancelCause::User,
+                        });
+                    }
+                    CompactionOutcome::TurnError(error) => {
+                        unstarted.release(reservation)?;
+                        return Ok(TurnEndReason::Error { error });
+                    }
+                }
+            }
+            if matches!(preparation, AttemptPreparation::HardLimit { .. }) {
+                unstarted.release(reservation)?;
+                return Ok(TurnEndReason::Error {
+                    error: context_limit_failure()?,
+                });
             }
             Some(preparation)
         };

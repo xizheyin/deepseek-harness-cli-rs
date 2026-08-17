@@ -29,7 +29,7 @@ use crate::{
     model::{
         ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, JsonValue, LlmCallConfig,
         LlmCallConfigAdapterDefaults, LlmFailure, MAX_JSON_VALUE_BYTES, Message, MessageSource,
-        StreamChunk, StreamChunkKind, ToolSchema,
+        RequestPurpose, StreamChunk, StreamChunkKind, TokenUsage, ToolSchema,
     },
     provider::{
         ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
@@ -214,6 +214,11 @@ impl Clock for PanicWhenArmedClock {
 struct ScriptedProvider {
     attempts: Mutex<VecDeque<Vec<StreamChunk>>>,
     requests: Mutex<Vec<Vec<Message>>>,
+    purposes: Mutex<Vec<RequestPurpose>>,
+    hard_limit_next: AtomicBool,
+    context_window: u64,
+    cancel_on_compaction: Option<CancellationToken>,
+    stall_compaction: bool,
     panic_clock_on_stream: Option<PanicWhenArmedClock>,
     retry_policy: RetryPolicy,
 }
@@ -326,6 +331,11 @@ impl ScriptedProvider {
         Self {
             attempts: Mutex::new(attempts.into()),
             requests: Mutex::new(Vec::new()),
+            purposes: Mutex::new(Vec::new()),
+            hard_limit_next: AtomicBool::new(false),
+            context_window: 4_096,
+            cancel_on_compaction: None,
+            stall_compaction: false,
             panic_clock_on_stream: None,
             retry_policy: RetryPolicy::normal(
                 0,
@@ -346,8 +356,31 @@ impl ScriptedProvider {
         self
     }
 
+    fn with_context_window(mut self, context_window: u64) -> Self {
+        self.context_window = context_window;
+        self
+    }
+
+    fn with_cancel_on_compaction(mut self, cancellation: CancellationToken) -> Self {
+        self.cancel_on_compaction = Some(cancellation);
+        self
+    }
+
+    fn with_stalled_compaction(mut self) -> Self {
+        self.stall_compaction = true;
+        self
+    }
+
     fn requests(&self) -> Vec<Vec<Message>> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn purposes(&self) -> Vec<RequestPurpose> {
+        self.purposes.lock().unwrap().clone()
+    }
+
+    fn fail_next_preflight_with_hard_limit(&self) {
+        self.hard_limit_next.store(true, Ordering::SeqCst);
     }
 }
 
@@ -364,7 +397,7 @@ impl ModelProvider for ScriptedProvider {
         Ok(PreparedProviderCall::new(
             effective,
             LlmCallConfigAdapterDefaults::default(),
-            Some(crate::model::NonNegativeSafeInteger::new(4_096).unwrap()),
+            Some(crate::model::NonNegativeSafeInteger::new(self.context_window).unwrap()),
         )
         .with_retry_policy(self.retry_policy.clone()))
     }
@@ -374,14 +407,30 @@ impl ModelProvider for ScriptedProvider {
         draft: ProviderRequestDraft<'_>,
     ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
         let prepared = self.prepare_call(draft.config().clone())?;
+        if self.hard_limit_next.swap(false, Ordering::SeqCst) {
+            return Err(ProviderPreflightError::WireTooLarge {
+                maximum: 1,
+                prepared,
+            });
+        }
         draft.finish(prepared, 1)
     }
 
     fn stream(&self, request: ProviderRequest, _cancel: CancellationToken) -> ProviderStream {
+        let purpose = request.purpose();
+        self.purposes.lock().unwrap().push(purpose);
         self.requests
             .lock()
             .unwrap()
             .push(request.messages().to_vec());
+        if purpose == RequestPurpose::Compaction {
+            if let Some(cancellation) = &self.cancel_on_compaction {
+                cancellation.cancel();
+            }
+            if self.stall_compaction {
+                return Box::pin(stream::pending());
+            }
+        }
         if let Some(clock) = &self.panic_clock_on_stream {
             clock.arm();
         }
@@ -1069,10 +1118,33 @@ fn mutation_response() -> Vec<StreamChunk> {
 }
 
 fn text_response() -> Vec<StreamChunk> {
+    text_response_with("done")
+}
+
+fn text_response_with(text: impl Into<String>) -> Vec<StreamChunk> {
     vec![
         StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
-        StreamChunk::block_end(0, ContentBlock::text("done").unwrap()).unwrap(),
+        StreamChunk::block_end(0, ContentBlock::text(text.into()).unwrap()).unwrap(),
         StreamChunk::finish(FinishReason::stop().unwrap(), None).unwrap(),
+    ]
+}
+
+fn max_tokens_response_with_usage(output_tokens: u64) -> Vec<StreamChunk> {
+    vec![
+        StreamChunk::block_start(0, ContentBlockType::Text).unwrap(),
+        StreamChunk::block_end(0, ContentBlock::text("partial summary").unwrap()).unwrap(),
+        StreamChunk::usage(TokenUsage::new(1, output_tokens).unwrap()).unwrap(),
+        StreamChunk::finish(FinishReason::max_tokens().unwrap(), None).unwrap(),
+    ]
+}
+
+fn provider_error_response(code: &str) -> Vec<StreamChunk> {
+    vec![
+        StreamChunk::finish(
+            FinishReason::error(LlmFailure::new("summary provider failed", code).unwrap()).unwrap(),
+            None,
+        )
+        .unwrap(),
     ]
 }
 
@@ -1540,10 +1612,9 @@ async fn a_memory_clock_rejection_is_not_misclassified_as_a_durable_error() {
 async fn hard_wire_limit_prunes_a_durable_tool_result_before_entering_the_step() {
     let (session, journal, root, workspace) =
         durable_session_with_event_room("agent-hard-prune", 512).await;
-    let first_provider = Arc::new(ScriptedProvider::new(vec![
-        tool_response(),
-        text_response(),
-    ]));
+    let first_provider = Arc::new(
+        ScriptedProvider::new(vec![tool_response(), text_response()]).with_context_window(100_000),
+    );
     let first_config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
         .with_tools(vec![schema()])
         .unwrap()
@@ -1649,6 +1720,844 @@ async fn hard_wire_limit_prunes_a_durable_tool_result_before_entering_the_step()
     std::fs::remove_dir_all(workspace).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pressure_summary_compacts_once_and_continues_the_same_input() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-pressure-summary", 1_024).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("a".repeat(10_000)),
+        text_response_with("the old request asked for a long fixture"),
+        text_response_with("continued after compaction"),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let first = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "user-long",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.reason(), &TurnEndReason::Completed);
+
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "user-continue",
+                    vec![ContentBlock::text("continue the same task").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.reason(), &TurnEndReason::Completed);
+    assert_eq!(second.attempts(), 2);
+    assert!(second.final_message().is_some_and(|message| {
+        matches!(
+            message.content(),
+            [block]
+                if matches!(
+                    block.kind(),
+                    ContentBlockKind::Text { text }
+                        if text == "continued after compaction"
+                )
+        )
+    }));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        provider.purposes(),
+        vec![
+            RequestPurpose::Conversation,
+            RequestPurpose::Compaction,
+            RequestPurpose::Conversation,
+        ]
+    );
+    assert!(requests[1].last().is_some_and(|message| {
+        matches!(
+            message.source().kind(),
+            crate::model::MessageSourceKind::Plugin { plugin, .. }
+                if plugin == "dsh.compaction"
+        )
+    }));
+    assert!(requests[2].iter().any(|message| {
+        matches!(
+            message.source().kind(),
+            crate::model::MessageSourceKind::Plugin { plugin, .. }
+                if plugin == "compact"
+        )
+    }));
+    assert!(
+        requests[2]
+            .iter()
+            .any(|message| message.id().as_str() == "user-continue")
+    );
+
+    agent.shutdown().await.unwrap();
+    let event_types = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    for expected in ["compaction/start", "compaction/summary", "compaction/end"] {
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == expected)
+                .count(),
+            1
+        );
+    }
+    let start = event_types
+        .iter()
+        .position(|event_type| event_type == "compaction/start")
+        .unwrap();
+    assert_eq!(
+        &event_types[start..start + 4],
+        &[
+            "compaction/start",
+            "compaction/summary",
+            "user/message",
+            "compaction/end",
+        ]
+    );
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hard_limit_summary_compacts_once_then_repreflights_the_same_input() {
+    let (session, _journal, root, workspace) =
+        durable_session_with_event_room("agent-hard-limit-summary", 1_024).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("s".repeat(3_000)),
+        text_response_with("the older request was condensed"),
+        text_response_with("continued after hard-limit compaction"),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let first = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "hard-limit-history",
+                    vec![ContentBlock::text("h".repeat(4_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.reason(), &TurnEndReason::Completed);
+    provider.fail_next_preflight_with_hard_limit();
+
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "hard-limit-target",
+                    vec![ContentBlock::text("continue this task").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.reason(), &TurnEndReason::Completed);
+    assert_eq!(second.steps(), 1);
+    assert_eq!(second.attempts(), 2);
+    assert!(second.final_message().is_some_and(|message| {
+        matches!(
+            message.content(),
+            [block]
+                if matches!(
+                    block.kind(),
+                    ContentBlockKind::Text { text }
+                        if text == "continued after hard-limit compaction"
+                )
+        )
+    }));
+    assert_eq!(
+        provider.purposes(),
+        vec![
+            RequestPurpose::Conversation,
+            RequestPurpose::Compaction,
+            RequestPurpose::Conversation,
+        ]
+    );
+    let requests = provider.requests();
+    assert!(requests[1].last().is_some_and(|message| {
+        matches!(
+            message.source().kind(),
+            crate::model::MessageSourceKind::Plugin { plugin, .. }
+                if plugin == "dsh.compaction"
+        )
+    }));
+    assert!(
+        requests[2]
+            .iter()
+            .any(|message| message.id().as_str() == "hard-limit-target")
+    );
+
+    agent.shutdown().await.unwrap();
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nonshrinking_pressure_summary_closes_once_and_continues_without_a_loop() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-invalid-pressure-summary", 1_024).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("a".repeat(10_000)),
+        text_response_with("z".repeat(10_000)),
+        tool_response(),
+        text_response_with("continued without the nonshrinking summary"),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "invalid-summary-history",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "invalid-summary-target",
+                    vec![ContentBlock::text("continue anyway").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.reason(), &TurnEndReason::Completed);
+    assert_eq!(second.attempts(), 3);
+    assert_eq!(second.tool_calls(), 1);
+    assert_eq!(
+        provider.purposes(),
+        vec![
+            RequestPurpose::Conversation,
+            RequestPurpose::Compaction,
+            RequestPurpose::Conversation,
+            RequestPurpose::Conversation,
+        ]
+    );
+    assert!(!provider.requests()[2].iter().any(|message| {
+        matches!(
+            message.source().kind(),
+            crate::model::MessageSourceKind::Plugin { plugin, .. }
+                if plugin == "compact"
+        )
+    }));
+
+    agent.shutdown().await.unwrap();
+    let event_types = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "compaction/start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "compaction/summary")
+            .count(),
+        1
+    );
+    let start = event_types
+        .iter()
+        .position(|event_type| event_type == "compaction/start")
+        .unwrap();
+    assert_eq!(
+        &event_types[start..start + 3],
+        &["compaction/start", "compaction/summary", "compaction/end"]
+    );
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pressure_summary_provider_failure_is_recorded_but_the_request_continues() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-pressure-summary-provider-error", 1_024).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("a".repeat(10_000)),
+        provider_error_response("SUMMARY_SERVER"),
+        text_response_with("continued after the advisory summary failure"),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-error-history",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-error-target",
+                    vec![ContentBlock::text("continue anyway").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second.reason(), &TurnEndReason::Completed);
+    assert_eq!(second.attempts(), 2);
+    assert_eq!(
+        provider.purposes(),
+        vec![
+            RequestPurpose::Conversation,
+            RequestPurpose::Compaction,
+            RequestPurpose::Conversation,
+        ]
+    );
+
+    agent.shutdown().await.unwrap();
+    let rows = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let end = rows
+        .iter()
+        .find(|row| row["type"] == "compaction/end")
+        .unwrap();
+    assert_eq!(end["data"]["error"]["code"], "SUMMARY_SERVER");
+    assert!(!rows.iter().any(|row| row["type"] == "compaction/summary"));
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_an_active_pressure_summary_closes_without_a_checkpoint() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-pressure-summary-cancel", 1_024).await;
+    let cancellation = CancellationToken::new();
+    let provider = Arc::new(
+        ScriptedProvider::new(vec![
+            text_response_with("a".repeat(10_000)),
+            text_response_with("must not become a checkpoint"),
+        ])
+        .with_cancel_on_compaction(cancellation.clone()),
+    );
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-cancel-history",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-cancel-target",
+                    vec![ContentBlock::text("continue").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            cancellation,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second.reason(),
+        &TurnEndReason::Aborted {
+            reason: crate::session::TurnEndCancelCause::User,
+        }
+    );
+    assert_eq!(second.steps(), 0);
+    assert_eq!(second.attempts(), 1);
+    assert_eq!(
+        provider.purposes(),
+        vec![RequestPurpose::Conversation, RequestPurpose::Compaction]
+    );
+
+    agent.shutdown().await.unwrap();
+    let rows = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .rposition(|row| row["type"] == "compaction/start")
+        .unwrap();
+    assert_eq!(rows[start + 1]["type"], "compaction/end");
+    assert_eq!(
+        rows[start + 1]["data"]["error"]["code"],
+        "AGENT_COMPACTION_CANCELLED"
+    );
+    assert!(
+        !rows[start..]
+            .iter()
+            .any(|row| row["type"] == "compaction/summary")
+    );
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_pressure_summary_times_out_and_closes_without_a_checkpoint() {
+    let provider = Arc::new(
+        ScriptedProvider::new(vec![text_response_with("a".repeat(10_000))])
+            .with_stalled_compaction(),
+    );
+    let limits = AgentLimits::default()
+        .with_turn_duration(Duration::from_secs(1))
+        .unwrap();
+    let mut agent = agent(
+        "memory-pressure-summary-timeout",
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Some(limits),
+    );
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-timeout-history",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-timeout-target",
+                    vec![ContentBlock::text("continue").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        second.reason(),
+        TurnEndReason::Error { error } if error.code() == "AGENT_TURN_TIMEOUT"
+    ));
+    assert_eq!(second.steps(), 0);
+    assert_eq!(second.attempts(), 1);
+    assert_eq!(
+        provider.purposes(),
+        vec![RequestPurpose::Conversation, RequestPurpose::Compaction]
+    );
+    let events = agent.session().events();
+    let start = events
+        .iter()
+        .rposition(|event| event.kind().event_type() == "compaction/start")
+        .unwrap();
+    assert_eq!(events[start + 1].kind().event_type(), "compaction/end");
+    assert!(matches!(
+        events[start + 1].kind(),
+        EventKind::CompactionEnd { end }
+            if matches!(
+                end.error(),
+                Some(crate::session::CompactionEndError::Failure(error))
+                    if error.code() == "AGENT_TURN_TIMEOUT"
+            )
+    ));
+    assert!(
+        !events[start..]
+            .iter()
+            .any(|event| event.kind().event_type() == "compaction/summary")
+    );
+}
+
+#[tokio::test]
+async fn memory_nonshrinking_summary_never_replaces_the_visible_surface() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("a".repeat(10_000)),
+        text_response_with("z".repeat(10_000)),
+        text_response_with("memory conversation continued"),
+    ]));
+    let mut agent = agent(
+        "memory-nonshrinking-summary",
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        None,
+    );
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "memory-summary-history",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "memory-summary-target",
+                    vec![ContentBlock::text("continue").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.reason(), &TurnEndReason::Completed);
+    assert_eq!(second.attempts(), 2);
+    assert!(!agent.session().messages().iter().any(|message| {
+        matches!(
+            message.source().kind(),
+            crate::model::MessageSourceKind::Plugin { plugin, .. }
+                if plugin == "compact"
+        )
+    }));
+    assert_eq!(
+        provider.purposes(),
+        vec![
+            RequestPurpose::Conversation,
+            RequestPurpose::Compaction,
+            RequestPurpose::Conversation,
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hard_limit_tool_call_summary_is_rejected_without_running_the_tool() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-summary-tool-rejected", 1_024).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("s".repeat(3_000)),
+        tool_response(),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-tool-history",
+                    vec![ContentBlock::text("h".repeat(4_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    provider.fail_next_preflight_with_hard_limit();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-tool-target",
+                    vec![ContentBlock::text("continue").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        second.reason(),
+        TurnEndReason::Error { error } if error.code() == "AGENT_CONTEXT_LIMIT"
+    ));
+    assert_eq!(second.steps(), 0);
+    assert_eq!(second.attempts(), 1);
+    assert_eq!(second.tool_calls(), 0);
+    assert_eq!(
+        provider.purposes(),
+        vec![RequestPurpose::Conversation, RequestPurpose::Compaction]
+    );
+
+    agent.shutdown().await.unwrap();
+    let event_types = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let start = event_types
+        .iter()
+        .rposition(|event_type| event_type == "compaction/start")
+        .unwrap();
+    assert_eq!(
+        &event_types[start..start + 2],
+        &["compaction/start", "compaction/end"]
+    );
+    assert!(
+        !event_types[start..]
+            .iter()
+            .any(|event_type| event_type == "tool/call")
+    );
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_summary_usage_still_consumes_the_turn_token_budget() {
+    let (session, journal, root, workspace) =
+        durable_session_with_event_room("agent-summary-usage-budget", 1_024).await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("a".repeat(10_000)),
+        max_tokens_response_with_usage(11),
+    ]));
+    let limits = AgentLimits::default()
+        .with_max_reported_output_tokens_per_turn(10)
+        .unwrap();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow)
+        .with_limits(limits);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-usage-history",
+                    vec![ContentBlock::text("u".repeat(6_000)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let second = agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "summary-usage-target",
+                    vec![ContentBlock::text("continue").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        second.reason(),
+        TurnEndReason::Error { error } if error.code() == "AGENT_TOKEN_BUDGET"
+    ));
+    assert_eq!(second.steps(), 0);
+    assert_eq!(second.attempts(), 1);
+    assert_eq!(second.reported_output_tokens(), 11);
+    assert_eq!(
+        provider.purposes(),
+        vec![RequestPurpose::Conversation, RequestPurpose::Compaction]
+    );
+
+    agent.shutdown().await.unwrap();
+    let rows = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let end = rows
+        .iter()
+        .rfind(|row| row["type"] == "compaction/end")
+        .unwrap();
+    assert_eq!(end["data"]["error"]["code"], "AGENT_TOKEN_BUDGET");
+    assert!(!rows.iter().any(|row| row["type"] == "compaction/summary"));
+
+    drop(agent);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
 #[test]
 fn preflight_snapshot_rejects_an_identical_surface_with_a_new_generation() {
     let mut session =
@@ -1686,7 +2595,7 @@ fn preflight_snapshot_rejects_an_identical_surface_with_a_new_generation() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn marker_only_hard_limit_never_repreflights_and_a_latched_cancel_wins() {
+async fn marker_only_hard_limit_summarizes_once_unless_cancellation_is_latched() {
     for cancel_on_failure in [false, true] {
         let label = if cancel_on_failure {
             "agent-prune-marker-cancel"
@@ -1696,10 +2605,10 @@ async fn marker_only_hard_limit_never_repreflights_and_a_latched_cancel_wins() {
         let clock = ArmedClock::new(1_000);
         let (session, journal, root, workspace) =
             durable_session_with_clock(label, 512, clock.clone()).await;
-        let first_provider = Arc::new(ScriptedProvider::new(vec![
-            tool_response(),
-            text_response(),
-        ]));
+        let first_provider = Arc::new(
+            ScriptedProvider::new(vec![tool_response(), text_response()])
+                .with_context_window(100_000),
+        );
         let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
             .with_tools(vec![schema()])
             .unwrap()
@@ -1766,9 +2675,15 @@ async fn marker_only_hard_limit_never_repreflights_and_a_latched_cancel_wins() {
             ));
         }
         assert_eq!(outcome.steps(), 0);
-        assert_eq!(outcome.attempts(), 0);
-        assert_eq!(provider.preflights.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.streams.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.attempts(), usize::from(!cancel_on_failure));
+        assert_eq!(
+            provider.preflights.load(Ordering::SeqCst),
+            if cancel_on_failure { 1 } else { 2 }
+        );
+        assert_eq!(
+            provider.streams.load(Ordering::SeqCst),
+            usize::from(!cancel_on_failure)
+        );
         assert_eq!(resumed.session().state().open_step(), None);
         assert_eq!(resumed.session().state().open_turn(), None);
 
@@ -1787,7 +2702,20 @@ async fn marker_only_hard_limit_never_repreflights_and_a_latched_cancel_wins() {
             .iter()
             .map(|row| row["type"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(second_tail, ["compaction/prune", "turn/end"]);
+        if cancel_on_failure {
+            assert_eq!(second_tail, ["compaction/prune", "turn/end"]);
+        } else {
+            assert_eq!(
+                second_tail,
+                [
+                    "compaction/prune",
+                    "compaction/start",
+                    "compaction/summary",
+                    "compaction/end",
+                    "turn/end",
+                ]
+            );
+        }
 
         drop(resumed);
         std::fs::remove_dir_all(root).unwrap();
@@ -1803,10 +2731,9 @@ async fn observer_failure_after_a_durable_prune_pair_still_closes_the_turn() {
     let observer = Arc::new(Mutex::new(
         session.attach_ui_observer_for_test(512).unwrap(),
     ));
-    let first_provider = Arc::new(ScriptedProvider::new(vec![
-        tool_response(),
-        text_response(),
-    ]));
+    let first_provider = Arc::new(
+        ScriptedProvider::new(vec![tool_response(), text_response()]).with_context_window(100_000),
+    );
     let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
         .with_tools(vec![schema()])
         .unwrap()

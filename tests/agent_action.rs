@@ -123,7 +123,7 @@ impl ModelProvider for ScriptedProvider {
         Ok(PreparedProviderCall::new(
             effective,
             LlmCallConfigAdapterDefaults::default(),
-            Some(deepseek_harness_cli::model::NonNegativeSafeInteger::new(4_096).unwrap()),
+            Some(deepseek_harness_cli::model::NonNegativeSafeInteger::new(10_000_000).unwrap()),
         )
         .with_retry_policy(
             RetryPolicy::normal(

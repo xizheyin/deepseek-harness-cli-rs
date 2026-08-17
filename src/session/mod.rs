@@ -32,6 +32,10 @@ pub use attempt_anchor::AttemptError;
 pub(crate) use attempt_anchor::{AttemptDisposition, PreparedAttempt};
 pub use clock::{Clock, SystemClock};
 pub use codec::{MAX_SESSION_EVENTS, MAX_SESSION_RETAINED_JSON_BYTES, MAX_SESSION_SNAPSHOT_BYTES};
+pub(crate) use compaction::{
+    COMPACTION_CHECKPOINT_PREFIX, COMPACTION_CHECKPOINT_SOURCE, COMPACTION_CHECKPOINT_SUFFIX,
+    COMPACTION_INSTRUCTION_SOURCE,
+};
 pub use compaction::{
     CompactionEndError, CompactionEndEvent, CompactionId, CompactionPruneEvent, CompactionRange,
     CompactionStartEvent, CompactionSummaryEvent, CompactionSummaryInput, CompactionTrigger,
@@ -51,6 +55,7 @@ pub use event::{
     TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TodoItem, TodoStatus, ToolFailure, TurnEndCancelCause,
     TurnEndReason, TurnId, UnixMillis,
 };
+pub(crate) use projection::CompactionCandidate;
 pub use projection::SessionState;
 pub(crate) use store::SessionMetadata;
 pub use store::{SessionStore, StoreError};
@@ -3409,6 +3414,17 @@ impl Session {
 
     pub(crate) fn context_total_tokens(&self) -> Result<u64, SurfaceError> {
         self.projection.context_total_tokens()
+    }
+
+    pub(crate) fn compaction_candidate(
+        &self,
+        retain_tokens: u64,
+    ) -> Result<Option<CompactionCandidate>, SurfaceError> {
+        self.projection.compaction_candidate(retain_tokens)
+    }
+
+    pub(crate) fn estimated_message_tokens(&self, message: &Message) -> Result<u64, SurfaceError> {
+        Projection::estimated_message_tokens(message)
     }
 
     /// Latest canonical model-request header, or `None` before one is logged.

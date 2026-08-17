@@ -776,7 +776,12 @@ fn durable_session_continues_after_crossing_the_old_retained_json_ceiling() {
 
     assert!(status.success());
     assert_eq!(requests.len(), 3);
-    assert!(requests[1].contains("large-call-a-15"));
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains("x-deepseek-harness-compact: 1\r\n")
+    );
+    assert!(requests[2].contains("large-call-a-15"));
     assert_eq!(
         transcript
             .windows(b"AGENT_EVENT_BUDGET".len())

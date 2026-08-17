@@ -19,6 +19,73 @@ written and synchronized to stable storage before a model request or tool side
 effect is allowed to proceed. The **active projection** is the bounded in-memory
 fold used for the next request; it is not a second source of truth.
 
+## 2026-08-18 v0.1 scope amendment
+
+This document began as a database-grade durability and physical-memory proof.
+The user has explicitly changed the product priority: v0.1 needs a useful
+terminal Agent, not proof that every power-loss point can be repaired. When an
+acceptance statement below conflicts with this amendment, this amendment is the
+Phase 8 completion boundary; the older material remains an audit record and a
+post-v0.1 hardening backlog.
+
+The required v0.1 behavior is now:
+
+1. a normally closed current-version local session can be listed, resumed, and
+   continued through the real CLI;
+2. corrupt or unsupported history fails before a new model request or tool side
+   effect, and a tool with an unknown old outcome is never replayed;
+3. long provider streams are not limited by the old 4,096-event in-memory
+   lifetime cap;
+4. before an ordinary request exceeds the context budget, Agent runs at most
+   one bounded summary transaction over a balanced old prefix, retains the
+   recent complete tail, installs the checkpoint, and retries the same input;
+5. an invalid, cancelled, failed, or non-shrinking summary fails clearly or
+   leaves the previous surface usable; it never executes summary-produced tool
+   calls or repeats a user tool side effect;
+6. if that one reduction still cannot make the request fit, the turn ends with
+   a clear context-limit error rather than looping.
+
+The existing writer locks, barriers, repair state machine, quotas, and resident
+credit remain tested code, but completing their original exhaustive proof is no
+longer a v0.1 gate. Specifically deferred are power-loss guarantees, every
+crash-prefix repair permutation, complete cross-filesystem `fsync` semantics,
+near-maximum cold-scan stress, exhaustive old/future schema migration,
+provider-overflow compact-and-replay, multiple compaction transactions in one
+check, and the complete 32/64/96/192 MiB physical-allocation ownership proof.
+
+This is an intentional scope difference from the fixed upstream producer, not
+a compatibility claim. The practical risk is that `SIGKILL`, power loss, disk
+failure, or filesystem failure may lose the final journal tail or make a session
+unresumable. Important code changes belong in the workspace and Git; the local
+session journal is a convenience, not a backup.
+
+### Implemented v0.1 path
+
+The real Agent now measures only committed Session context for the 80% pressure
+trigger. Before summarizing it first runs the existing oversized-tool-result
+pruner, then selects the same balanced oldest prefix used by Projection and
+retains a 16% recent tail. The auxiliary request has purpose `compaction`, a
+maximum of 8,192 output tokens, the current canonical system/tools/session
+facts, and no pending user input. Its stream is collected in memory under the
+existing chunk and byte limits and is never passed to ToolExecutor.
+
+A successful pass writes the adjacent `start → summary → checkpoint → end`
+transaction and rebuilds the original ordinary request. A provider failure at
+pressure is recorded in the error end and the still-encodable ordinary request
+continues; the same failure after a hard wire-limit result becomes the stable
+context-limit turn error. Cancellation, timeout, token-budget exhaustion,
+tool-calling output, and non-shrinking output never install a checkpoint. A
+turn-local guard permits at most one summary request, including across later
+tool steps in that turn.
+
+The production Agent tests cover pressure and hard-limit success, same-input
+continuation, memory and durable non-shrinking summaries, summary tool-call
+rejection, provider failure, token usage on invalid output, cancellation after
+the bracket starts, a stalled summary reaching the turn deadline, marker-only
+prune failure, and the one-pass guard. A real
+`dsh`/DeepSeek-loopback/resume smoke test drives the same path across three CLI
+processes and checks the final request and durable four-event transaction.
+
 ## Scope and non-goals
 
 Phase 8 adds:
@@ -773,6 +840,11 @@ to fit listing's fixed candidate-header buffer.
 
 All numbers below are product policy, not upstream compatibility facts:
 
+The limits already enforced by production remain in force. The original goal
+of proving every allocator backing, shallow alias, cold-scan clone, and combined
+32/64/96/192 MiB high-water is now post-v0.1 hardening; absence of that complete
+physical proof does not block the revised Phase 8 product gate.
+
 | Resource | Limit | Behavior at the boundary |
 | --- | ---: | --- |
 | Tagged header JSONL line | 64 KiB including its LF | reject before `CREATE|EXCL`; the in-memory raw-header cap remains separate |
@@ -1449,10 +1521,10 @@ Malformed option combinations and noncanonical IDs remain `CLI_USAGE`, exit 2.
 
 ## Context measurement and compaction
 
-Automatic pressure compaction runs at the fixed upstream pre-step boundary:
+The revised v0.1 automatic compaction runs at the pre-step boundary:
 after `turn/start` and the input batch is claimed, but before `step/start`, its
 new user messages enter the surface, or the ordinary request header/context is
-appended. Like upstream, its 80% token-pressure value measures only the
+appended. Its 80% token-pressure value measures only the
 previously committed Session surface. When a durable ordinary request header
 exists, the summary request reuses its system/tool prefix exactly like upstream;
 Rust also duplicates the actual prefix in `compaction/start` so the auxiliary
@@ -1461,25 +1533,26 @@ header exists, it uses the current bounded Agent system/tools and records those
 inline. The separately prepared compaction config is likewise captured in the
 start recipe. Separately, before input admission, Rust
 preflights the proposed surface plus claimed input against the hard
-4,096-message and 8 MiB encoder limits and may invoke the same compactor as the
-intentional safety difference above. Canonical provider-overflow recovery runs
-after a failed ordinary request and compacts that request's committed surface
-before its one replay. Raw stream retirement solves the event-budget incident;
-compaction separately keeps the model-visible surface under provider message,
-byte, and token limits.
+4,096-message and 8 MiB encoder limits and may invoke the same compactor. One
+pre-step check may commit at most one summary transaction. It then rebuilds and
+preflights the same ordinary request; if the request still does not fit, Agent
+returns `AGENT_CONTEXT_LIMIT` instead of starting another transaction. Raw
+stream retirement solves the event-budget incident; this one-pass summary keeps
+ordinary model-visible history usable without making crash-perfect persistence
+a release condition.
 
-`CompactionTrigger` has exactly three durable spellings: `pressure`,
-`context-overflow`, and `hard-limit`. `pressure` is the compatible 80% path;
-`context-overflow` is the post-provider-error path with a zero-token retain
-target; `hard-limit` is Rust's pre-admission safety path and may run even when
-the committed pressure is below 80%. The hard-limit path first prunes, then uses
-the ordinary 16% balanced-tail selection and at most two successful summary
-transactions, rechecking the virtual surface plus claimed input after each. It
-stops as soon as the 4,096-message and 8 MiB encoder checks fit. The claimed
-input is never included in the summary request because it is not yet committed.
-No safe range or a still-oversize request after the bounded passes releases the
-unstarted step claims and closes the already-open turn with the stable context
-failure.
+`CompactionTrigger` keeps its three durable spellings for wire stability:
+`pressure`, `context-overflow`, and `hard-limit`. The v0.1 production gate uses
+`pressure` at 80% and `hard-limit` when the virtual request does not fit. It
+first performs the already implemented oversized tool-result prune, then uses
+the ordinary 16% balanced-tail selection for at most one summary. Claimed input
+is never included in the summary because it is not yet committed. No safe range
+or a still-oversize request after that pass releases the unstarted step claims
+and closes the already-open turn with the stable context failure.
+
+`context-overflow` remains a validated wire/state-machine form, but automatic
+post-provider compact-and-replay is not required for v0.1. A provider overflow
+therefore ends clearly rather than initiating a hidden replay or retry loop.
 
 That local failure is exactly
 `LlmFailure { code: "AGENT_CONTEXT_LIMIT", message: "the conversation cannot be reduced to fit the model request limits" }`.
@@ -1487,9 +1560,8 @@ Message-count, 8 MiB encoder, provenance-capacity, no-balanced-range, and
 bounded-pass exhaustion all use this same non-secret code/message when the
 virtual request still cannot be admitted. An ordinary pressure pass whose
 original request fits remains advisory and does not produce this turn error.
-After an actual Provider `CONTEXT_WINDOW_EXCEEDED`, failure to make any durable
-replacement progress preserves the original provider failure instead of
-rewriting it as `AGENT_CONTEXT_LIMIT`.
+An actual Provider `CONTEXT_WINDOW_EXCEEDED` preserves the original provider
+failure; v0.1 does not automatically replay that request.
 
 ### Frozen compaction event wire
 
@@ -2128,7 +2200,33 @@ the Rust comparator normalizes them to decoded logical events and explicitly
 asserts both the plain-JSONL intentional difference and zero-modification refusal
 of a packed physical row as a Rust journal.
 
-## Default-enabled verification plan
+## Revised Phase 8 product verification
+
+The v0.1 acceptance evidence is deliberately small and user-facing:
+
+- a real CLI session can be created, normally closed, listed, resumed, and
+  continued with its previous model-visible context;
+- a final incomplete line is handled safely, while corrupt/unsupported history
+  fails before Provider or tool execution;
+- an interrupted tool whose outcome is unknown is not executed again;
+- long provider streams can cross the old 4,096-event lifetime boundary;
+- at 80% committed-context pressure, or when the virtual pending request does
+  not fit, Agent performs at most one bounded summary transaction, preserves a
+  balanced recent tail and complete tool pairs, installs a smaller checkpoint,
+  and continues the same input;
+- empty, tool-calling, max-token, failed, cancelled, and non-shrinking summaries
+  do not become checkpoints and do not cause a compaction loop;
+- if the one pass cannot make the request fit, the turn ends with the stable
+  context-limit error and no tool is replayed;
+- the repository-wide offline checks, macOS tests, Ubuntu CI, a narrow fixed-
+  upstream summary comparison, Phase 8 validation record, and independent
+  review are green.
+
+## Original durability hardening matrix
+
+The detailed matrix below remains useful engineering backlog and records why
+the existing code has its current shape. Items not repeated in the revised
+product verification section are no longer required to finish v0.1 Phase 8.
 
 ### Long-task regression
 
@@ -2459,14 +2557,17 @@ RUSTDOCFLAGS='-D warnings' cargo +1.85.0 doc --no-deps --all-features --locked
 git diff --check
 ```
 
-Release build/help/version, keyless list, new/resume script smoke, release
-symbol/LLVM-IR test-seam scan, and exact upstream fixture regeneration are also
-required. The default suites must run on local macOS and GitHub Ubuntu 24.04.
-Only after independent review, validation/compatibility/README updates, a clean
-commit, non-force push, and exact-commit green CI may Phase 8 become `complete`.
+Keyless list, new/resume script smoke, and one automatic-compaction-and-continue
+acceptance test are also required. The default suites must run on local macOS
+and GitHub Ubuntu 24.04. Only after independent review,
+validation/compatibility/README updates, a clean commit, non-force push, and
+green CI may Phase 8 become `complete`.
 
 ## Known system limits
 
+- The local journal is a convenience, not a backup. `SIGKILL`, power loss, disk
+  failure, and filesystem failure may lose the final session tail or make the
+  session unresumable; keep important source changes in the workspace and Git.
 - `SIGKILL`, power loss, failing hardware, and a kernel/filesystem that lies
   about `fsync` cannot be made clean by application code.
 - Advisory locks and directory durability are claimed only on tested local

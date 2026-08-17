@@ -113,7 +113,10 @@ impl ModelProvider for ScriptedProvider {
         Ok(PreparedProviderCall::new(
             effective,
             LlmCallConfigAdapterDefaults::default(),
-            Some(NonNegativeSafeInteger::new(4_096).expect("4096 is a safe integer")),
+            Some(
+                NonNegativeSafeInteger::new(10_000_000)
+                    .expect("the isolated tool-test context is a safe integer"),
+            ),
         )
         .with_retry_policy(
             RetryPolicy::normal(

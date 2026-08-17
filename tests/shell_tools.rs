@@ -114,7 +114,7 @@ impl ModelProvider for ScriptedProvider {
         Ok(PreparedProviderCall::new(
             effective,
             LlmCallConfigAdapterDefaults::default(),
-            Some(NonNegativeSafeInteger::new(4_096).unwrap()),
+            Some(NonNegativeSafeInteger::new(10_000_000).unwrap()),
         )
         .with_retry_policy(
             RetryPolicy::normal(

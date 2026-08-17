@@ -1095,6 +1095,19 @@ impl LlmCallConfig {
         Self::from_value(value)
     }
 
+    /// Replace the output ceiling without discarding provider extension keys.
+    pub(crate) fn with_max_tokens_preserving_extensions(
+        &self,
+        max_tokens: NonNegativeSafeInteger,
+    ) -> Result<Self, ModelError> {
+        let mut value = self.inner.raw.as_value().clone();
+        value
+            .as_object_mut()
+            .ok_or_else(|| shape("call config", "must be a JSON object"))?
+            .insert("maxTokens".to_owned(), Value::from(max_tokens.get()));
+        Self::from_value(value)
+    }
+
     /// Remove fields previously supplied by an adapter while preserving extensions.
     pub(crate) fn without_adapter_defaults(
         &self,
