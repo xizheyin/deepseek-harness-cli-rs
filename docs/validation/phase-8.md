@@ -2,9 +2,10 @@
 
 ## Status
 
-The user-approved Phase 8 product scope is implemented and has passed its local
-acceptance gates. The roadmap remains `in-progress` until this worktree is
-committed and pushed as one auditable checkpoint.
+The user-approved Phase 8 product scope is complete. Its implementation and
+acceptance evidence were committed as
+`11ab0954bb1e21e60ba95c6de86639cc6211f79b` and pushed non-force to
+`origin/main`; the roadmap has advanced to Phase 9.
 
 This is deliberately not a claim of database-grade durability or complete
 upstream persistence/compaction compatibility. Phase 8 now delivers useful
@@ -44,6 +45,8 @@ allocation proof.
 - Date: 2026-08-18 (Asia/Shanghai)
 - Git base before the current worktree:
   `2495e6b3b710ee4eede61b4c9769c90dfe8ee3e7`
+- Pushed implementation checkpoint:
+  `11ab0954bb1e21e60ba95c6de86639cc6211f79b`
 - Host: macOS, arm64
 - Rust: `rustc 1.85.0 (4d91de4e4 2025-02-17)`
 - Public-network use: none; HTTP tests bind only loopback addresses
@@ -99,7 +102,6 @@ the compatibility table describe only the reachable path and its limits.
 
 ## Publication gate
 
-The source, tests, and documentation are ready for the normal non-force
-checkpoint. Formal Phase 8 completion still requires that commit and its
-best-effort push under the repository rules; the landed commit is recorded in
-the follow-up status transition.
+The source, tests, and documentation were committed and pushed through the
+normal non-force checkpoint. Phase 8 is complete; Phase 9 now owns the single
+formal `in-progress` slot.

@@ -12,8 +12,8 @@ This roadmap records implementation status. Phases 0–9 remain the finite v0.1 
 | 5 | File changes and approval | `complete` | [`validation/phase-5.md`](validation/phase-5.md) |
 | 6 | Shell, timeout, and cancellation | `complete` | [`validation/phase-6.md`](validation/phase-6.md) |
 | 7 | Interactive CLI/TUI | `complete` | [`validation/phase-7.md`](validation/phase-7.md) |
-| 8 | Local session continuity and one-pass automatic context compaction | `in-progress` | [candidate evidence](validation/phase-8.md) |
-| 9 | v0.1 integration and release candidate | `not-started` | — |
+| 8 | Local session continuity and one-pass automatic context compaction | `complete` | [`validation/phase-8.md`](validation/phase-8.md) |
+| 9 | v0.1 integration and release candidate | `in-progress` | — |
 | 10 | Bounded subprocess tool plugins and examples | `not-started` | — |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
