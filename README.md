@@ -3,7 +3,7 @@
   <p><strong>用 Rust 构建的 DeepSeek 终端编程 Agent</strong></p>
   <p>在真实代码仓库里持续对话：搜索和阅读代码、应用补丁、运行命令，并在长会话中保存、恢复与压缩上下文。</p>
   <p>
-    <a href="https://github.com/xizheyin/deepseek-harness-cli-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/xizheyin/deepseek-harness-cli-rs/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://github.com/xizheyin/deepseek-harness-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/xizheyin/deepseek-harness-rs/actions/workflows/ci.yml/badge.svg"></a>
     <a href="Cargo.toml"><img alt="Version 0.1.0-alpha.0" src="https://img.shields.io/badge/version-0.1.0--alpha.0-f59e0b"></a>
     <a href="rust-toolchain.toml"><img alt="Rust 1.85.0" src="https://img.shields.io/badge/Rust-1.85.0-000000?logo=rust"></a>
     <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2563eb"></a>
@@ -18,8 +18,8 @@
 </div>
 
 > [!WARNING]
-> `dsh` 当前是 `0.1.0-alpha.0` 预发布版本，尚无受支持的正式发行版。Phase 9
-> 正在进行发布前的终端体验、安装和端到端验收。
+> `dsh` 当前是 `0.1.0-alpha.0` 预发布版本，源码安装候选已通过 Phase 0–9
+> 验收，但尚无受支持的稳定发行版、预编译包或 crates.io 发布。
 
 `dsh-rs` 是项目名，安装后的命令是 `dsh`。这是一个独立的社区开源项目，Agent 内核以固定版本的
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 为行为参考，
@@ -176,13 +176,12 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 项目 | 状态 |
 | --- | --- |
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
-| Phase 0–8 | 已完成：基础设施、Provider、Agent、工具、审批、Shell、终端、会话恢复与自动摘要 |
-| Phase 9 | 进行中：终端体验、源码安装、完整离线验收、文档和发布矩阵 |
-| Phase 10 | 计划中：受限的本地子进程工具插件；不属于 v0.1 |
+| Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
+| Phase 10 | 进行中：受限的本地子进程工具插件；尚不是当前可用功能 |
 
-当前开发和测试主要面向 macOS 与 Ubuntu 24.04。macOS 已有本地终端验收；Ubuntu
-24.04 是 CI 和 v0.1 发布矩阵目标，当前 Phase 9 仍在重新验收。Windows 和其他平台
-尚未实现或声明支持。
+当前候选已通过本地 macOS arm64 验收，以及 GitHub-hosted `macos-14` arm64 和
+`ubuntu-24.04` x86_64 的完整仓库检查与安装版旅程。Windows 和其他平台尚未实现或
+声明支持。
 
 ### 已知限制
 
@@ -229,6 +228,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 - [配置说明](docs/configuration.md)
 - [发布检查表](docs/releasing.md)
 - [Phase 8 验收记录](docs/validation/phase-8.md)
+- [Phase 9 验收记录](docs/validation/phase-9.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 

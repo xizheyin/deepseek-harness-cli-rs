@@ -69,7 +69,7 @@ security-tested.
 ## Reporting a vulnerability
 
 Please do not publish exploit details in a public issue. Use the repository's
-[private vulnerability reporting form](https://github.com/xizheyin/deepseek-harness-cli-rs/security/advisories/new)
+[private vulnerability reporting form](https://github.com/xizheyin/deepseek-harness-rs/security/advisories/new)
 when it is available. If that form is not visible, open a public issue titled
 `Security contact request` without vulnerability details or private data; the
 maintainer will arrange a private channel before asking for the report.

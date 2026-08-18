@@ -9,7 +9,7 @@ Phase 0 establishes a reproducible project without pretending that an agent alre
 - Executable: `dsh`
 - Pre-release version: `0.1.0-alpha.0`
 - License: MIT
-- Repository: <https://github.com/xizheyin/deepseek-harness-cli-rs>
+- Repository: <https://github.com/xizheyin/deepseek-harness-rs>
 
 The Phase 9 identity review keeps three deliberately separate names: users see
 the `dsh-rs` community-project brand, install and run the short `dsh` command,

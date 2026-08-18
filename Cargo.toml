@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "A Rust CLI for the DeepSeek Harness agent core"
 license = "MIT"
-repository = "https://github.com/xizheyin/deepseek-harness-cli-rs"
+repository = "https://github.com/xizheyin/deepseek-harness-rs"
 readme = "README.md"
 publish = false
 

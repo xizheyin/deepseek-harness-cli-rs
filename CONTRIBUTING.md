@@ -14,7 +14,7 @@ The checked-in `rust-toolchain.toml` selects the expected compiler, formatter, a
 From any directory, run:
 
 ```console
-./path/to/deepseek-harness-cli-rs/scripts/verify.sh
+./path/to/deepseek-harness-rs/scripts/verify.sh
 ```
 
 From the repository root, the shorter form is:
