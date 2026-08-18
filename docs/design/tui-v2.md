@@ -28,9 +28,15 @@ search, copy, and ordinary terminal history remain available on the verified
 primary-screen profiles. Auto mode conservatively avoids tmux, GNU Screen, and
 Zellij; users may explicitly request enhanced mode there, but no cross-emulator
 scrollback guarantee is claimed yet.
-Inspect, Review, and the startup Session picker may enter a temporary
-alternate-screen workspace only after an explicit user command; leaving it
-restores the inline transcript and draft. A bounded plain renderer remains
+Inspect and Review will first use a temporary, read-only panel inside the
+existing primary-screen Dock. The panel is owned by the same `InlineScreen`
+ledger as the composer, so committed output continues into native scrollback
+above it and no second transcript is retained or replayed. The panel is never
+written into scrollback as a report merely because the user opens it. A later
+Session picker may use an alternate screen only after a separate terminal
+ownership checkpoint proves every partial-write, signal, suspend, resize, and
+Drop path; Phase 11 does not rely on that acceleration. A bounded plain
+renderer remains
 authoritative for `--tui linear`, `--no-color`, `NO_COLOR`, `TERM=dumb`,
 non-TTY output, and screen-reader use. `--tui auto` selects enhanced only for a
 colored `xterm*` profile with no known multiplexer and an initial size of at
@@ -85,7 +91,8 @@ Rust-specific design with deterministic tests.
 - no Web or desktop GUI;
 - no visual or feature-for-feature Claude Code clone;
 - no alternate-screen requirement, mouse requirement, or hidden terminal query
-  that races ordinary input; explicit Inspect/Review acceleration is optional;
+  that races ordinary input; the first Inspect/Review path stays in the owned
+  primary-screen Dock;
 - no new approval bypass, sandbox claim, Provider, Hook, MCP, background agent,
   or arbitrary status-line command;
 - no persisted prompt-history file or secret-bearing UI cache;
@@ -113,10 +120,12 @@ are hidden from the default view.
 
 - **Focus**: user prompts, assistant answers, compact tool groups, decisions,
   errors, compaction notices, and final work receipt.
-- **Inspect**: reasoning, complete tool parameters/results, retry facts,
-  timings, and correlation IDs.
-- **Review**: changed-file summaries, canonical diffs, executed commands,
-  failures, and the turn receipt.
+- **Inspect**: retained reasoning, payload availability, retry facts, commit
+  times, and correlation IDs. It says `omitted` when a bounded source is not
+  retained; it does not call bounded data complete.
+- **Review**: changed-file summaries, proven process outcomes, failures, and
+  the joined turn receipt. Canonical diffs and full command records require a
+  later closed presentation supplement and are not reconstructed from prose.
 
 No fact is silently deleted. The view changes only the default presentation.
 
@@ -253,8 +262,11 @@ enum ViewMode {
 ```
 
 `UiState` also owns a `Composer`, bounded `PromptQueue`, current
-`TurnPresentation`, dock geometry, view mode, theme, scrollback commit marker,
-and approval focus. A pure reducer consumes:
+`TurnPresentation`, dock geometry, a transactional view mode, theme,
+scrollback commit marker, and approval focus. `ViewMode::Inspect` and
+`ViewMode::Review` hide the composer visually but never move or clear its
+draft, undo state, history navigation, or queued prompts. A pure reducer
+consumes:
 
 ```text
 keyboard / paste / resize / timer / signal / committed Session fact
@@ -270,8 +282,9 @@ No lock is held across an async effect. Rendering cannot call Provider, tools,
 approval policy, Session mutation, filesystem operations, or subprocesses.
 
 One `TerminalSession` owns the terminal descriptors, the exact original
-termios, the derived application termios, bracketed-paste state, and optional
-alternate-screen state. One `InteractiveDriver` event loop is the only TTY
+termios, the derived application termios, and bracketed-paste state. The first
+Inspect/Review implementation does not add alternate-screen state. One
+`InteractiveDriver` event loop is the only TTY
 reader and writer and the only owner that changes input focus. Decoder,
 composer, projector, layout, and renderer are pure or synchronously bounded
 components beneath that owner; no second input task may race them.
@@ -560,14 +573,88 @@ provides them. The current slice also does not claim an execution duration.
 Review will later expand changed files, canonical diffs, commands, errors,
 denials, cancellations, and unknown outcomes.
 
-The header displays the configured model, workspace basename, approval mode,
-and bounded context percentage when known. Compaction emits one quiet marker
-and an Inspect expansion; it does not expose internal event noise.
+Focus does not claim a live context percentage from the latest Provider usage.
+The first truthful status line uses the Session projection's own bounded
+surface estimate, sampled by the CLI before and after a turn, and labels it as
+an estimate. Inspect separately shows the latest reported input/output/cache
+usage and the configured context window. A route change never combines a new
+model with an older window or usage record. If the safe join is unavailable,
+the percentage is omitted rather than guessed.
 
-`dsh --resume` without an ID may open a bounded picker after the Session root
-and workspace policy are validated. The picker shows a safe display name or
-last user-message summary, age, and workspace basename; full UUID and path are
-details. No history is opened, mutated, or resumed merely by moving selection.
+Compaction emits one quiet marker and an Inspect expansion; it does not expose
+the summary or raw Provider output. A successful marker says that earlier
+context was summarized and, when known, that the shadowed nodes were estimated
+at a given token count. It never says that exactly that many tokens were
+deleted or freed. A prune marker is not called complete until its matching
+surface replacement commits.
+
+### Bounded view archive and primary-screen detail panels
+
+`LiveRenderer` remains the sole owner of `UiProjector` for the first detail
+slice. Beside it, one `ViewArchive` retains only the current turn and one
+frozen, successfully joined previous-turn review. It observes complete
+`CommittedUiEvent` values so sequence and commit time are not discarded, but
+it does not reimplement tool outcome correlation. Inspect and Review builders
+read this archive and the projector through immutable snapshots.
+
+The archive is presentation state, not a second Session log:
+
+- Inspect retains bounded reasoning text, retry facts, correlation IDs,
+  approval outcomes, compaction phases, and payload availability
+  (`retained/original bytes`, omitted parts). Raw tool arguments/results/meta
+  are not shown by default and never enter Debug output.
+- Review is frozen only after the committed `turn/end` and returned
+  `TurnOutcome` agree on turn, sequence, and the receipt-relevant reason key.
+  It contains trusted changed-file summaries, strict foreground process
+  outcomes, plugin settlement facts, issues, and the same receipt used by
+  Focus.
+- The first Review slice is deliberately summary-only. It does not call Git,
+  reread the workspace, parse model/tool prose, or claim a complete historical
+  diff/command record. A canonical diff may appear later only through a closed
+  post-commit presentation supplement from the owning patch path.
+- A resumed observer begins at the live seam. Inspect therefore says that
+  earlier details are unavailable, and Review does not synthesize historical
+  counters or timings without a retained `TurnOutcome` join.
+
+`ViewMode` has a desired state and a screen-committed state. A key may request
+Inspect or Review, but the transition becomes visible only after the matching
+`InlineScreen` transaction commits. Changing panel height uses the same-size
+re-anchor path: clear every old owned bottom row, scroll only the additional
+height needed when a panel grows, retain the existing transcript cursor when a
+panel shrinks, then draw the new fixed-height panel. It does not reuse the more
+conservative physical-resize path, which intentionally creates a completely
+new boundary. Closing restores the unchanged Composer Dock.
+Program-driven transitions therefore do not append panel snapshots to native
+history or replay transcript facts.
+
+The terminal emulator resizes before `SIGWINCH` reaches the process. A hostile
+or unusual emulator may therefore move old primary-screen rows into its own
+history during shrink before dsh can clear them. Phase 11 can prove that dsh
+does not actively append or duplicate panel text; it does not claim universal
+control over emulator-owned resize history.
+
+While a detail panel is open, the event loop continues draining and reducing
+the bounded observer. Assistant/tool output still commits once above the
+panel, while the panel coalesces redraws. `Ctrl+C` keeps its existing turn
+cancellation meaning. Paste, Enter, printable text, and unknown CSI cannot
+submit, queue, or approve from a detail panel. `Ctrl+O`, `Esc`, or `q` returns
+to Focus; arrows and PageUp/PageDown scroll. Exact local `/inspect`, `/review`,
+and `/focus` commands never enter Session or the next-turn FIFO.
+
+Approval has higher focus than a detail panel. Once a matching committed
+approval question exists, the driver first commits a panel-to-Focus Dock
+re-anchor. Only then may it append the trusted preview. After that preview
+commits, the existing 100 ms quiet period, input flush, decoder epoch reset,
+and default-Reject selector arm exactly as before. Approval never automatically
+returns to the old detail view.
+
+`dsh --resume` without an ID may later open a bounded picker after the Session
+root and workspace policy are validated. The first picker may show only facts
+already present in the bounded session listing: a safe workspace basename,
+creation time, and shortened ID. A last-message summary or last-active time
+would require a separately bounded read-only journal scan and is not inferred
+from header metadata. No history is opened, mutated, or resumed merely by
+moving selection.
 
 ## Commands and suggestions
 
@@ -577,7 +664,11 @@ does not traverse the filesystem. Suggestions are capped, cancellable, and
 visibly relative to the workspace. Selecting a suggestion inserts text only;
 it never reads the file into the model request by itself.
 
-Ctrl+O opens Inspect, while `/review` opens Review. Focus/Inspect/Review, theme,
+Ctrl+O opens Inspect, while `/review` opens Review. `/inspect` and `/focus`
+provide explicit equivalents. In a running turn these exact commands change
+the local panel immediately; they are never queued as model prompts. During an
+approval, the approval focus wins and view-switch keys cannot authorize or
+replace the question. Focus/Inspect/Review, theme,
 reduced motion, help, status, sessions, exit, and quit are local commands.
 Commands that would change Agent or Session semantics must follow the ordinary
 audited boundary rather than being hidden UI actions.
@@ -634,6 +725,13 @@ text never controls it and the default is off.
 | canonical patch row provenance | one byte per physical preview row, at most 64 Ki entries |
 | final tool-card headline / detail | 256 UTF-8 bytes each |
 | receipt headline / counters / effects | 4 KiB UTF-8 each |
+| Inspect metadata rows | 512 per turn |
+| Inspect metadata text aggregate | 512 KiB UTF-8 |
+| retained reasoning for Inspect | 256 KiB UTF-8 per turn |
+| frozen joined Review snapshots | 1 |
+| Review activities | 256 |
+| detail-panel physical rows | 4,096 after wrapping |
+| detail-panel source text | 1 MiB UTF-8 |
 | markup line-prefix candidate | 64 sanitized UTF-8 bytes |
 | complete inline-code candidate, including delimiters | 4 KiB sanitized UTF-8 |
 | fence language label | 32 ASCII bytes |
@@ -678,6 +776,9 @@ remain in force.
 | oversized prompt/paste/queue | reject locally without losing the previous draft |
 | resize during stream | reflow dock; no repeated transcript or cursor loss |
 | resize during approval | preserve Reject/selection; no decision |
+| resize during Inspect/Review | clamp the viewport; preserve draft/queue; never replay transcript |
+| approval while Inspect/Review is open | commit Focus Dock first, then preview and the unchanged Reject-first fence |
+| Inspect archive overflow | one `details omitted` fact; Session and current turn continue |
 | Ctrl+C while running | keep draft/queue, show stopping/cleanup, then next prompt |
 | Ctrl+C while idle | clear draft first; second explicit action may exit per documented policy |
 | Ctrl+Z | restore terminal, finish required cleanup, suspend, revalidate/redraw on resume |
@@ -690,7 +791,7 @@ remain in force.
 
 ## Acceptance tests
 
-1. Pure reducer tests cover every `Interaction`, view, tool, approval, queue,
+1. Pure reducer tests cover every `Interaction`, desired/committed view, tool, approval, queue,
    command, resize, cancellation, and terminal-failure transition.
 2. Semantic golden tests render 112×34, 80×24, and 44×20 scenes in Adaptive,
    Paper, High Contrast, Mono, and plain modes, including Chinese, emoji,
@@ -739,8 +840,11 @@ remain in force.
 6. **Canonical patch approval (green)**: generator-provenanced, single-source
    `apply_patch` facts; one copyable semantic diff card; unchanged linear
    record; and the existing default-Reject input fence.
-7. **Remaining product checkpoint**: tables, Focus/Inspect/Review,
-   commands/suggestions, themes, context/compaction, and session picker.
+7. **Remaining product checkpoint**: bounded view archive, primary-screen
+   Focus/Inspect/Review panels, context/compaction presentation, then tables,
+   commands/suggestions, themes, and Session picker. Each sub-slice remains
+   independently green and pushed; this line is not a claim that they are
+   already implemented.
 8. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status
