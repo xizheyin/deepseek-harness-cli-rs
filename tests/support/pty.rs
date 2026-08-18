@@ -114,37 +114,116 @@ pub struct JobControlHarness {
     _session_root: TestSessionRoot,
 }
 
-pub struct TestSessionRoot(PathBuf);
+struct PtyLaunch {
+    color: bool,
+    binary: PathBuf,
+}
+
+impl PtyLaunch {
+    fn cargo(color: bool) -> Self {
+        Self {
+            color,
+            binary: cargo_test_binary(),
+        }
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled release-acceptance binary.
+    fn installed(color: bool) -> Self {
+        Self {
+            color,
+            binary: dsh_binary(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TestSessionRoot(Arc<TestSessionDirectory>);
+
+struct TestSessionDirectory(PathBuf);
 
 impl TestSessionRoot {
     pub fn new() -> Self {
         let parent = std::fs::canonicalize(std::env::temp_dir())
             .expect("test temp directory should canonicalize without symlinks");
-        Self(parent.join(format!("dsh-pty-sessions-{}", uuid::Uuid::new_v4())))
+        Self(Arc::new(TestSessionDirectory(
+            parent.join(format!("dsh-pty-sessions-{}", uuid::Uuid::new_v4())),
+        )))
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.0.0
     }
 }
 
-impl Drop for TestSessionRoot {
+impl Drop for TestSessionDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
+#[allow(dead_code)] // Used only by the separately compiled release-acceptance binary.
+pub fn dsh_binary() -> PathBuf {
+    std::env::var_os("DSH_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dsh")))
+}
+
+fn cargo_test_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_dsh"))
+}
+
 impl PtyHarness {
     pub fn spawn(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, false)
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            None,
+            None,
+            PtyLaunch::cargo(false),
+        )
     }
 
     pub fn spawn_color(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, true)
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            None,
+            None,
+            PtyLaunch::cargo(true),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled release-acceptance binary.
+    pub fn spawn_color_with_session_root(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            PtyLaunch::installed(true),
+        )
     }
 
     pub fn spawn_rolling(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, true, None, None, None, false)
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            true,
+            None,
+            None,
+            None,
+            PtyLaunch::cargo(false),
+        )
     }
 
     pub fn spawn_with_disabled_terminal_mode(
@@ -152,7 +231,15 @@ impl PtyHarness {
         workspace: &Path,
         mode: DisabledTerminalMode,
     ) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, Some(mode), None, None, false)
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            Some(mode),
+            None,
+            None,
+            PtyLaunch::cargo(false),
+        )
     }
 
     pub fn spawn_resume(
@@ -168,7 +255,25 @@ impl PtyHarness {
             None,
             Some(session_root),
             Some(session_id),
+            PtyLaunch::cargo(false),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled release-acceptance binary.
+    pub fn spawn_resume_color(
+        base_url: &str,
+        caller_workspace: &Path,
+        session_root: TestSessionRoot,
+        session_id: &str,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            caller_workspace,
             false,
+            None,
+            Some(session_root),
+            Some(session_id),
+            PtyLaunch::installed(true),
         )
     }
 
@@ -179,8 +284,9 @@ impl PtyHarness {
         disabled_mode: Option<DisabledTerminalMode>,
         session_root: Option<TestSessionRoot>,
         resume_id: Option<&str>,
-        color: bool,
+        launch: PtyLaunch,
     ) -> Self {
+        let PtyLaunch { color, binary } = launch;
         let (master, slave) = open_test_pty();
         let mut termios =
             rustix::termios::tcgetattr(&slave).expect("PTY terminal settings should be readable");
@@ -271,7 +377,7 @@ impl PtyHarness {
             read_controlled_transcript(File::from(reader_fd), &reader_state, &reader_commands)
         });
         let session_root = session_root.unwrap_or_else(TestSessionRoot::new);
-        let command = blocking::Command::new(env!("CARGO_BIN_EXE_dsh"));
+        let command = blocking::Command::new(binary);
         let command = if let Some(session_id) = resume_id {
             if color {
                 command.args(["--resume", session_id])
@@ -596,7 +702,7 @@ impl JobControlHarness {
             .env("PROMPT_COMMAND", "")
             .env("HISTFILE", "/dev/null")
             .env("BASH_SILENCE_DEPRECATION_WARNING", "1")
-            .env("DSH_TEST_BIN", env!("CARGO_BIN_EXE_dsh"))
+            .env("DSH_TEST_BIN", cargo_test_binary())
             .env("DSH_TEST_WORKSPACE", workspace)
             .env("DEEPSEEK_BASE_URL", base_url)
             .env("DEEPSEEK_API_KEY", TEST_API_KEY)

@@ -483,6 +483,83 @@ async function preStepReject() {
   }
 }
 
+function requestHeaderReasons(agent: Agent): string[] {
+  return agent.session.events
+    .filter(event => event.type === 'request/header')
+    .map(event => event.type === 'request/header' ? event.data.reason : '')
+}
+
+function requestHeaderPayloads(agent: Agent) {
+  return agent.session.events
+    .filter(event => event.type === 'request/header')
+    .map(event => event.type === 'request/header' ? clone(event.data) : undefined)
+    .filter(value => value !== undefined)
+}
+
+async function requestHeaderLifecycle() {
+  const { ctx, adapter } = await harness([
+    textResponse('first'),
+    textResponse('stable'),
+    textResponse('changed'),
+  ])
+  const agent = createAgent(ctx, 'phase3-header-lifecycle')
+  ctx.on('agent/request', async ({ turn }, next) => {
+    const config = await next()
+    return turn === 3 ? { ...config, maxTokens: 2_048 } : config
+  })
+
+  await drive(agent, fixedUser('user-header-first', 'first'))
+  const afterInitial = requestHeaderReasons(agent)
+  await drive(agent, fixedUser('user-header-stable', 'stable'))
+  const afterStable = requestHeaderReasons(agent)
+  await drive(agent, fixedUser('user-header-change', 'change'))
+  const afterChange = requestHeaderReasons(agent)
+
+  const first = await harness([textResponse('before resume')])
+  const firstAgent = createAgent(first.ctx, 'phase3-header-before-resume')
+  await drive(firstAgent, fixedUser('user-before-resume', 'before resume'))
+  const beforeResume = requestHeaderReasons(firstAgent)
+
+  const resumed = await harness([textResponse('after resume')])
+  const resumedHandle = await resumed.ctx.agents.create({
+    sessionId: SessionId('phase3-header-resumed'),
+    seed: clone(firstAgent.session.events),
+    agentOptions: { provider: 'mock', model: 'oracle-model', maxTokens: 1_024 },
+  })
+  await drive(resumedHandle.agent, fixedUser('user-after-resume', 'after resume'))
+  const afterResume = requestHeaderReasons(resumedHandle.agent)
+
+  return {
+    stableAndChange: {
+      afterInitial,
+      afterStable,
+      afterChange,
+      payloads: requestHeaderPayloads(agent),
+      maxTokensAtDispatch: adapter.dispatches.map(dispatch => dispatch.request.maxTokens),
+      everyRequestReconstructs: adapter.dispatches.every(
+        dispatch => Object.values(dispatch.checks).every(Boolean),
+      ),
+    },
+    resume: {
+      beforeResume,
+      afterResume,
+      payloads: requestHeaderPayloads(resumedHandle.agent),
+      resumedRequestExtendsHistory:
+        (resumed.adapter.dispatches[0]?.request.messages.length ?? 0)
+          > (first.adapter.dispatches[0]?.request.messages.length ?? 0),
+      resumedRequestReconstructs: Object.values(
+        resumed.adapter.dispatches[0]?.checks ?? {},
+      ).every(Boolean),
+    },
+    checks: {
+      stableSuppressed: same(afterInitial, ['initial']) && same(afterStable, ['initial']),
+      changedSnapshot: same(afterChange, ['initial', 'change']),
+      resumedSnapshot: same(beforeResume, ['initial'])
+        && same(afterResume, ['initial', 'resume']),
+    },
+  }
+}
+
 function assertNoFalseChecks(value: unknown, path = 'scenarios'): void {
   if (value === false) throw new Error(`oracle check failed: ${path}`)
   if (Array.isArray(value) || value === null || typeof value !== 'object') return
@@ -527,6 +604,7 @@ async function main(): Promise<void> {
     retrySameStep: await retrySameStep(),
     maxTokens: await maxTokens(),
     preStepReject: await preStepReject(),
+    requestHeaderLifecycle: await requestHeaderLifecycle(),
   }
   assertNoFalseChecks(Object.fromEntries(
     Object.entries(scenarios).map(([name, scenario]) => [name, scenario.checks]),

@@ -168,3 +168,22 @@ The Phase 3 checkpoint was pushed non-forced to `origin/main`. GitHub Actions
 run [31759801021](https://github.com/xizheyin/deepseek-harness-cli-rs/actions/runs/31759801021)
 completed successfully on Ubuntu 24.04 for the exact checkpoint
 `66c91700c4c61f0f0032a4cf6f46e26005693348`.
+
+## 2026-08-18 request-header lifecycle addendum
+
+Phase 9 closed the remaining v0.1 comparison gap without rewriting the
+historical Phase 3 checkpoint above. The pinned upstream generator now adds a
+sixth scenario that runs three turns with effective `maxTokens` values
+`1024 → 1024 → 2048`, then starts a fresh loop over a complete prior event seed.
+It records the full canonical `request/header` payloads and reasons, rather than
+only their event types.
+
+The Rust producer test uses the same system/config facts and the same three-turn
+field change. It compares the complete `initial`/`change` payload pair, plus the
+complete seeded `initial`/`resume` pair. The generator type-checked against the
+same clean pinned checkout, generated twice byte-identically, and the focused
+Rust comparison passed. Addendum SHA-256 values:
+
+- type checker: `3c21bb11b3ef37d3ec8182a4585d9efe4e7adc0c2984e8fefcf634a09a4976f1`;
+- generator: `7f1292f3dcbf0a23b80e277222e8be21c7aba57d31376bf69bb285c9d1e00746`;
+- fixture: `5377ba8401c346a5266dd425f0b6f2100d983179c289b05f112eeded2b7817e5`.

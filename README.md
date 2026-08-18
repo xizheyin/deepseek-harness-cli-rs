@@ -26,17 +26,24 @@
 再用适合 Rust CLI 的类型、并发模型和安全边界重新实现；它不是官方产品，也不是
 TypeScript 源码的逐行翻译。
 
+<p align="center">
+  <img src="docs/assets/dsh-overview.png" alt="dsh-rs 在终端中读取文件、展示补丁并完成修改" width="1128">
+</p>
+
+<p align="center"><sub>真实安装版 <code>dsh</code> 在 PTY 中运行；模型响应来自离线 loopback fixture，不调用真实 API，也不消耗额度。</sub></p>
+
 ## 快速开始
 
 仓库固定使用 Rust 1.85.0。安装 [Rustup](https://rustup.rs/) 后，在仓库根目录执行：
 
 ```console
-cargo build --locked
+cargo install --locked --path .
 export DEEPSEEK_API_KEY='你的 DeepSeek API Key'
-cargo run --locked -- --workspace .
+dsh --workspace .
 ```
 
-看到 `dsh >` 后，直接输入任务并按回车。例如：
+看到彩色提示符 `❯` 后，直接输入任务并按回车；`--no-color` 模式下提示符是
+`dsh >`。例如：
 
 ```text
 请先了解这个项目，再告诉我最值得修复的三个问题。
@@ -62,7 +69,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 ### 交互模式
 
 ```console
-cargo run --locked -- --workspace .
+dsh --workspace .
 ```
 
 | 输入 | 行为 |
@@ -77,11 +84,15 @@ cargo run --locked -- --workspace .
 <kbd>Tab</kbd> 或 `y/n/c` 移动选择，按 <kbd>Enter</kbd> 确认；默认选中
 **Reject**，按 <kbd>Esc</kbd> 取消。
 
+<p align="center">
+  <img src="docs/assets/dsh-approval.png" alt="dsh-rs 补丁审批选择器，默认选中 Reject，可移动到 Allow once" width="1128">
+</p>
+
 ### 一次性脚本调用
 
 ```console
-cargo run --locked -- --workspace . --prompt '概括这个项目的目录结构'
-printf '读取 README.md 并概括当前限制\n' | cargo run --locked -- --workspace .
+dsh --workspace . --prompt '概括这个项目的目录结构'
+printf '读取 README.md 并概括当前限制\n' | dsh --workspace .
 ```
 
 脚本模式不会等待人工审批，因此文件写入和 Shell 调用会被拒绝。成功完成时，stdout
@@ -90,11 +101,28 @@ printf '读取 README.md 并概括当前限制\n' | cargo run --locked -- --work
 ### 查看帮助
 
 ```console
-cargo run --locked -- --help
+dsh --help
 ```
 
 主要参数包括 `--workspace`、`--model`、`--prompt`、`--list-sessions`、
 `--resume` 和 `--no-color`。
+
+### 配置
+
+`dsh` 当前使用少量环境变量，没有配置文件或 profile 系统：
+
+| 变量 | 用途 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | 必需的 DeepSeek API Key；每次请求时读取 |
+| `DEEPSEEK_BASE_URL` | 可选的可信 API 地址；只允许 HTTPS，离线测试可用环回 HTTP |
+| `DSH_SESSION_ROOT` | 可选的绝对会话目录，适合测试或运维隔离 |
+| `XDG_STATE_HOME` | Linux 未设置会话目录覆盖时的状态目录基准 |
+| `NO_COLOR` | 存在即关闭颜色；`TERM=dumb` 和 `--no-color` 也会关闭颜色 |
+
+默认会话目录是 macOS 的 `~/Library/Application Support/dsh/sessions`，以及 Linux
+的 `$XDG_STATE_HOME/dsh/sessions`；未设置 `XDG_STATE_HOME` 时使用
+`~/.local/state/dsh/sessions`。自定义 endpoint 不跟随重定向，也不使用系统代理。
+更多示例见 [配置说明](docs/configuration.md)。
 
 ## 会话与长对话
 
@@ -102,15 +130,15 @@ cargo run --locked -- --help
 列出并恢复：
 
 ```console
-cargo run --locked -- --list-sessions
-cargo run --locked -- --list-sessions --workspace .
+dsh --list-sessions
+dsh --list-sessions --workspace .
 ```
 
 从列表复制一个会话 ID 后继续：
 
 ```console
-cargo run --locked -- --resume session-550e8400-e29b-41d4-a716-446655440000
-cargo run --locked -- --resume session-550e8400-e29b-41d4-a716-446655440000 \
+dsh --resume session-550e8400-e29b-41d4-a716-446655440000
+dsh --resume session-550e8400-e29b-41d4-a716-446655440000 \
   --prompt '继续上一项工作'
 ```
 
@@ -156,6 +184,15 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 24.04 是 CI 和 v0.1 发布矩阵目标，当前 Phase 9 仍在重新验收。Windows 和其他平台
 尚未实现或声明支持。
 
+### 已知限制
+
+- 当前只支持从源码安装，包没有发布到 crates.io，也没有预编译下载或 Homebrew formula；
+- Provider 只有 DeepSeek；不支持 MCP、Hooks、Skills、子智能体或后台任务；
+- `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
+- 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
+- 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
+- Windows 以及未列入发布矩阵的 Unix 平台尚未支持。
+
 查看完整的 [Roadmap](docs/roadmap.md) 和逐项的
 [Compatibility matrix](docs/compatibility.md)。
 
@@ -167,10 +204,14 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 
 ```console
 ./scripts/verify.sh
+./scripts/accept-phase9.sh
 ```
 
-这是本地与 GitHub Actions 共用的验证入口，包含格式、全部目标/feature 编译、测试、
-Clippy（warnings denied）和空白检查。贡献前请阅读 [Contributing guide](CONTRIBUTING.md)。
+第一条执行格式、全部目标/feature 编译、测试、Clippy（warnings denied）和空白检查；
+第二条安装 release 二进制到临时目录，再用真实 PTY 和离线 loopback Provider 跑完整
+发布旅程。安装阶段在本机尚未缓存依赖时可能访问 Cargo registry，但 Agent 场景不会
+调用真实 DeepSeek。两条命令也会在发布 CI 中运行。贡献前请阅读
+[Contributing guide](CONTRIBUTING.md)。
 
 ## 上游关系
 
@@ -185,6 +226,8 @@ Clippy（warnings denied）和空白检查。贡献前请阅读 [Contributing gu
 
 - [产品路线图](docs/roadmap.md)
 - [兼容性矩阵](docs/compatibility.md)
+- [配置说明](docs/configuration.md)
+- [发布检查表](docs/releasing.md)
 - [Phase 8 验收记录](docs/validation/phase-8.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)

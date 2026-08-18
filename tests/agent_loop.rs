@@ -697,7 +697,7 @@ struct PolicyProvider {
 }
 
 struct SequencedPreparedProvider {
-    preparations: Mutex<VecDeque<(String, u64)>>,
+    preparations: Mutex<VecDeque<(String, u64, u64)>>,
     attempts: Mutex<VecDeque<Vec<StreamChunk>>>,
 }
 
@@ -712,12 +712,12 @@ impl PolicyProvider {
 }
 
 impl SequencedPreparedProvider {
-    fn new(preparations: Vec<(&str, u64)>, attempts: Vec<Vec<StreamChunk>>) -> Self {
+    fn new(preparations: Vec<(&str, u64, u64)>, attempts: Vec<Vec<StreamChunk>>) -> Self {
         Self {
             preparations: Mutex::new(
                 preparations
                     .into_iter()
-                    .map(|(model, context)| (model.to_owned(), context))
+                    .map(|(model, context, max_tokens)| (model.to_owned(), context, max_tokens))
                     .collect(),
             ),
             attempts: Mutex::new(attempts.into()),
@@ -730,10 +730,11 @@ impl ModelProvider for SequencedPreparedProvider {
         &self,
         config: LlmCallConfig,
     ) -> Result<PreparedProviderCall, ProviderPrepareError> {
-        let (model, context_window) = self.preparations.lock().unwrap().pop_front().unwrap();
+        let (model, context_window, max_tokens) =
+            self.preparations.lock().unwrap().pop_front().unwrap();
         let mut raw = config.raw().as_value().clone();
         raw["model"] = model.into();
-        raw["maxTokens"] = 1_024.into();
+        raw["maxTokens"] = max_tokens.into();
         let effective = serde_json::from_value(raw).unwrap();
         Ok(PreparedProviderCall::new(
             effective,
@@ -1168,6 +1169,17 @@ async fn text_completion_is_logged_before_a_balanced_turn_closes() {
 
 #[tokio::test]
 async fn request_headers_are_suppressed_when_stable_and_marked_on_resume_or_change() {
+    const ORACLE_SYSTEM: &str = concat!(
+        "You are an AI agent powered by DeepSeek Harness.\n\n",
+        "Phase 3 oracle persona."
+    );
+    let oracle: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/agent/upstream_phase3_oracle.json")).unwrap();
+    let lifecycle = &oracle["scenarios"]["requestHeaderLifecycle"];
+    assert_eq!(lifecycle["checks"]["stableSuppressed"], true);
+    assert_eq!(lifecycle["checks"]["changedSnapshot"], true);
+    assert_eq!(lifecycle["checks"]["resumedSnapshot"], true);
+
     let provider = Arc::new(FakeProvider::new(vec![
         text_response("first"),
         text_response("second"),
@@ -1178,26 +1190,37 @@ async fn request_headers_are_suppressed_when_stable_and_marked_on_resume_or_chan
         "header-lifecycle",
         provider.clone(),
         tools.clone(),
-        config(),
+        oracle_config(ORACLE_SYSTEM, false),
     );
-    for text in ["one", "two"] {
-        original
-            .run_turn(
-                TurnProposal::Enter(vec![user_with_id(&format!("user-{text}"), text)]),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-    }
-    let initial_reasons = request_header_reasons(original.session());
-    assert_eq!(initial_reasons, vec![RequestHeaderReason::Initial]);
+    original
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("user-one", "one")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(request_header_reasons(original.session())).unwrap(),
+        lifecycle["stableAndChange"]["afterInitial"]
+    );
+    original
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("user-two", "two")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(request_header_reasons(original.session())).unwrap(),
+        lifecycle["stableAndChange"]["afterStable"]
+    );
 
     let mut reconstructed = AgentLoop::with_runtime(
         original.into_session(),
         provider,
         tools,
         Arc::new(FixedRuntime::default()),
-        config(),
+        oracle_config(ORACLE_SYSTEM, false),
     )
     .unwrap();
     reconstructed
@@ -1208,48 +1231,81 @@ async fn request_headers_are_suppressed_when_stable_and_marked_on_resume_or_chan
         .await
         .unwrap();
     assert_eq!(
-        request_header_reasons(reconstructed.session()),
-        vec![RequestHeaderReason::Initial, RequestHeaderReason::Resume]
+        serde_json::to_value(request_header_reasons(reconstructed.session())).unwrap(),
+        lifecycle["resume"]["afterResume"]
+    );
+    assert_eq!(
+        request_header_payloads(reconstructed.session()),
+        lifecycle["resume"]["payloads"]
     );
 
     let provider = Arc::new(SequencedPreparedProvider::new(
-        vec![("model-a", 4_096), ("model-b", 8_192)],
-        vec![text_response("a"), text_response("b")],
+        vec![
+            ("oracle-model", 4_096, 1_024),
+            ("oracle-model", 4_096, 1_024),
+            ("oracle-model", 4_096, 2_048),
+        ],
+        vec![
+            text_response("first"),
+            text_response("stable"),
+            text_response("changed"),
+        ],
     ));
     let mut changed = AgentLoop::with_runtime(
         session("header-change"),
         provider,
         Arc::new(FakeTools::default()),
         Arc::new(FixedRuntime::default()),
-        config(),
+        oracle_config(ORACLE_SYSTEM, false),
     )
     .unwrap();
-    for text in ["a", "b"] {
-        changed
-            .run_turn(
-                TurnProposal::Enter(vec![user_with_id(&format!("user-{text}"), text)]),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-    }
+    changed
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("user-a", "a")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        request_header_reasons(changed.session()),
-        vec![RequestHeaderReason::Initial, RequestHeaderReason::Change]
+        serde_json::to_value(request_header_reasons(changed.session())).unwrap(),
+        lifecycle["stableAndChange"]["afterInitial"]
+    );
+    changed
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("user-b", "b")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(request_header_reasons(changed.session())).unwrap(),
+        lifecycle["stableAndChange"]["afterStable"]
+    );
+    changed
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("user-c", "c")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(request_header_reasons(changed.session())).unwrap(),
+        lifecycle["stableAndChange"]["afterChange"]
     );
     assert_eq!(
-        changed.session().request_context().unwrap().model(),
-        Some("model-b")
+        request_header_payloads(changed.session()),
+        lifecycle["stableAndChange"]["payloads"]
     );
     assert_eq!(
         changed
             .session()
-            .request_context()
+            .request_header()
             .unwrap()
-            .context_window()
+            .config
+            .max_tokens()
             .unwrap()
             .get(),
-        8_192
+        2_048
     );
 }
 
@@ -4308,6 +4364,22 @@ fn request_header_reasons(session: &Session) -> Vec<RequestHeaderReason> {
             _ => None,
         })
         .collect()
+}
+
+fn request_header_payloads(session: &Session) -> serde_json::Value {
+    serde_json::Value::Array(
+        session
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                EventKind::RequestHeader { header, reason } => Some(json!({
+                    "header": header,
+                    "reason": reason,
+                })),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn rust_event_types_from_events(

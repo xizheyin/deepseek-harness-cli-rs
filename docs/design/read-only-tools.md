@@ -339,8 +339,25 @@ assistant/message → tool/call → tool/result → step/end
 
 `tool/call` contains the exact model-provided arguments string and commits before
 the registry body is polled. `tool/result.sourceEventSeqs` points to that call.
-Filesystem observation hooks and structured presentation cards are deferred; no
-non-durable callback is required to understand the outcome.
+
+### Intentional `read` presentation difference
+
+The pinned upstream `read` result displays an absolute path and returns a
+structured file `value` plus presentation `meta`. Rust v0.1 intentionally emits
+one workspace-relative text result and no success `meta`. This avoids publishing
+the host's absolute workspace root and gives the model, append-only Session, and
+terminal one authoritative replayable value instead of a second UI-only file
+object. The observable cost is that an upstream presentation-card consumer cannot
+read Rust's result byte-for-byte and sees no structured file object; the model
+still receives numbered content, pagination facts, and normalized failures. The
+Session schema gains no hidden state, and replay never rereads the file.
+
+The type-checked Phase 4 oracle retains the upstream absolute text, `value`, and
+`meta`; the paired Rust comparator normalizes only the known workspace prefix.
+Rust result tests additionally prove that the persisted result has no success
+`meta`, contains only the relative path, and replays the exact same model-visible
+text. This fixture-backed privacy/ownership choice is therefore an
+`intentional-difference`, not an unfinished presentation feature.
 
 ## Determinism, replay, and state
 

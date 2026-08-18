@@ -199,8 +199,10 @@ rather than reconstructing evidence only after the turn finishes.
 
 [`scripts/generate-upstream-agent-fixtures.ts`](../scripts/generate-upstream-agent-fixtures.ts)
 records text completion, a tool round trip, a retry in the same step,
-max-token tool suppression, and pre-step rejection. The fixture retains the
-official inbox events; the Rust comparison removes exactly
+max-token tool suppression, pre-step rejection, and a separate request-header
+lifecycle covering stable suppression, a changed full snapshot, and a fresh
+loop over a seeded log. The fixture retains the official inbox events; the Rust
+core-trace comparison removes exactly
 `agent/inbox/spliced`, then compares the remaining core trace. Provider chunks
 are read back from the fixture instead of being duplicated in a handwritten
 Rust script.
@@ -227,8 +229,8 @@ The accepted Phase 3 research run used Node 26.0.0, TypeScript 6.0.3, and the
 upstream lockfile's `tsx` 4.22.4. Its SHA-256 values are:
 
 - type checker: `3c21bb11b3ef37d3ec8182a4585d9efe4e7adc0c2984e8fefcf634a09a4976f1`;
-- generator: `d8368691f9b14dd2f214db512ba60d4b192dbfc7a1b915c52e78bd80c6226444`;
-- fixture: `9b0249dacd104df417faff37657aa0a71cde0675f66808db793bd52c562b124c`.
+- generator: `7f1292f3dcbf0a23b80e277222e8be21c7aba57d31376bf69bb285c9d1e00746`;
+- fixture: `5377ba8401c346a5266dd425f0b6f2100d983179c289b05f112eeded2b7817e5`.
 
 The checker loads the oracle into the pinned TypeScript source graph; merely
 executing it through `tsx` is not counted as type checking. Two generations

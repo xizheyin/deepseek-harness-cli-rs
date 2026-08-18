@@ -8,7 +8,7 @@
     "clockStartMs": 1700000000000,
     "clockStepMs": 7,
     "eventTimes": "normalized from each scenario event seq",
-    "uuidCalls": 6
+    "uuidCalls": 11
   },
   "evidence": {
     "sourcePaths": [
@@ -2227,6 +2227,90 @@
         "noStep": true,
         "noHeaderOrContext": true,
         "balancedBlockedTurn": true
+      }
+    },
+    "requestHeaderLifecycle": {
+      "stableAndChange": {
+        "afterInitial": [
+          "initial"
+        ],
+        "afterStable": [
+          "initial"
+        ],
+        "afterChange": [
+          "initial",
+          "change"
+        ],
+        "payloads": [
+          {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+            },
+            "reason": "initial"
+          },
+          {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 2048
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+            },
+            "reason": "change"
+          }
+        ],
+        "maxTokensAtDispatch": [
+          1024,
+          1024,
+          2048
+        ],
+        "everyRequestReconstructs": true
+      },
+      "resume": {
+        "beforeResume": [
+          "initial"
+        ],
+        "afterResume": [
+          "initial",
+          "resume"
+        ],
+        "payloads": [
+          {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+            },
+            "reason": "initial"
+          },
+          {
+            "header": {
+              "config": {
+                "provider": "mock",
+                "model": "oracle-model",
+                "maxTokens": 1024
+              },
+              "system": "You are an AI agent powered by DeepSeek Harness.\n\nPhase 3 oracle persona."
+            },
+            "reason": "resume"
+          }
+        ],
+        "resumedRequestExtendsHistory": true,
+        "resumedRequestReconstructs": true
+      },
+      "checks": {
+        "stableSuppressed": true,
+        "changedSnapshot": true,
+        "resumedSnapshot": true
       }
     }
   }
