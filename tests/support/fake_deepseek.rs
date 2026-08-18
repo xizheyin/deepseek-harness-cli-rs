@@ -13,6 +13,8 @@ use std::{
 // second request is not rejected by the offline fixture server first.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_TERMINAL_TESTS: usize = 8;
+const INITIAL_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+const FOLLOWUP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 static TERMINAL_TEST_PERMITS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
 
 struct TerminalTestPermit;
@@ -112,7 +114,7 @@ impl SplitSseServer {
         );
         let (release, wait_for_release) = sync_channel(0);
         let worker = thread::spawn(move || {
-            let (mut stream, _) = accept_with_deadline(&listener)?;
+            let (mut stream, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)?;
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -180,8 +182,18 @@ impl SequenceSseServer {
         let worker = thread::spawn(move || {
             bodies
                 .into_iter()
-                .map(|body| {
-                    let (mut stream, _) = accept_with_deadline(&listener)
+                .enumerate()
+                .map(|(index, body)| {
+                    // The first deadline catches a CLI that never connects.
+                    // Later requests may legitimately follow a large durable
+                    // tool round, so they inherit the test's bounded journey
+                    // deadline instead of a second cold-start deadline.
+                    let timeout = if index == 0 {
+                        INITIAL_ACCEPT_TIMEOUT
+                    } else {
+                        FOLLOWUP_ACCEPT_TIMEOUT
+                    };
+                    let (mut stream, _) = accept_with_deadline(&listener, timeout)
                         .expect("dsh should make every scripted request");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -225,8 +237,8 @@ impl CancelThenSseServer {
                 .expect("loopback listener should have an address")
         );
         let worker = thread::spawn(move || {
-            let (mut first, _) =
-                accept_with_deadline(&listener).expect("dsh should make the stalled request");
+            let (mut first, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)
+                .expect("dsh should make the stalled request");
             first
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -256,8 +268,8 @@ impl CancelThenSseServer {
                 .join()
                 .expect("connection monitor should join");
 
-            let (mut second, _) =
-                accept_with_deadline(&listener).expect("dsh should make the post-cancel request");
+            let (mut second, _) = accept_with_deadline(&listener, FOLLOWUP_ACCEPT_TIMEOUT)
+                .expect("dsh should make the post-cancel request");
             second
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -300,8 +312,8 @@ impl GatedFirstSseServer {
         );
         let (release, wait_for_release) = sync_channel(0);
         let worker = thread::spawn(move || {
-            let (mut stream, _) =
-                accept_with_deadline(&listener).expect("dsh should make the gated request");
+            let (mut stream, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)
+                .expect("dsh should make the gated request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -332,7 +344,7 @@ impl GatedFirstSseServer {
                 .expect("gated SSE suffix should write");
 
             for body in remaining {
-                let (mut stream, _) = accept_with_deadline(&listener)
+                let (mut stream, _) = accept_with_deadline(&listener, FOLLOWUP_ACCEPT_TIMEOUT)
                     .expect("dsh should make every remaining request");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -388,8 +400,8 @@ impl StalledSseServer {
                 .expect("loopback listener should have an address")
         );
         let worker = thread::spawn(move || {
-            let (mut stream, _) =
-                accept_with_deadline(&listener).expect("dsh should make the stalled request");
+            let (mut stream, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)
+                .expect("dsh should make the stalled request");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -444,8 +456,8 @@ impl BacklogThenStalledSseServer {
         );
         let (ready_sender, second_request_ready) = sync_channel(1);
         let worker = thread::spawn(move || {
-            let (mut first, _) =
-                accept_with_deadline(&listener).expect("dsh should make the backlog request");
+            let (mut first, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)
+                .expect("dsh should make the backlog request");
             first
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -456,8 +468,8 @@ impl BacklogThenStalledSseServer {
                 String::from_utf8(read_http_request(&mut first)).expect("request should be UTF-8");
             write_sse_response(&mut first, &first_response);
 
-            let (mut second, _) =
-                accept_with_deadline(&listener).expect("dsh should make the post-tool request");
+            let (mut second, _) = accept_with_deadline(&listener, FOLLOWUP_ACCEPT_TIMEOUT)
+                .expect("dsh should make the post-tool request");
             second
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("request read should be bounded");
@@ -545,8 +557,11 @@ fn write_sse_response(stream: &mut TcpStream, body: &str) {
         .expect("SSE response should write");
 }
 
-fn accept_with_deadline(listener: &TcpListener) -> Option<(TcpStream, std::net::SocketAddr)> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+fn accept_with_deadline(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> Option<(TcpStream, std::net::SocketAddr)> {
+    let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
             Ok((stream, address)) => {
