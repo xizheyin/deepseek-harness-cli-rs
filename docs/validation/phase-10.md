@@ -2,10 +2,23 @@
 
 ## Status
 
-Phase 10 is `in-progress`. The production path, examples, and local fault
-matrix exist, but completion still requires one immutable candidate commit,
-successful `macos-14` and `ubuntu-24.04` CI jobs running the installed-plugin
-journey, and a separate reviewed status commit.
+The Phase 10 bounded subprocess-plugin extension is accepted. The immutable
+implementation candidate is `f2bd55ca1a2d554198a26d5d9778713ed21dcdef`
+on `main`, pushed non-force to `origin/main`. The project remains
+`0.1.0-alpha.0`; this acceptance does not publish a crate, prebuilt binary,
+tag, GitHub Release, or stable support commitment.
+
+## Candidate identity
+
+- Project and Cargo package: `dsh-rs`
+- Installed command: `dsh`
+- Library target: `deepseek_harness_cli`
+- Rust toolchain: `1.85.0`
+- Candidate commit: `f2bd55ca1a2d554198a26d5d9778713ed21dcdef`
+- Branch and remote: `main` on
+  `git@github.com:xizheyin/deepseek-harness-rs.git`
+- Pinned semantic baseline:
+  `deepseek-ai/deepseek-harness@47f943859bef60e4160492346772ded9b24f765a`
 
 ## Implemented scope
 
@@ -86,17 +99,18 @@ The install steps may fetch already locked crates when the Cargo cache is empty;
 the Agent/plugin scenarios themselves use loopback Provider fixtures and
 temporary workspaces.
 
-## Publication gate
+## Remote acceptance
 
-Pending before `complete`:
+GitHub Actions [CI run 32133405407](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/32133405407)
+completed successfully for the exact candidate commit:
 
-1. commit and non-force push the reviewed candidate;
-2. record the immutable candidate SHA;
-3. record successful `macos-14` and `ubuntu-24.04` job URLs, each including
-   repository verification plus the Phase 9 and Phase 10 installed journeys;
-4. confirm the pushed tree is unchanged by those checks;
-5. create and verify the separate status commit that changes Phase 10 from
-   `in-progress` to `complete`.
+- [Ubuntu job 95699262190](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/32133405407/job/95699262190),
+  completed at `2026-08-18T11:50:48Z` in 4m 12s;
+- [macOS job 95699262199](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/32133405407/job/95699262199),
+  completed at `2026-08-18T11:52:01Z` in 5m 25s.
 
-The current alpha is still source-installed. Phase 10 does not publish a crate,
-prebuilt binary, tag, GitHub Release, or stable support commitment.
+Both jobs concluded `success` for `Run repository checks`,
+`Verify the installed release journey`, and
+`Verify the installed plugin journey`. The pushed implementation tree matches
+the locally reviewed candidate. The separate status commit changes only this
+acceptance record, the roadmap, and the README status wording.
