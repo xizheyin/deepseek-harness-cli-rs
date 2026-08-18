@@ -1262,11 +1262,13 @@ oracle. Rust deliberately keeps native scrollback and the existing Unix signal
 contract and supplies its own visual language. The partial implementation now
 projects bounded committed facts and has a production-reachable enhanced input
 and inline-Dock path: long-lived cbreak, Unicode editing, safe paste, bounded
-next-turn FIFO, full-screen-scroll ownership, and directional approval. This
-terminal-specific behavior has no upstream visual oracle, so
-`docs/compatibility.md` remains `partial`. Semantic tool cards/receipts,
-Markdown/diff, Inspect/Review, installed Phase 11 evidence, screenshots, and
-the real-emulator/platform matrix must exist before any broader
+next-turn FIFO, full-screen-scroll ownership, and directional approval. It now
+also folds each committed tool lifecycle into one truth-safe final card and
+joins committed `turn/end` with the exact `TurnOutcome` for a compact receipt.
+These terminal-specific behaviors have no upstream visual oracle, so
+`docs/compatibility.md` remains `partial`. Markdown/diff, Inspect/Review,
+installed Phase 11 evidence, screenshots, and the real-emulator/platform matrix
+must exist before any broader
 `intentional-difference` completion claim.
 
 The complete state, layout, safety, resource, and test design was frozen in

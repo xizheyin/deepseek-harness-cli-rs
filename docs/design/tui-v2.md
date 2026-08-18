@@ -3,10 +3,11 @@
 ## Status and decision
 
 Phase 11 is a user-approved post-v0.1 product-quality extension. The Phase 9
-linear renderer remains the tested escape hatch. A production-reachable first
-enhanced slice now adds the owned composer and inline dock described below,
-while tool cards, receipts, Markdown/diff, Inspect/Review, themes, Session
-picker, installed screenshots, and the real-emulator matrix remain incomplete.
+linear renderer remains the tested escape hatch. Production-reachable slices
+now add the owned composer, inline dock, one final truth-safe card per settled
+tool, and one joined turn receipt. Markdown/diff, Inspect/Review, themes,
+Session picker, installed screenshots, and the real-emulator matrix remain
+incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.
@@ -491,16 +492,21 @@ rather than becoming composer input. Plain mode uses an explicit
 
 ## Work receipt, context, and sessions
 
-At turn end, the projector may append one compact receipt derived only from
-committed facts:
+At turn end, the enhanced renderer appends one compact receipt from projector
+facts only after the committed `turn/end` and returned `TurnOutcome` agree on
+turn, sequence, and reason. The current Focus slice renders exact
+step/tool-request/retry/output-token counters, strict patch effects, strict
+foreground-Shell starts, and issue counts:
 
 ```text
-✓ Completed in 18.4s · 2 files changed · 3 commands executed
-  Review changes · continue at the composer
+Turn complete
+  5 steps | 4 tool requests | 1 retry | 842 reported output tokens
+  2 files changed (+12 -3) | 1 command run | 1 issue
 ```
 
 It cannot claim test counts or pass status unless a structured, trusted source
-provides them. Review expands changed files, canonical diffs, commands, errors,
+provides them. The current slice also does not claim an execution duration.
+Review will later expand changed files, canonical diffs, commands, errors,
 denials, cancellations, and unknown outcomes.
 
 The header displays the configured model, workspace basename, approval mode,
@@ -570,6 +576,10 @@ text never controls it and the default is off.
 | in-memory prompt history | 128 entries and 1 MiB |
 | bracketed paste | 64 KiB UTF-8 |
 | CSI sequence | 32 bytes |
+| projected tool activities / approval links | 256 each |
+| projected tool summary / Dock activity source | 4 KiB UTF-8 each |
+| final tool-card headline / detail | 256 UTF-8 bytes each |
+| receipt headline / counters / effects | 4 KiB UTF-8 each |
 | sanitized owned text / presented text | 1 MiB |
 | presented items | 128 Ki items |
 | screen transaction | 2 MiB |
@@ -585,8 +595,12 @@ text never controls it and the default is off.
 | terminal write batch | existing 8 KiB chunks and 5-second deadline |
 | poisoned visual reset | 250 ms |
 
-Every count and byte limit receives exact and one-over tests. Existing Session,
-Provider, tool, approval-preview, and terminal-output limits remain in force.
+These UI text limits apply to source bytes before visible-control sanitizer
+expansion. Implemented input, queue, decoder, and screen limits have exact and
+one-over tests. The new card, receipt, and Dock text limits are bounded, while
+their complete exact/one-over evidence remains a release-checkpoint gate.
+Existing Session, Provider, tool, approval-preview, and terminal-output limits
+remain in force.
 
 ## Failure and cancellation matrix
 
@@ -642,16 +656,18 @@ Provider, tool, approval-preview, and terminal-output limits remain in force.
 1. **Design checkpoint (green)**: this document, roadmap/compatibility/upstream
    status, state tables, wireframes, and the frozen red-test inventory.
 2. **Semantic foundation (green)**: bounded committed UI facts, reducer,
-   correlation, truth-safe metadata, and fail-open shadow observation. The
-   receipt and final tool-card renderer remain Product work.
+   correlation, truth-safe metadata, and fail-open shadow observation.
 3. **Composer + inline Dock (green)**: owned long-lived cbreak, decoder,
    Unicode editing, current-process history, paste fences, FIFO, full-screen
    scroll ledger, compact layouts, enhanced approval, exact restoration, and
    PTY failures. This is the first production enhanced path.
-4. **Product checkpoint**: semantic tool cards/receipt, Markdown/diff,
-   Focus/Inspect/Review,
+4. **Truthful timeline slice (green)**: at most one final card per projected
+   lifecycle, emitted by the first non-replacement result or a turn-end unknown
+   fallback; strict patch/Shell/plugin facts; and an exact Session/TurnOutcome
+   receipt join.
+5. **Remaining product checkpoint**: Markdown/diff, Focus/Inspect/Review,
    commands/suggestions, themes, context/compaction, and session picker.
-5. **Release checkpoint**: remove the replaced log renderer, installed-binary
+6. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status
    commit.
