@@ -8,10 +8,11 @@ use crate::session::{
     UiTurnEndCancelCause, UiTurnEndReason,
 };
 use crate::tui::{
+    markup::{MAX_MARKUP_FRAME_TEXT_BYTES, MarkupState},
     presentation::{PresentationError, PresentedChunk, PresentedChunkBuilder, TextStyle},
     projector::UiProjector,
     timeline::{TimelineTone, ToolCardView, WorkReceiptView},
-    visible::render_visible_owned,
+    visible::{render_visible_owned, render_visible_owned_bounded},
 };
 
 use crate::agent::TurnOutcome;
@@ -126,13 +127,61 @@ impl fmt::Debug for LiveFrame {
     }
 }
 
-#[derive(Debug)]
 enum LivePart {
     TrustedLine(&'static str),
     TrustedOwned(String),
     TrustedInline(&'static str),
+    AssistantMarkup { key: MarkupStreamKey, text: String },
+    AssistantMarkupFinish { key: Option<MarkupStreamKey> },
+    AssistantMarkupAbort,
     Untrusted { role: UiRole, text: String },
     UntrustedStyled { style: TextStyle, text: String },
+}
+
+impl fmt::Debug for LivePart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrustedLine(text) => formatter
+                .debug_struct("TrustedLine")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::TrustedOwned(text) => formatter
+                .debug_struct("TrustedOwned")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::TrustedInline(text) => formatter
+                .debug_struct("TrustedInline")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::AssistantMarkup { key, text } => formatter
+                .debug_struct("AssistantMarkup")
+                .field("key", key)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::AssistantMarkupFinish { key } => formatter
+                .debug_struct("AssistantMarkupFinish")
+                .field("key", key)
+                .finish(),
+            Self::AssistantMarkupAbort => formatter.write_str("AssistantMarkupAbort"),
+            Self::Untrusted { role, text } => formatter
+                .debug_struct("Untrusted")
+                .field("role", role)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::UntrustedStyled { style, text } => formatter
+                .debug_struct("UntrustedStyled")
+                .field("style", style)
+                .field("bytes", &text.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MarkupStreamKey {
+    turn: crate::session::TurnId,
+    step: crate::session::StepId,
+    block: u64,
 }
 
 impl LiveFrame {
@@ -174,6 +223,12 @@ impl LiveFrame {
 
     pub(super) fn notice(value: &'static str) -> Result<Self, LiveRenderError> {
         Self::trusted(value)
+    }
+
+    fn markup_abort() -> Result<Self, LiveRenderError> {
+        let mut parts = try_parts(1)?;
+        parts.push(LivePart::AssistantMarkupAbort);
+        Ok(Self { parts })
     }
 
     pub(super) fn human_message(text: String) -> Result<Self, LiveRenderError> {
@@ -299,6 +354,34 @@ impl PendingLiveFrame {
                     self.part_index += 1;
                     self.text_offset = 0;
                 }
+                LivePart::AssistantMarkup { text, .. } => {
+                    let start = self.text_offset;
+                    let mut end = start
+                        .saturating_add(FRAME_SOURCE_CHUNK_BYTES)
+                        .min(text.len());
+                    while end > start && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if end == start && start != text.len() {
+                        return Err(LiveRenderError);
+                    }
+                    presenter.render_untrusted(UiRole::Assistant, &text[start..end], |chunk| {
+                        append_output(&mut self.output, chunk)
+                    })?;
+                    self.text_offset = end;
+                    if end == text.len() {
+                        self.part_index += 1;
+                        self.text_offset = 0;
+                    }
+                }
+                LivePart::AssistantMarkupFinish { .. } => {
+                    self.part_index += 1;
+                    self.text_offset = 0;
+                }
+                LivePart::AssistantMarkupAbort => {
+                    self.part_index += 1;
+                    self.text_offset = 0;
+                }
                 LivePart::Untrusted { role, text } => {
                     let start = self.text_offset;
                     let mut end = start
@@ -370,11 +453,13 @@ pub(super) struct InteractivePresenter {
 pub(super) struct EnhancedPresenter {
     at_line_start: bool,
     active_role: Option<UiRole>,
+    markup_key: Option<MarkupStreamKey>,
+    markup: MarkupState,
 }
 
 pub(super) struct PreparedPresentation {
     chunk: PresentedChunk,
-    next: EnhancedPresenter,
+    next: Box<EnhancedPresenter>,
 }
 
 impl fmt::Debug for PreparedPresentation {
@@ -401,6 +486,8 @@ impl EnhancedPresenter {
         Self {
             at_line_start: true,
             active_role: None,
+            markup_key: None,
+            markup: MarkupState::default(),
         }
     }
 
@@ -410,11 +497,14 @@ impl EnhancedPresenter {
     ) -> Result<PreparedPresentation, LiveRenderError> {
         let mut next = self.clone();
         let chunk = next.present_mut(frame)?;
-        Ok(PreparedPresentation { chunk, next })
+        Ok(PreparedPresentation {
+            chunk,
+            next: Box::new(next),
+        })
     }
 
     pub(super) fn commit(&mut self, prepared: PreparedPresentation) {
-        *self = prepared.next;
+        *self = *prepared.next;
     }
 
     pub(super) fn force_line_boundary(&mut self) {
@@ -426,19 +516,31 @@ impl EnhancedPresenter {
         let mut builder = PresentedChunk::builder();
         for part in frame.parts {
             match part {
+                LivePart::AssistantMarkup { key, text } => {
+                    self.push_assistant_markup(&mut builder, key, &text)?;
+                }
+                LivePart::AssistantMarkupFinish { key } => {
+                    self.finish_markup_key_authoritatively(&mut builder, key)?;
+                }
+                LivePart::AssistantMarkupAbort => {
+                    self.abort_active_markup(&mut builder)?;
+                }
                 LivePart::TrustedLine(text) => {
+                    self.abort_active_markup(&mut builder)?;
                     self.ensure_line_start(&mut builder)?;
                     let (style, text) = enhanced_trusted_line(text);
                     self.push_text_with_lines(&mut builder, style, text)?;
                     self.active_role = None;
                 }
                 LivePart::TrustedOwned(text) => {
+                    self.abort_active_markup(&mut builder)?;
                     self.ensure_line_start(&mut builder)?;
                     let text = strip_product_terminal_controls(&text)?;
                     self.push_text_with_lines(&mut builder, TextStyle::Warning, &text)?;
                     self.active_role = None;
                 }
                 LivePart::TrustedInline(text) => {
+                    self.abort_active_markup(&mut builder)?;
                     if !self.at_line_start {
                         self.push_text_with_lines(&mut builder, TextStyle::Plain, text)?;
                     }
@@ -447,10 +549,12 @@ impl EnhancedPresenter {
                     }
                 }
                 LivePart::Untrusted { role, text } => {
+                    self.abort_active_markup(&mut builder)?;
                     let text = render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
                     self.push_role_fragment(&mut builder, role, &text)?;
                 }
                 LivePart::UntrustedStyled { style, text } => {
+                    self.abort_active_markup(&mut builder)?;
                     self.ensure_line_start(&mut builder)?;
                     let text = render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
                     self.push_text_with_lines(&mut builder, style, &text)?;
@@ -459,6 +563,94 @@ impl EnhancedPresenter {
             }
         }
         Ok(builder.finish())
+    }
+
+    fn push_assistant_markup(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+        key: MarkupStreamKey,
+        text: &str,
+    ) -> Result<(), LiveRenderError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self.markup_key != Some(key) {
+            self.abort_active_markup(builder)?;
+            self.markup_key = Some(key);
+        }
+        if self.active_role != Some(UiRole::Assistant) {
+            self.ensure_line_start(builder)?;
+            builder
+                .push_text(TextStyle::Accent, "DSH")
+                .map_err(map_presentation_error)?;
+            builder.push_line_feed().map_err(map_presentation_error)?;
+            self.at_line_start = true;
+        }
+        match render_visible_owned_bounded(text, true, MAX_MARKUP_FRAME_TEXT_BYTES)
+            .map_err(|_| LiveRenderError)?
+        {
+            Some(text) => self
+                .markup
+                .push(&text, builder, &mut self.at_line_start)
+                .map_err(map_presentation_error)?,
+            None => self
+                .markup
+                .omit_remaining_display(builder, &mut self.at_line_start)
+                .map_err(map_presentation_error)?,
+        }
+        self.active_role = Some(UiRole::Assistant);
+        Ok(())
+    }
+
+    fn abort_active_markup(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+    ) -> Result<(), LiveRenderError> {
+        if self.markup_key.is_none() {
+            return Ok(());
+        }
+        self.ensure_pending_markup_header(builder)?;
+        self.markup
+            .abort_plain(builder, &mut self.at_line_start)
+            .map_err(map_presentation_error)?;
+        self.markup_key = None;
+        self.active_role = None;
+        Ok(())
+    }
+
+    fn finish_markup_key_authoritatively(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+        key: Option<MarkupStreamKey>,
+    ) -> Result<(), LiveRenderError> {
+        if self.markup_key.is_none() {
+            return Ok(());
+        }
+        if key.is_some() && key != self.markup_key {
+            return Ok(());
+        }
+        self.ensure_pending_markup_header(builder)?;
+        self.markup
+            .finish_authoritative(builder, &mut self.at_line_start)
+            .map_err(map_presentation_error)?;
+        self.markup_key = None;
+        self.active_role = None;
+        Ok(())
+    }
+
+    fn ensure_pending_markup_header(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+    ) -> Result<(), LiveRenderError> {
+        if self.active_role != Some(UiRole::Assistant) && self.markup.has_pending_source() {
+            self.ensure_line_start(builder)?;
+            builder
+                .push_text(TextStyle::Accent, "DSH")
+                .map_err(map_presentation_error)?;
+            builder.push_line_feed().map_err(map_presentation_error)?;
+            self.at_line_start = true;
+        }
+        Ok(())
     }
 
     fn ensure_line_start(
@@ -660,6 +852,11 @@ impl InteractivePresenter {
                 LivePart::TrustedLine(text) => self.render_trusted_line(text, &mut emit)?,
                 LivePart::TrustedOwned(text) => self.render_trusted_owned(text, &mut emit)?,
                 LivePart::TrustedInline(text) => self.render_trusted_inline(text, &mut emit)?,
+                LivePart::AssistantMarkup { text, .. } => {
+                    self.render_untrusted(UiRole::Assistant, text, &mut emit)?
+                }
+                LivePart::AssistantMarkupFinish { .. } => {}
+                LivePart::AssistantMarkupAbort => {}
                 LivePart::Untrusted { role, text } => {
                     self.render_untrusted(*role, text, &mut emit)?
                 }
@@ -860,7 +1057,7 @@ impl LiveRenderer {
             CommittedUiKind::TurnEnd { turn, reason } => {
                 self.attempt = None;
                 lifecycle = LiveLifecycle::TurnEnded { turn };
-                enhanced_frame = EnhancedFrame::Suppress;
+                enhanced_frame = EnhancedFrame::Replace(LiveFrame::markup_abort()?);
                 dock_notice = DockNoticeUpdate::Clear;
                 Some(turn_end_frame(reason)?)
             }
@@ -876,7 +1073,7 @@ impl LiveRenderer {
                 {
                     self.attempt = None;
                 }
-                None
+                Some(LiveFrame::markup_abort()?)
             }
             CommittedUiKind::UserMessage { source, content } => {
                 let _ = (source, content);
@@ -892,7 +1089,7 @@ impl LiveRenderer {
                 text,
             } => {
                 self.retain_delta(turn, step, index, UiAssistantBlockKind::Text, seq, &text)?;
-                LiveFrame::from_parts(single_untrusted(UiRole::Assistant, text)?)
+                LiveFrame::from_parts(single_assistant_markup(turn, step, index, text)?)
             }
             CommittedUiKind::AssistantReasoningDelta {
                 turn,
@@ -1230,30 +1427,45 @@ impl LiveRenderer {
         let state_degraded = attempt.as_ref().is_some_and(|attempt| attempt.degraded);
         match content {
             UiAssistantContent::Degraded { text } => {
-                let mut parts = try_parts(2)?;
+                let mut parts = try_parts(4)?;
+                parts.push(LivePart::AssistantMarkupAbort);
                 parts.push(LivePart::TrustedLine(
                     "[final answer restated; streaming comparison limit reached]\n",
                 ));
                 if !text.is_empty() {
-                    parts.push(LivePart::Untrusted {
-                        role: UiRole::Assistant,
+                    parts.push(LivePart::AssistantMarkup {
+                        key: MarkupStreamKey {
+                            turn,
+                            step,
+                            block: u64::MAX,
+                        },
                         text,
                     });
                 }
+                parts.push(LivePart::AssistantMarkupFinish {
+                    key: Some(MarkupStreamKey {
+                        turn,
+                        step,
+                        block: u64::MAX,
+                    }),
+                });
                 Ok(LiveFrame::from_parts(parts))
             }
             UiAssistantContent::Indexed(blocks) if state_degraded => {
-                let mut parts = try_parts(blocks.len().saturating_add(1))?;
+                let mut parts = try_parts(blocks.len().saturating_mul(2).saturating_add(2))?;
+                parts.push(LivePart::AssistantMarkupAbort);
                 parts.push(LivePart::TrustedLine(
                     "[final answer restated; streaming comparison limit reached]\n",
                 ));
                 for block in blocks {
-                    if !block.text.is_empty() {
-                        parts.push(LivePart::Untrusted {
-                            role: role_for(block.kind),
-                            text: block.text,
-                        });
-                    }
+                    push_authoritative_block(
+                        &mut parts,
+                        turn,
+                        step,
+                        block.index.into(),
+                        block.kind,
+                        block.text,
+                    )?;
                 }
                 Ok(LiveFrame::from_parts(parts))
             }
@@ -1274,16 +1486,19 @@ impl LiveRenderer {
                                 streamed.compare(&block.text, sources) == Comparison::Mismatch
                             })
                     });
-                let mut parts = try_parts(blocks.len().saturating_add(1))?;
+                let mut parts = try_parts(blocks.len().saturating_mul(2).saturating_add(2))?;
                 if has_mismatch {
+                    parts.push(LivePart::AssistantMarkupAbort);
                     parts.push(LivePart::TrustedLine("[final answer corrected]\n"));
                     for block in blocks {
-                        if !block.text.is_empty() {
-                            parts.push(LivePart::Untrusted {
-                                role: role_for(block.kind),
-                                text: block.text,
-                            });
-                        }
+                        push_authoritative_block(
+                            &mut parts,
+                            turn,
+                            step,
+                            block.index.into(),
+                            block.kind,
+                            block.text,
+                        )?;
                     }
                     return Ok(LiveFrame::from_parts(parts));
                 }
@@ -1295,13 +1510,35 @@ impl LiveRenderer {
                             streamed.compare(&block.text, sources)
                         });
                     match comparison {
-                        Comparison::Exact => {}
+                        Comparison::Exact => {
+                            if block.kind == UiAssistantBlockKind::Text {
+                                parts.push(LivePart::AssistantMarkupFinish {
+                                    key: Some(MarkupStreamKey {
+                                        turn,
+                                        step,
+                                        block: block.index.into(),
+                                    }),
+                                });
+                            }
+                        }
                         Comparison::Prefix(bytes) => {
                             if bytes < block.text.len() {
                                 block.text.drain(..bytes);
-                                parts.push(LivePart::Untrusted {
-                                    role: role_for(block.kind),
-                                    text: block.text,
+                                push_authoritative_block(
+                                    &mut parts,
+                                    turn,
+                                    step,
+                                    block.index.into(),
+                                    block.kind,
+                                    block.text,
+                                )?;
+                            } else if block.kind == UiAssistantBlockKind::Text {
+                                parts.push(LivePart::AssistantMarkupFinish {
+                                    key: Some(MarkupStreamKey {
+                                        turn,
+                                        step,
+                                        block: block.index.into(),
+                                    }),
                                 });
                             }
                         }
@@ -1318,9 +1555,55 @@ impl LiveRenderer {
     }
 }
 
+fn push_authoritative_block(
+    parts: &mut Vec<LivePart>,
+    turn: crate::session::TurnId,
+    step: crate::session::StepId,
+    block: u64,
+    kind: UiAssistantBlockKind,
+    text: String,
+) -> Result<(), LiveRenderError> {
+    match kind {
+        UiAssistantBlockKind::Text => {
+            if !text.is_empty() {
+                parts.push(LivePart::AssistantMarkup {
+                    key: MarkupStreamKey { turn, step, block },
+                    text,
+                });
+            }
+            parts.push(LivePart::AssistantMarkupFinish {
+                key: Some(MarkupStreamKey { turn, step, block }),
+            });
+        }
+        UiAssistantBlockKind::Reasoning => {
+            if !text.is_empty() {
+                parts.push(LivePart::Untrusted {
+                    role: UiRole::Reasoning,
+                    text,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn single_untrusted(role: UiRole, text: String) -> Result<Vec<LivePart>, LiveRenderError> {
     let mut parts = try_parts(1)?;
     parts.push(LivePart::Untrusted { role, text });
+    Ok(parts)
+}
+
+fn single_assistant_markup(
+    turn: crate::session::TurnId,
+    step: crate::session::StepId,
+    block: u64,
+    text: String,
+) -> Result<Vec<LivePart>, LiveRenderError> {
+    let mut parts = try_parts(1)?;
+    parts.push(LivePart::AssistantMarkup {
+        key: MarkupStreamKey { turn, step, block },
+        text,
+    });
     Ok(parts)
 }
 
@@ -1344,13 +1627,6 @@ fn try_parts(capacity: usize) -> Result<Vec<LivePart>, LiveRenderError> {
         .try_reserve_exact(capacity)
         .map_err(|_| LiveRenderError)?;
     Ok(parts)
-}
-
-fn role_for(kind: UiAssistantBlockKind) -> UiRole {
-    match kind {
-        UiAssistantBlockKind::Text => UiRole::Assistant,
-        UiAssistantBlockKind::Reasoning => UiRole::Reasoning,
-    }
 }
 
 impl TurnEndAnchor {
@@ -1733,13 +2009,15 @@ enum Comparison {
 mod tests {
     use crate::model::LlmFailure;
     use crate::session::{
-        CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap, StepId, TurnEndReason,
-        TurnId, UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent, UiIdentity,
-        UiOpaquePayload, UiToolFailure, UiTurnEndReason, UnixMillis,
+        CommittedUiEvent, CommittedUiKind, EventSeq, RetryNumber, SourceSeqBitmap, StepId,
+        TurnEndReason, TurnId, UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent,
+        UiIdentity, UiOpaquePayload, UiToolFailure, UiTurnEndReason, UnixMillis,
     };
-    use crate::tui::{presentation::PresentedItem, projector::UiProjector};
+    use crate::tui::{
+        presentation::{PresentedItem, TextStyle},
+        projector::UiProjector,
+    };
 
-    use super::super::theme::UiRole;
     use super::{
         AttemptState, EnhancedPresenter, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame,
         LivePart, LiveRenderer, MAX_ATTEMPT_BLOCKS, MAX_ATTEMPT_TEXT_BYTES, TurnEndAnchor,
@@ -1768,24 +2046,51 @@ mod tests {
         text
     }
 
+    fn presented_text_with_style(
+        presentation: &super::PreparedPresentation,
+        expected: TextStyle,
+    ) -> String {
+        let mut text = String::new();
+        for item in presentation.chunk().items() {
+            if let PresentedItem::Text { style, text: value } = item {
+                if *style == expected {
+                    text.push_str(value);
+                }
+            }
+        }
+        text
+    }
+
     #[test]
     fn enhanced_presentation_state_changes_only_after_commit() {
         let mut presenter = EnhancedPresenter::new();
+        let key = super::MarkupStreamKey {
+            turn: TurnId::new(1).unwrap(),
+            step: StepId::new(1).unwrap(),
+            block: 0,
+        };
         let frame = || LiveFrame {
-            parts: vec![LivePart::Untrusted {
-                role: UiRole::Assistant,
-                text: "partial".to_owned(),
+            parts: vec![LivePart::AssistantMarkup {
+                key,
+                text: "before `secret".to_owned(),
             }],
         };
         let abandoned = presenter.prepare(frame()).unwrap();
-        assert_eq!(presented_text(&abandoned), "DSH  partial");
+        assert_eq!(presented_text(&abandoned), "DSH\nbefore ");
 
         let retry = presenter.prepare(frame()).unwrap();
-        assert_eq!(presented_text(&retry), "DSH  partial");
+        assert_eq!(presented_text(&retry), "DSH\nbefore ");
         presenter.commit(retry);
 
-        let continuation = presenter.prepare(frame()).unwrap();
-        assert_eq!(presented_text(&continuation), "partial");
+        let continuation = presenter
+            .prepare(LiveFrame {
+                parts: vec![LivePart::AssistantMarkup {
+                    key,
+                    text: " value`".to_owned(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(presented_text(&continuation), "`secret value`");
     }
 
     fn enhanced_text(frame: LiveFrame) -> String {
@@ -1796,16 +2101,334 @@ mod tests {
 
     #[test]
     fn enhanced_multiline_text_keeps_structural_line_feeds() {
+        let key = super::MarkupStreamKey {
+            turn: TurnId::new(1).unwrap(),
+            step: StepId::new(1).unwrap(),
+            block: 0,
+        };
         let frame = LiveFrame {
-            parts: vec![LivePart::Untrusted {
-                role: UiRole::Assistant,
-                text: "first\nsecond\u{1b}".to_owned(),
-            }],
+            parts: vec![
+                LivePart::AssistantMarkup {
+                    key,
+                    text: "first\nsecond\u{1b}\u{202e}\u{fff0}\u{e0000}".to_owned(),
+                },
+                LivePart::AssistantMarkupFinish { key: Some(key) },
+            ],
         };
         let output = enhanced_text(frame);
-        assert!(output.contains("first\nDSH  second"));
+        assert!(output.contains("DSH\nfirst\nsecond"));
         assert!(output.contains("\\u{1b}"));
+        assert!(output.contains("\\u{202e}"));
+        assert!(output.contains("\\u{fff0}"));
+        assert!(output.contains("\\u{e0000}"));
+        assert!(!output.contains('\u{202e}'));
         assert!(!output.contains("first\\nsecond"));
+    }
+
+    #[test]
+    fn exact_final_without_a_suffix_flushes_pending_markup() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let mut presenter = EnhancedPresenter::new();
+
+        let mut delta = renderer
+            .consume(event(
+                1,
+                CommittedUiKind::AssistantTextDelta {
+                    turn,
+                    step,
+                    index: 0,
+                    text: "`unfinished".to_owned(),
+                },
+            ))
+            .unwrap();
+        let prepared = presenter.prepare(delta.take_frame(true).unwrap()).unwrap();
+        assert_eq!(presented_text(&prepared), "DSH\n");
+        presenter.commit(prepared);
+
+        let mut final_message = renderer
+            .consume(event(
+                2,
+                CommittedUiKind::AssistantMessage {
+                    turn,
+                    step,
+                    content: UiAssistantContent::Indexed(vec![UiAssistantBlock {
+                        index: 0,
+                        kind: UiAssistantBlockKind::Text,
+                        text: "`unfinished".to_owned(),
+                    }]),
+                    sources: SourceSeqBitmap::from_sources(&[EventSeq::new(1).unwrap()]).unwrap(),
+                    provider: identity("mock"),
+                    model: identity("mock-model"),
+                    usage: None,
+                },
+            ))
+            .unwrap();
+        let prepared = presenter
+            .prepare(final_message.take_frame(true).unwrap())
+            .unwrap();
+        assert_eq!(presented_text(&prepared), "`unfinished");
+    }
+
+    #[test]
+    fn step_end_aborts_an_eof_closer_as_plain_and_resets_the_next_stream() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let mut presenter = EnhancedPresenter::new();
+        let mut delta = renderer
+            .consume(event(
+                1,
+                CommittedUiKind::AssistantTextDelta {
+                    turn,
+                    step,
+                    index: 0,
+                    text: "```rust\nprivate\n```".to_owned(),
+                },
+            ))
+            .unwrap();
+        let prepared = presenter.prepare(delta.take_frame(true).unwrap()).unwrap();
+        assert_eq!(presented_text(&prepared), "DSH\n");
+        presenter.commit(prepared);
+
+        let mut end = renderer
+            .consume(event(2, CommittedUiKind::StepEnd { turn, step }))
+            .unwrap();
+        let prepared = presenter.prepare(end.take_frame(true).unwrap()).unwrap();
+        assert_eq!(presented_text(&prepared), "```rust\nprivate\n```");
+        assert!(presented_text_with_style(&prepared, TextStyle::Code).is_empty());
+        presenter.commit(prepared);
+
+        let next_step = StepId::new(2).unwrap();
+        let _ = renderer
+            .consume(event(
+                3,
+                CommittedUiKind::StepStart {
+                    turn,
+                    step: next_step,
+                },
+            ))
+            .unwrap();
+        let mut next = renderer
+            .consume(event(
+                4,
+                CommittedUiKind::AssistantTextDelta {
+                    turn,
+                    step: next_step,
+                    index: 0,
+                    text: "after".to_owned(),
+                },
+            ))
+            .unwrap();
+        let prepared = presenter.prepare(next.take_frame(true).unwrap()).unwrap();
+        assert_eq!(presented_text(&prepared), "\nDSH\nafter");
+    }
+
+    #[test]
+    fn corrected_final_aborts_old_fence_and_styles_only_the_authoritative_answer() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let mut presenter = EnhancedPresenter::new();
+
+        let mut delta = renderer
+            .consume(event(
+                1,
+                CommittedUiKind::AssistantTextDelta {
+                    turn,
+                    step,
+                    index: 0,
+                    text: "```rust\nold-body\n```".to_owned(),
+                },
+            ))
+            .unwrap();
+        let prepared = presenter.prepare(delta.take_frame(true).unwrap()).unwrap();
+        assert_eq!(presented_text(&prepared), "DSH\n");
+        presenter.commit(prepared);
+
+        let mut final_message = renderer
+            .consume(event(
+                2,
+                CommittedUiKind::AssistantMessage {
+                    turn,
+                    step,
+                    content: UiAssistantContent::Indexed(vec![UiAssistantBlock {
+                        index: 0,
+                        kind: UiAssistantBlockKind::Text,
+                        text: "```rust\nnew-body\n```\n".to_owned(),
+                    }]),
+                    sources: SourceSeqBitmap::from_sources(&[EventSeq::new(1).unwrap()]).unwrap(),
+                    provider: identity("mock"),
+                    model: identity("mock-model"),
+                    usage: None,
+                },
+            ))
+            .unwrap();
+        let prepared = presenter
+            .prepare(final_message.take_frame(true).unwrap())
+            .unwrap();
+        let text = presented_text(&prepared);
+        assert_eq!(text.matches("old-body").count(), 1);
+        assert_eq!(text.matches("new-body").count(), 1);
+        let code = presented_text_with_style(&prepared, TextStyle::Code);
+        assert!(!code.contains("old-body"));
+        assert!(code.contains("new-body"));
+    }
+
+    #[test]
+    fn retry_aborts_partial_markup_as_plain_and_does_not_leak_style_state() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let mut presenter = EnhancedPresenter::new();
+
+        let mut delta = renderer
+            .consume(event(
+                1,
+                CommittedUiKind::AssistantTextDelta {
+                    turn,
+                    step,
+                    index: 0,
+                    text: "```rust\nretry-partial\n```".to_owned(),
+                },
+            ))
+            .unwrap();
+        let prepared = presenter.prepare(delta.take_frame(true).unwrap()).unwrap();
+        presenter.commit(prepared);
+
+        let mut retry = renderer
+            .consume(event(
+                2,
+                CommittedUiKind::RetryScheduled {
+                    retry_id: identity("retry-1"),
+                    retry: RetryNumber::new(1).unwrap(),
+                    provider: identity("mock"),
+                    delay_ms: 10.0,
+                    max_retries: Some(RetryNumber::new(2).unwrap()),
+                    failure_code: "RETRY".to_owned(),
+                    failure_message: "temporary".to_owned(),
+                },
+            ))
+            .unwrap();
+        let prepared = presenter.prepare(retry.take_frame(true).unwrap()).unwrap();
+        assert!(presented_text(&prepared).contains("retry-partial"));
+        assert!(presented_text_with_style(&prepared, TextStyle::Code).is_empty());
+        presenter.commit(prepared);
+
+        let next_key = super::MarkupStreamKey {
+            turn,
+            step,
+            block: 1,
+        };
+        let prepared = presenter
+            .prepare(LiveFrame {
+                parts: vec![
+                    LivePart::AssistantMarkup {
+                        key: next_key,
+                        text: "after retry".to_owned(),
+                    },
+                    LivePart::AssistantMarkupFinish {
+                        key: Some(next_key),
+                    },
+                ],
+            })
+            .unwrap();
+        assert!(presented_text(&prepared).ends_with("DSH\nafter retry"));
+    }
+
+    #[test]
+    fn hostile_assistant_display_expansion_is_omitted_once_and_the_next_stream_recovers() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let first = super::MarkupStreamKey {
+            turn,
+            step,
+            block: 0,
+        };
+        let next = super::MarkupStreamKey {
+            turn,
+            step,
+            block: 1,
+        };
+        let mut presenter = EnhancedPresenter::new();
+
+        for hostile in ["x\n".repeat(50_000), "\u{202e}".repeat(100_000)] {
+            let prepared = presenter
+                .prepare(LiveFrame {
+                    parts: vec![
+                        LivePart::AssistantMarkup {
+                            key: first,
+                            text: hostile,
+                        },
+                        LivePart::AssistantMarkupFinish { key: Some(first) },
+                    ],
+                })
+                .unwrap();
+            let text = presented_text(&prepared);
+            assert_eq!(
+                text.matches("[assistant display omitted: presentation limit exceeded]")
+                    .count(),
+                1
+            );
+            assert!(!text.contains('\u{202e}'));
+            presenter.commit(prepared);
+
+            let prepared = presenter
+                .prepare(LiveFrame {
+                    parts: vec![
+                        LivePart::AssistantMarkup {
+                            key: next,
+                            text: "after".to_owned(),
+                        },
+                        LivePart::AssistantMarkupFinish { key: Some(next) },
+                    ],
+                })
+                .unwrap();
+            assert!(presented_text(&prepared).ends_with("DSH\nafter"));
+            presenter.commit(prepared);
+        }
+    }
+
+    #[test]
+    fn a_finish_for_an_old_block_cannot_flush_the_active_block() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let old = super::MarkupStreamKey {
+            turn,
+            step,
+            block: 0,
+        };
+        let active = super::MarkupStreamKey {
+            turn,
+            step,
+            block: 1,
+        };
+        let mut presenter = EnhancedPresenter::new();
+        let prepared = presenter
+            .prepare(LiveFrame {
+                parts: vec![LivePart::AssistantMarkup {
+                    key: active,
+                    text: "`private".to_owned(),
+                }],
+            })
+            .unwrap();
+        presenter.commit(prepared);
+
+        let stale = presenter
+            .prepare(LiveFrame {
+                parts: vec![LivePart::AssistantMarkupFinish { key: Some(old) }],
+            })
+            .unwrap();
+        assert!(presented_text(&stale).is_empty());
+        presenter.commit(stale);
+
+        let current = presenter
+            .prepare(LiveFrame {
+                parts: vec![LivePart::AssistantMarkupFinish { key: Some(active) }],
+            })
+            .unwrap();
+        assert_eq!(presented_text(&current), "`private");
     }
 
     #[test]
@@ -1965,7 +2588,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        assert!(end.take_frame(true).is_none());
+        assert!(enhanced_text(end.take_frame(true).unwrap()).is_empty());
     }
 
     #[test]

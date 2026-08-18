@@ -634,6 +634,13 @@ fn push_style(output: &mut String, style: TextStyle, styled: bool) {
         TextStyle::Accent => "\x1b[1;36m",
         TextStyle::User => "\x1b[1;35m",
         TextStyle::Assistant => "\x1b[36m",
+        TextStyle::Heading => "\x1b[1;36m",
+        TextStyle::Code => "\x1b[1m",
+        TextStyle::Quote => "\x1b[2;36m",
+        TextStyle::DiffHeader => "\x1b[1;36m",
+        TextStyle::DiffHunk => "\x1b[36m",
+        TextStyle::DiffAdd => "\x1b[32m",
+        TextStyle::DiffRemove => "\x1b[31m",
         TextStyle::Warning => "\x1b[1;33m",
         TextStyle::Error => "\x1b[1;31m",
         TextStyle::Success => "\x1b[32m",
@@ -679,6 +686,7 @@ mod tests {
         composer::Composer,
         dock::{DockFrame, DockInteraction, DockModel},
         input_memory::PromptQueue,
+        markup::MarkupState,
         presentation::{PresentedChunk, TextStyle},
         terminal_model::{HistoryPolicy, MiniTerminal},
     };
@@ -725,6 +733,17 @@ mod tests {
         if line_feed {
             builder.push_line_feed().unwrap();
         }
+        builder.finish()
+    }
+
+    fn markup_chunk(text: &str) -> PresentedChunk {
+        let mut state = MarkupState::default();
+        let mut builder = PresentedChunk::builder();
+        let mut at_line_start = true;
+        state.push(text, &mut builder, &mut at_line_start).unwrap();
+        state
+            .finish_authoritative(&mut builder, &mut at_line_start)
+            .unwrap();
         builder.finish()
     }
 
@@ -887,6 +906,74 @@ mod tests {
             assert!(terminal.history().iter().all(|line| {
                 !line.contains("Working") && !line.contains("Enter queue") && !line.contains('❯')
             }));
+        }
+    }
+
+    #[test]
+    fn markdown_and_diff_remain_unique_at_44_80_and_112_columns() {
+        let source = concat!(
+            "# MARKUP-HEADING\n",
+            "- list with `INLINE-CODE`\n",
+            "```rust\n",
+            "fn CODE_SENTINEL() {}\n",
+            "```\n",
+            "```diff\n",
+            "--- a/note\n",
+            "+++ b/note\n",
+            "@@ -1 +1 @@\n",
+            "-REMOVE-SENTINEL\n",
+            "+ADD-SENTINEL\n",
+            "```\n",
+        );
+        for (rows, columns) in [(20_u16, 44_u16), (24, 80), (34, 112)] {
+            for policy in [
+                HistoryPolicy::FullScreenOnly,
+                HistoryPolicy::TopAnchoredRegion,
+            ] {
+                let mut terminal = MiniTerminal::blank(rows.into(), columns.into(), policy);
+                let mut screen = InlineScreen::default();
+                let composer = Composer::default();
+                let queue = PromptQueue::default();
+                let frame = dock_at(&composer, &queue, rows, columns);
+                let attach = screen
+                    .stage_attach(ScreenSize { rows, columns }, &frame, true)
+                    .unwrap();
+                apply(&mut screen, &mut terminal, attach);
+                let write = screen
+                    .stage_transcript(&markup_chunk(source), &frame, true)
+                    .unwrap();
+                apply(&mut screen, &mut terminal, write);
+
+                let mut drain = PresentedChunk::builder();
+                for _ in 0..rows {
+                    drain.push_line_feed().unwrap();
+                }
+                let write = screen
+                    .stage_transcript(&drain.finish(), &frame, true)
+                    .unwrap();
+                apply(&mut screen, &mut terminal, write);
+
+                let joined = terminal.all_lines().join("\n");
+                for sentinel in [
+                    "MARKUP-HEADING",
+                    "INLINE-CODE",
+                    "CODE_SENTINEL",
+                    "REMOVE-SENTINEL",
+                    "ADD-SENTINEL",
+                ] {
+                    assert_eq!(
+                        joined.matches(sentinel).count(),
+                        1,
+                        "{policy:?} {columns} columns duplicated {sentinel}"
+                    );
+                }
+                assert!(terminal.history().iter().all(|line| {
+                    !line.contains("Working")
+                        && !line.contains("Enter queue")
+                        && !line.contains('❯')
+                }));
+                assert!(!terminal.partial_margin_seen());
+            }
         }
     }
 

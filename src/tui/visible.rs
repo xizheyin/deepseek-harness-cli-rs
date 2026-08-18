@@ -79,8 +79,9 @@ pub(crate) fn must_escape(character: char) -> bool {
                 | 0x3164
                 | 0xFE00..=0xFE0F
                 | 0xFFA0
+                | 0xFFF0..=0xFFF8
                 | 0x13440..=0x13455
-                | 0xE0100..=0xE01EF
+                | 0xE0000..=0xE0FFF
         )
 }
 
@@ -96,9 +97,19 @@ pub(crate) fn render_visible_owned(
     input: &str,
     preserve_line_feed: bool,
 ) -> Result<String, VisibleTextError> {
+    render_visible_owned_bounded(input, preserve_line_feed, MAX_VISIBLE_OWNED_BYTES)?
+        .ok_or(VisibleTextError::Limit)
+}
+
+pub(crate) fn render_visible_owned_bounded(
+    input: &str,
+    preserve_line_feed: bool,
+    max_bytes: usize,
+) -> Result<Option<String>, VisibleTextError> {
+    let max_bytes = max_bytes.min(MAX_VISIBLE_OWNED_BYTES);
     let mut output = String::new();
     output
-        .try_reserve_exact(input.len())
+        .try_reserve_exact(input.len().min(max_bytes))
         .map_err(|_| VisibleTextError::Capacity)?;
     for character in input.chars() {
         let visible = VisibleChar::classify(character, !preserve_line_feed);
@@ -112,8 +123,8 @@ pub(crate) fn render_visible_owned(
             .len()
             .checked_add(needed)
             .ok_or(VisibleTextError::Limit)?;
-        if next > MAX_VISIBLE_OWNED_BYTES {
-            return Err(VisibleTextError::Limit);
+        if next > max_bytes {
+            return Ok(None);
         }
         output
             .try_reserve(needed)
@@ -130,7 +141,7 @@ pub(crate) fn render_visible_owned(
             VisibleChar::Printable(character) => output.push(character),
         }
     }
-    Ok(output)
+    Ok(Some(output))
 }
 
 fn hex_digits(mut value: u32) -> usize {
@@ -146,7 +157,7 @@ fn hex_digits(mut value: u32) -> usize {
 mod tests {
     use super::{
         MAX_VISIBLE_OWNED_BYTES, UNICODE_16_FORMAT_RANGES, VisibleChar, must_escape,
-        render_visible_owned,
+        render_visible_owned, render_visible_owned_bounded,
     };
 
     #[test]
@@ -183,6 +194,22 @@ mod tests {
     }
 
     #[test]
+    fn reserved_default_ignorables_are_visible_at_both_range_edges() {
+        for value in [0xFFF0, 0xFFF8, 0xE0000, 0xE0FFF] {
+            let character = char::from_u32(value).unwrap();
+            assert!(must_escape(character), "U+{value:04X} was not escaped");
+            assert_eq!(
+                render_visible_owned(&character.to_string(), true).unwrap(),
+                format!("\\u{{{value:x}}}")
+            );
+        }
+        for value in [0xFFEF, 0xFFFC, 0xDFFFF, 0xE1000] {
+            let character = char::from_u32(value).unwrap();
+            assert!(!must_escape(character), "U+{value:04X} widened the range");
+        }
+    }
+
+    #[test]
     fn owned_rendering_accepts_one_mib_and_rejects_one_byte_more() {
         let exact = "x".repeat(MAX_VISIBLE_OWNED_BYTES);
         assert_eq!(
@@ -191,5 +218,17 @@ mod tests {
         );
         let over = "x".repeat(MAX_VISIBLE_OWNED_BYTES + 1);
         assert!(render_visible_owned(&over, true).is_err());
+    }
+
+    #[test]
+    fn bounded_rendering_reports_expansion_without_allocating_over_the_limit() {
+        assert_eq!(
+            render_visible_owned_bounded("\u{202e}", true, "\\u{202e}".len()).unwrap(),
+            Some("\\u{202e}".to_owned())
+        );
+        assert_eq!(
+            render_visible_owned_bounded("\u{202e}", true, "\\u{202e}".len() - 1).unwrap(),
+            None
+        );
     }
 }

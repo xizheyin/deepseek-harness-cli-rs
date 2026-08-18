@@ -14,6 +14,13 @@ pub(crate) enum TextStyle {
     Accent,
     User,
     Assistant,
+    Heading,
+    Code,
+    Quote,
+    DiffHeader,
+    DiffHunk,
+    DiffAdd,
+    DiffRemove,
     Warning,
     Error,
     Success,
@@ -85,6 +92,14 @@ pub(crate) struct PresentedChunkBuilder {
 }
 
 impl PresentedChunkBuilder {
+    pub(crate) fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn text_bytes(&self) -> usize {
+        self.text_bytes
+    }
+
     pub(crate) fn push_text(
         &mut self,
         style: TextStyle,

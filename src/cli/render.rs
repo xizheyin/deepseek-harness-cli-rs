@@ -228,10 +228,10 @@ mod tests {
 
     #[test]
     fn table_boundaries_escape_only_the_tabled_code_points() {
-        let input = "\u{05ff}\u{0600}\u{0605}\u{0606}\u{180d}\u{180e}\u{180f}\u{1810}\u{fe0f}\u{fe10}\u{e007f}\u{e0080}";
+        let input = "\u{05ff}\u{0600}\u{0605}\u{0606}\u{180d}\u{180e}\u{180f}\u{1810}\u{fe0f}\u{fe10}\u{e007f}\u{e0080}\u{e0fff}\u{e1000}";
         assert_eq!(
             render_for_test(input, None),
-            "\u{05ff}\\u{600}\\u{605}\u{0606}\\u{180d}\\u{180e}\\u{180f}\u{1810}\\u{fe0f}\u{fe10}\\u{e007f}\u{e0080}"
+            "\u{05ff}\\u{600}\\u{605}\u{0606}\\u{180d}\\u{180e}\\u{180f}\u{1810}\\u{fe0f}\u{fe10}\\u{e007f}\\u{e0080}\\u{e0fff}\u{e1000}"
         );
     }
 }

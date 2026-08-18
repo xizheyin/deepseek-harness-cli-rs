@@ -43,6 +43,23 @@ fn text_sse(text: &str) -> String {
     )
 }
 
+fn fragmented_text_sse(fragments: &[&str]) -> String {
+    let mut body = String::new();
+    body.try_reserve(fragments.len().saturating_mul(96).saturating_add(128))
+        .expect("bounded fragmented response should allocate");
+    for fragment in fragments {
+        let fragment = serde_json::to_string(fragment).expect("test fragment should encode");
+        body.push_str("data: {\"choices\":[{\"delta\":{\"content\":");
+        body.push_str(&fragment);
+        body.push_str("}}]}\n\n");
+    }
+    body.push_str(concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    ));
+    body
+}
+
 fn request_json(request: &str) -> serde_json::Value {
     let (_, body) = request
         .split_once("\r\n\r\n")
@@ -285,7 +302,7 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
     dsh.expect(b"\x1b[1;36mdsh-rs\x1b[0m");
     dsh.expect("❯".as_bytes());
     dsh.write(b"show the styled interface\r");
-    dsh.expect(b"\x1b[36mDSH  styled answer");
+    dsh.expect(b"\x1b[1;36mDSH\x1b[0m\r\n\x1b[36mstyled answer");
     dsh.expect(b"\x1b[1;36mTurn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
@@ -297,6 +314,75 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
             .windows(b"assistant |".len())
             .any(|bytes| bytes == b"assistant |")
     );
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
+    let body = fragmented_text_sse(&[
+        "#",
+        " Heading\n``",
+        "`diff\n--- a/note\n",
+        "+++ b/note\n@@ -1 +1 @@\n",
+        "-old-sentinel\n",
+        "+新-sentinel\n``",
+        "`\nDone with `in",
+        "line`.\n```rust\nfn EOF_CODE() {}\n``",
+        "`",
+    ]);
+    let server = SequenceSseServer::start(vec![body]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"render markdown\r");
+    dsh.expect(b"\x1b[1;36mDSH\x1b[0m");
+    dsh.expect(b"\x1b[31m-old-sentinel");
+    dsh.expect("\x1b[32m+新-sentinel".as_bytes());
+    dsh.expect(b"\x1b[1m`inline`");
+    dsh.expect(b"\x1b[1mfn EOF_CODE() {}");
+    dsh.expect(b"Turn complete");
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    for sentinel in [
+        "-old-sentinel",
+        "+新-sentinel",
+        "`inline`",
+        "fn EOF_CODE() {}",
+    ] {
+        assert_eq!(
+            transcript
+                .windows(sentinel.len())
+                .filter(|window| *window == sentinel.as_bytes())
+                .count(),
+            1,
+            "{sentinel} should enter native scrollback once"
+        );
+    }
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn linear_tui_keeps_markdown_literal_and_emits_no_escape_bytes() {
+    let answer = "# Heading\n```diff\n-old-linear\n+new-linear\n```\n`inline`\n";
+    let server = SequenceSseServer::start(vec![text_sse(answer)]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"render plain markdown\r");
+    dsh.expect(b"# Heading");
+    dsh.expect(b"```diff");
+    dsh.expect(b"-old-linear");
+    dsh.expect(b"+new-linear");
+    dsh.expect(b"`inline`");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
     assert_eq!(server.finish().len(), 1);
 }
 
@@ -509,6 +595,44 @@ fn enhanced_ctrl_c_keeps_the_screen_ledger_usable_for_the_next_turn() {
     assert_eq!(
         last_user_content(&requests[1]),
         "continue after cancellation"
+    );
+}
+
+#[test]
+fn enhanced_ctrl_c_flushes_a_partial_fence_as_plain_before_the_next_turn() {
+    let fragment = serde_json::to_string("visible-before-cancel\n```rust\ncancelled-fence")
+        .expect("test fragment should encode");
+    let partial = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":{fragment}}}}}]}}\n\n");
+    let server = CancelThenSseServer::start(partial, text_sse("after cancelled fence"));
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"cancel an open fence\r");
+    dsh.expect(b"visible-before-cancel");
+    dsh.write(&[0x03]);
+    dsh.expect(b"cancelled-fence");
+    dsh.expect(b"stopped; skipped");
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"continue after the open fence\r");
+    dsh.expect(b"after cancelled fence");
+    dsh.expect(b"Turn complete");
+    let (status, transcript) = dsh.exit_cleanly();
+    let (requests, first_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(first_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        transcript
+            .windows(b"cancelled-fence".len())
+            .filter(|window| *window == b"cancelled-fence")
+            .count(),
+        1
+    );
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "continue after the open fence"
     );
 }
 

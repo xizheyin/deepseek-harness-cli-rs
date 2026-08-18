@@ -3306,14 +3306,19 @@ fn complete_ready_frame(
                 Some(PendingOutput::Inline(output)) => output,
                 _ => return Err(InteractiveError::Agent),
             };
-            active_dock
-                .ok_or(InteractiveError::Agent)?
-                .screen
+            let dock = active_dock.ok_or(InteractiveError::Agent)?;
+            let mut transcript_presenter = if matches!(output.intent, InlineIntent::Transcript(_)) {
+                Some(enhanced_presenter.take().ok_or(InteractiveError::Agent)?)
+            } else {
+                None
+            };
+            dock.screen
                 .commit(output.write)
                 .map_err(map_inline_screen_error)?;
             if let InlineIntent::Transcript(presentation) = output.intent {
-                enhanced_presenter
-                    .ok_or(InteractiveError::Agent)?
+                transcript_presenter
+                    .take()
+                    .expect("transcript presenter was proven before screen commit")
                     .commit(presentation);
             }
         }
