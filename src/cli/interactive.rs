@@ -2198,6 +2198,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         prompt_committed: active.prompt_committed,
                                         expected_prompt: &active.prompt,
                                         render_committed_prompt: active.enhanced,
+                                        dock_notice: active.queue_notice.as_deref_mut(),
+                                        dock_redraw_requested: active
+                                            .enhanced
+                                            .then_some(&mut dock_redraw_requested),
                                     },
                                 )
                             });
@@ -2636,6 +2640,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         prompt_committed: active.prompt_committed,
                                         expected_prompt: &active.prompt,
                                         render_committed_prompt: active.enhanced,
+                                        dock_notice: active.queue_notice.as_deref_mut(),
+                                        dock_redraw_requested: active
+                                            .enhanced
+                                            .then_some(&mut dock_redraw_requested),
                                     },
                                 )
                             });
@@ -2803,6 +2811,35 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
         observe_failure(&mut stop, error);
     }
 
+    if active.enhanced && stop.is_none() {
+        if let Ok(outcome) = &result {
+            match active.live.receipt_frame(outcome) {
+                Ok(frame) => match write_enhanced_terminal_frame(
+                    frame,
+                    active
+                        .queued_input
+                        .as_deref()
+                        .ok_or(InteractiveError::Agent)?,
+                    active.queue_notice.as_deref().and_then(Option::as_deref),
+                    active
+                        .enhanced_presenter
+                        .as_deref_mut()
+                        .ok_or(InteractiveError::Agent)?,
+                    active.terminal,
+                    active.signals,
+                    active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
+                )
+                .await
+                {
+                    Ok(None) => turn_end_rendered = true,
+                    Ok(Some(signal)) => observe_signal(&mut stop, signal),
+                    Err(error) => observe_failure(&mut stop, error),
+                },
+                Err(_) => observe_failure(&mut stop, InteractiveError::Output),
+            }
+        }
+    }
+
     let mut skipped = 0_usize;
     if stop.is_some() {
         skipped = discard_ready_updates_after_stop(
@@ -2913,7 +2950,7 @@ fn process_event(
     expected_turn: TurnId,
     live: &mut LiveRenderer,
     joins: &mut ApprovalJoin,
-    targets: EventTargets<'_, '_>,
+    mut targets: EventTargets<'_, '_>,
 ) -> Result<(), InteractiveError> {
     if event.seq.get() < expected_start.get() {
         return Err(InteractiveError::Agent);
@@ -2945,9 +2982,9 @@ fn process_event(
     {
         *targets.prompt_committed = true;
     }
-    let update = live.consume(event).map_err(|_| InteractiveError::Output)?;
+    let mut update = live.consume(event).map_err(|_| InteractiveError::Output)?;
     let mut frame_after = AfterFrame::None;
-    match update.lifecycle {
+    match std::mem::replace(&mut update.lifecycle, LiveLifecycle::None) {
         LiveLifecycle::None => {}
         LiveLifecycle::ApprovalAsked {
             id,
@@ -2968,7 +3005,17 @@ fn process_event(
             frame_after = AfterFrame::TurnEnd;
         }
     }
-    let frame = match (committed_prompt, update.frame) {
+    if targets.render_committed_prompt {
+        if let Some(notice) = targets.dock_notice.as_deref_mut() {
+            if update.apply_dock_notice(notice) {
+                if let Some(redraw) = targets.dock_redraw_requested.as_deref_mut() {
+                    *redraw = true;
+                }
+            }
+        }
+    }
+    let product_frame = update.take_frame(targets.render_committed_prompt);
+    let frame = match (committed_prompt, product_frame) {
         (Some(prompt), None) => {
             Some(LiveFrame::human_message(prompt).map_err(|_| InteractiveError::Output)?)
         }
@@ -2996,6 +3043,8 @@ struct EventTargets<'a, 'terminal> {
     prompt_committed: &'a mut bool,
     expected_prompt: &'a str,
     render_committed_prompt: bool,
+    dock_notice: Option<&'a mut Option<String>>,
+    dock_redraw_requested: Option<&'a mut bool>,
 }
 
 fn apply_approval_update(

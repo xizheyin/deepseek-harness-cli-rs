@@ -63,7 +63,7 @@ pub use store::{SessionStore, StoreError};
 pub(crate) use observer::{
     CommittedUiEvent, CommittedUiKind, CommittedUiReceiver, SourceSeqBitmap, UiAssistantBlockKind,
     UiAssistantContent, UiIdentity, UiObserverAttachError, UiOpaquePayload, UiTokenUsage,
-    UiTurnEndReason, UiUserSource,
+    UiTurnEndCancelCause, UiTurnEndReason, UiUserSource,
 };
 #[cfg(test)]
 pub(crate) use observer::{UiAssistantBlock, UiToolFailure};

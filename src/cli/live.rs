@@ -4,13 +4,17 @@ use thiserror::Error;
 
 use crate::session::{
     ApprovalOutcome, CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap,
-    UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiTurnEndReason,
+    TurnEndCancelCause, TurnEndReason, UiAssistantBlockKind, UiAssistantContent, UiIdentity,
+    UiTurnEndCancelCause, UiTurnEndReason,
 };
 use crate::tui::{
     presentation::{PresentationError, PresentedChunk, PresentedChunkBuilder, TextStyle},
     projector::UiProjector,
+    timeline::{TimelineTone, ToolCardView, WorkReceiptView},
     visible::render_visible_owned,
 };
+
+use crate::agent::TurnOutcome;
 
 use super::{
     render::VisibleRenderer,
@@ -21,6 +25,7 @@ const MAX_ATTEMPT_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ATTEMPT_BLOCKS: usize = 128;
 const FRAME_SOURCE_CHUNK_BYTES: usize = 512;
 pub(super) const FRAME_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_DOCK_NOTICE_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("CLI_OUTPUT_FAILED")]
@@ -48,6 +53,64 @@ pub(super) enum LiveLifecycle {
 pub(super) struct LiveUpdate {
     pub(super) frame: Option<LiveFrame>,
     pub(super) lifecycle: LiveLifecycle,
+    enhanced_frame: EnhancedFrame,
+    dock_notice: DockNoticeUpdate,
+}
+
+#[derive(Debug)]
+enum EnhancedFrame {
+    Same,
+    Suppress,
+    Replace(LiveFrame),
+}
+
+enum DockNoticeUpdate {
+    Keep,
+    Clear,
+    Set(String),
+}
+
+impl fmt::Debug for DockNoticeUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keep => formatter.write_str("Keep"),
+            Self::Clear => formatter.write_str("Clear"),
+            Self::Set(value) => formatter
+                .debug_struct("Set")
+                .field("bytes", &value.len())
+                .finish(),
+        }
+    }
+}
+
+impl LiveUpdate {
+    pub(super) fn take_frame(&mut self, enhanced: bool) -> Option<LiveFrame> {
+        let frame = self.frame.take();
+        if !enhanced {
+            return frame;
+        }
+        match std::mem::replace(&mut self.enhanced_frame, EnhancedFrame::Suppress) {
+            EnhancedFrame::Same => frame,
+            EnhancedFrame::Suppress => None,
+            EnhancedFrame::Replace(replacement) => Some(replacement),
+        }
+    }
+
+    pub(super) fn apply_dock_notice(&mut self, notice: &mut Option<String>) -> bool {
+        match std::mem::replace(&mut self.dock_notice, DockNoticeUpdate::Keep) {
+            DockNoticeUpdate::Keep => false,
+            DockNoticeUpdate::Clear => {
+                let changed = notice.is_some();
+                *notice = None;
+                changed
+            }
+            DockNoticeUpdate::Set(value) => {
+                let changed = notice.as_ref() != Some(&value);
+                *notice = Some(value);
+                changed
+            }
+        }
+    }
 }
 
 pub(super) struct LiveFrame {
@@ -69,6 +132,7 @@ enum LivePart {
     TrustedOwned(String),
     TrustedInline(&'static str),
     Untrusted { role: UiRole, text: String },
+    UntrustedStyled { style: TextStyle, text: String },
 }
 
 impl LiveFrame {
@@ -255,6 +319,26 @@ impl PendingLiveFrame {
                         self.text_offset = 0;
                     }
                 }
+                LivePart::UntrustedStyled { text, .. } => {
+                    let start = self.text_offset;
+                    let mut end = start
+                        .saturating_add(FRAME_SOURCE_CHUNK_BYTES)
+                        .min(text.len());
+                    while end > start && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if end == start && start != text.len() {
+                        return Err(LiveRenderError);
+                    }
+                    presenter.render_untrusted_styled(&text[start..end], |chunk| {
+                        append_output(&mut self.output, chunk)
+                    })?;
+                    self.text_offset = end;
+                    if end == text.len() {
+                        self.part_index += 1;
+                        self.text_offset = 0;
+                    }
+                }
             }
         }
         Ok(!self.output.is_empty())
@@ -363,8 +447,14 @@ impl EnhancedPresenter {
                     }
                 }
                 LivePart::Untrusted { role, text } => {
-                    let text = render_visible_owned(&text, false).map_err(|_| LiveRenderError)?;
+                    let text = render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
                     self.push_role_fragment(&mut builder, role, &text)?;
+                }
+                LivePart::UntrustedStyled { style, text } => {
+                    self.ensure_line_start(&mut builder)?;
+                    let text = render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
+                    self.push_text_with_lines(&mut builder, style, &text)?;
+                    self.active_role = None;
                 }
             }
         }
@@ -573,6 +663,9 @@ impl InteractivePresenter {
                 LivePart::Untrusted { role, text } => {
                     self.render_untrusted(*role, text, &mut emit)?
                 }
+                LivePart::UntrustedStyled { text, .. } => {
+                    self.render_untrusted_styled(text, &mut emit)?
+                }
             }
         }
         Ok(())
@@ -636,6 +729,17 @@ impl InteractivePresenter {
         Ok(())
     }
 
+    fn render_untrusted_styled<E>(
+        &mut self,
+        text: &str,
+        mut emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.visible.ensure_line_start(&mut emit)?;
+        self.visible.render_fragment(text, None, &mut emit)?;
+        self.active_role = None;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn finish_line<E>(
         &mut self,
@@ -659,6 +763,33 @@ impl InteractivePresenter {
 pub(super) struct LiveRenderer {
     attempt: Option<AttemptState>,
     semantic: UiProjector,
+    turn_end: Option<TurnEndAnchor>,
+}
+
+struct TurnEndAnchor {
+    turn: crate::session::TurnId,
+    seq: EventSeq,
+    reason: ReceiptReason,
+}
+
+enum ReceiptReason {
+    Completed,
+    Aborted(UiTurnEndCancelCause),
+    Blocked,
+    Error { code: String },
+    MaxTokens,
+    Interrupted,
+    Other,
+}
+
+impl fmt::Debug for TurnEndAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnEndAnchor")
+            .field("turn", &self.turn)
+            .field("seq", &self.seq)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LiveRenderer {
@@ -666,6 +797,7 @@ impl LiveRenderer {
         Self {
             attempt: None,
             semantic: UiProjector::default(),
+            turn_end: None,
         }
     }
 
@@ -673,11 +805,30 @@ impl LiveRenderer {
         &mut self,
         event: CommittedUiEvent,
     ) -> Result<LiveUpdate, LiveRenderError> {
+        let first_tool_result = match &event.kind {
+            CommittedUiKind::ToolResult {
+                turn,
+                step,
+                call_id,
+                surface_replacement_target: None,
+                ..
+            } => self
+                .semantic
+                .tools()
+                .iter()
+                .find(|tool| tool.turn == *turn && tool.step == *step && tool.call_id == *call_id)
+                .is_none_or(|tool| tool.is_error.is_none()),
+            _ => false,
+        };
+        let turn_end_anchor = TurnEndAnchor::from_event(&event)?;
         if self.semantic.observe(&event.kind).is_err() {
-            // Phase 11 semantic projection is shadowing the accepted Phase 9
-            // renderer until its own dock becomes authoritative. A display
-            // mismatch must not cancel otherwise valid Agent work.
-            self.semantic = UiProjector::default();
+            // A presentation allocation failure must not cancel valid Agent
+            // work or erase facts that were already projected. The product
+            // view keeps the safe subset and labels its details incomplete.
+            self.semantic.mark_degraded();
+        }
+        if let Some(anchor) = turn_end_anchor {
+            self.turn_end = Some(anchor);
         }
         let semantic_status = self.semantic.status();
         let _ = (
@@ -692,18 +843,25 @@ impl LiveRenderer {
             semantic_status.orphan_prune_markers,
             semantic_status.conflicting_facts,
             semantic_status.compaction_usage,
+            semantic_status.degraded,
         );
         let seq = event.seq;
         let _time = event.time;
         let mut lifecycle = LiveLifecycle::None;
+        let mut enhanced_frame = EnhancedFrame::Same;
+        let mut dock_notice = DockNoticeUpdate::Keep;
         let frame = match event.kind {
             CommittedUiKind::TurnStart { turn } => {
                 let _ = turn;
+                self.turn_end = None;
+                enhanced_frame = EnhancedFrame::Suppress;
                 Some(LiveFrame::trusted("[working; press Ctrl+C to stop]\n")?)
             }
             CommittedUiKind::TurnEnd { turn, reason } => {
                 self.attempt = None;
                 lifecycle = LiveLifecycle::TurnEnded { turn };
+                enhanced_frame = EnhancedFrame::Suppress;
+                dock_notice = DockNoticeUpdate::Clear;
                 Some(turn_end_frame(reason)?)
             }
             CommittedUiKind::StepStart { turn, step } => {
@@ -775,6 +933,7 @@ impl LiveRenderer {
                 name,
                 arguments,
             } => {
+                enhanced_frame = EnhancedFrame::Suppress;
                 let semantic = self.semantic.tools().iter().find(|activity| {
                     activity.turn == turn && activity.step == step && activity.call_id == call_id
                 });
@@ -795,6 +954,7 @@ impl LiveRenderer {
                         &semantic.shell_signal,
                         semantic.shell_timed_out,
                     );
+                    dock_notice = DockNoticeUpdate::Set(tool_activity_notice(semantic)?);
                 }
                 let _ = &arguments;
                 let mut parts = try_parts(5)?;
@@ -821,14 +981,53 @@ impl LiveRenderer {
                 meta,
                 surface_replacement_target,
             } => {
-                let _ = (turn, step, call_id, content, meta);
+                let _ = (turn, step, &content, &meta);
                 if surface_replacement_target.is_some() {
                     // A prune replacement rewrites old surface payload. It is
                     // not a second tool execution and must not appear twice.
                     return Ok(LiveUpdate {
                         frame: None,
                         lifecycle: LiveLifecycle::None,
+                        enhanced_frame: EnhancedFrame::Suppress,
+                        dock_notice: DockNoticeUpdate::Keep,
                     });
+                }
+                dock_notice = self
+                    .semantic
+                    .tools()
+                    .iter()
+                    .rev()
+                    .find(|tool| {
+                        tool.turn == turn
+                            && tool.is_error.is_none()
+                            && matches!(
+                                tool.state,
+                                crate::tui::projector::ToolActivityState::Preparing
+                                    | crate::tui::projector::ToolActivityState::AwaitingApproval
+                                    | crate::tui::projector::ToolActivityState::Allowed
+                            )
+                    })
+                    .map(tool_activity_notice)
+                    .transpose()?
+                    .map_or(DockNoticeUpdate::Clear, DockNoticeUpdate::Set);
+                if first_tool_result {
+                    let activity = self.semantic.tools().iter().find(|activity| {
+                        activity.turn == turn
+                            && activity.step == step
+                            && activity.call_id == call_id
+                    });
+                    enhanced_frame = EnhancedFrame::Replace(if let Some(activity) = activity {
+                        tool_card_frame(
+                            &ToolCardView::from_activity(activity).map_err(|_| LiveRenderError)?,
+                        )?
+                    } else {
+                        generic_tool_result_frame(
+                            is_error,
+                            failure.as_ref().map(|failure| failure.code.as_str()),
+                        )?
+                    });
+                } else {
+                    enhanced_frame = EnhancedFrame::Suppress;
                 }
                 let mut parts = try_parts(5)?;
                 parts.push(LivePart::TrustedLine(if is_error {
@@ -894,6 +1093,30 @@ impl LiveRenderer {
                     id: id.into_display(),
                     outcome,
                 };
+                enhanced_frame = EnhancedFrame::Suppress;
+                dock_notice = match outcome {
+                    ApprovalOutcome::AllowedOnce => self
+                        .semantic
+                        .tools()
+                        .iter()
+                        .rev()
+                        .find(|tool| {
+                            tool.state == crate::tui::projector::ToolActivityState::Allowed
+                                && tool.is_error.is_none()
+                        })
+                        .map(tool_approved_notice)
+                        .transpose()?
+                        .map_or(DockNoticeUpdate::Keep, DockNoticeUpdate::Set),
+                    ApprovalOutcome::Rejected => {
+                        DockNoticeUpdate::Set("Rejected; recording result".to_owned())
+                    }
+                    ApprovalOutcome::Cancelled => {
+                        DockNoticeUpdate::Set("Cancelled; recording result".to_owned())
+                    }
+                    ApprovalOutcome::Unavailable => {
+                        DockNoticeUpdate::Set("Approval unavailable".to_owned())
+                    }
+                };
                 Some(LiveFrame::trusted(match outcome {
                     ApprovalOutcome::AllowedOnce => "[approval: allowed once]\n",
                     ApprovalOutcome::Rejected => "[approval: rejected]\n",
@@ -931,7 +1154,44 @@ impl LiveRenderer {
                 None
             }
         };
-        Ok(LiveUpdate { frame, lifecycle })
+        Ok(LiveUpdate {
+            frame,
+            lifecycle,
+            enhanced_frame,
+            dock_notice,
+        })
+    }
+
+    pub(super) fn receipt_frame(
+        &self,
+        outcome: &TurnOutcome,
+    ) -> Result<LiveFrame, LiveRenderError> {
+        let anchor = self.turn_end.as_ref().ok_or(LiveRenderError)?;
+        if !anchor.matches(outcome.turn(), outcome.turn_end_seq(), outcome.reason()) {
+            return Err(LiveRenderError);
+        }
+        let mut parts = try_parts(self.semantic.tools().len().saturating_mul(5) + 7)?;
+        for tool in self.semantic.tools().iter().filter(|tool| {
+            tool.turn == outcome.turn()
+                && tool.is_error.is_none()
+                && matches!(
+                    tool.state,
+                    crate::tui::projector::ToolActivityState::Denied
+                        | crate::tui::projector::ToolActivityState::Cancelled
+                        | crate::tui::projector::ToolActivityState::Unavailable
+                        | crate::tui::projector::ToolActivityState::OutcomeUnknown
+                )
+        }) {
+            append_tool_card_parts(
+                &mut parts,
+                &ToolCardView::from_activity(tool).map_err(|_| LiveRenderError)?,
+            )?;
+        }
+        let receipt =
+            WorkReceiptView::from_outcome(outcome, self.semantic.tools(), self.semantic.status())
+                .map_err(|_| LiveRenderError)?;
+        append_receipt_parts(&mut parts, &receipt)?;
+        Ok(LiveFrame { parts })
     }
 
     fn retain_delta(
@@ -1091,6 +1351,214 @@ fn role_for(kind: UiAssistantBlockKind) -> UiRole {
         UiAssistantBlockKind::Text => UiRole::Assistant,
         UiAssistantBlockKind::Reasoning => UiRole::Reasoning,
     }
+}
+
+impl TurnEndAnchor {
+    fn from_event(event: &CommittedUiEvent) -> Result<Option<Self>, LiveRenderError> {
+        let CommittedUiKind::TurnEnd { turn, reason } = &event.kind else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            turn: *turn,
+            seq: event.seq,
+            reason: ReceiptReason::from_ui(reason)?,
+        }))
+    }
+
+    fn matches(&self, turn: crate::session::TurnId, seq: EventSeq, reason: &TurnEndReason) -> bool {
+        self.turn == turn && self.seq == seq && self.reason.matches(reason)
+    }
+}
+
+impl ReceiptReason {
+    fn from_ui(reason: &UiTurnEndReason) -> Result<Self, LiveRenderError> {
+        Ok(match reason {
+            UiTurnEndReason::Completed => Self::Completed,
+            UiTurnEndReason::Aborted { cause } => Self::Aborted(*cause),
+            UiTurnEndReason::Blocked => Self::Blocked,
+            UiTurnEndReason::Error { code, .. } => Self::Error {
+                code: copy_frame_text(code)?,
+            },
+            UiTurnEndReason::MaxTokens => Self::MaxTokens,
+            UiTurnEndReason::Interrupted => Self::Interrupted,
+            UiTurnEndReason::Other { .. } => Self::Other,
+        })
+    }
+
+    fn matches(&self, reason: &TurnEndReason) -> bool {
+        match (self, reason) {
+            (Self::Completed, TurnEndReason::Completed)
+            | (Self::Blocked, TurnEndReason::Blocked)
+            | (Self::MaxTokens, TurnEndReason::MaxTokens)
+            | (Self::Interrupted, TurnEndReason::Interrupted) => true,
+            (Self::Aborted(left), TurnEndReason::Aborted { reason: right }) => {
+                matches!(
+                    (left, right),
+                    (UiTurnEndCancelCause::User, TurnEndCancelCause::User)
+                        | (UiTurnEndCancelCause::Parent, TurnEndCancelCause::Parent)
+                        | (UiTurnEndCancelCause::Hook, TurnEndCancelCause::Hook { .. })
+                        | (UiTurnEndCancelCause::Disposed, TurnEndCancelCause::Disposed)
+                        | (UiTurnEndCancelCause::Legacy, TurnEndCancelCause::Legacy)
+                )
+            }
+            (Self::Error { code: left_code }, TurnEndReason::Error { error }) => {
+                left_code == error.code()
+            }
+            (Self::Other, TurnEndReason::Other { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+fn tool_card_frame(view: &ToolCardView) -> Result<LiveFrame, LiveRenderError> {
+    let mut parts = try_parts(5)?;
+    append_tool_card_parts(&mut parts, view)?;
+    Ok(LiveFrame { parts })
+}
+
+fn tool_activity_notice(
+    tool: &crate::tui::projector::ToolActivity,
+) -> Result<String, LiveRenderError> {
+    let label = match tool.name.as_str() {
+        "list" => "Requested  List",
+        "glob" => "Requested  Glob",
+        "grep" => "Requested  Search",
+        "read" => "Requested  Read",
+        "apply_patch" => "Requested  Patch",
+        "bash" => "Requested  Command",
+        _ => "Tool requested",
+    };
+    let mut notice = String::new();
+    notice
+        .try_reserve_exact(MAX_DOCK_NOTICE_BYTES)
+        .map_err(|_| LiveRenderError)?;
+    notice.push_str(label);
+    if let Some(summary) = tool.summary.as_deref() {
+        notice.push_str("  ");
+        let remaining = MAX_DOCK_NOTICE_BYTES.saturating_sub(notice.len());
+        if summary.len() <= remaining {
+            notice.push_str(summary);
+        } else {
+            let mut end = remaining.saturating_sub("...".len());
+            while end != 0 && !summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            notice.push_str(&summary[..end]);
+            notice.push_str("...");
+        }
+    }
+    Ok(notice)
+}
+
+fn tool_approved_notice(
+    tool: &crate::tui::projector::ToolActivity,
+) -> Result<String, LiveRenderError> {
+    let label = match tool.name.as_str() {
+        "list" => "List",
+        "glob" => "Glob",
+        "grep" => "Search",
+        "read" => "Read",
+        "apply_patch" => "Patch",
+        "bash" => "Command",
+        _ => "Tool",
+    };
+    copy_frame_text(&format!("Approved; awaiting result  {label}"))
+}
+
+fn generic_tool_result_frame(
+    is_error: bool,
+    failure_code: Option<&str>,
+) -> Result<LiveFrame, LiveRenderError> {
+    let mut parts = try_parts(4)?;
+    let has_error = is_error || failure_code.is_some();
+    parts.push(LivePart::UntrustedStyled {
+        style: if has_error {
+            TextStyle::Error
+        } else {
+            TextStyle::Accent
+        },
+        text: if has_error {
+            "Tool result recorded with an error".to_owned()
+        } else {
+            "Tool result recorded".to_owned()
+        },
+    });
+    parts.push(LivePart::TrustedInline("\n"));
+    parts.push(LivePart::UntrustedStyled {
+        style: TextStyle::Muted,
+        text: copy_frame_text(failure_code.unwrap_or("details incomplete"))?,
+    });
+    parts.push(LivePart::TrustedInline("\n\n"));
+    Ok(LiveFrame { parts })
+}
+
+fn append_tool_card_parts(
+    parts: &mut Vec<LivePart>,
+    view: &ToolCardView,
+) -> Result<(), LiveRenderError> {
+    parts.push(LivePart::UntrustedStyled {
+        style: style_for_tone(view.tone()),
+        text: copy_frame_text(view.headline())?,
+    });
+    parts.push(LivePart::TrustedInline("\n"));
+    if let Some(detail) = view.detail() {
+        let mut indented = String::new();
+        indented
+            .try_reserve_exact(detail.len().saturating_add(2))
+            .map_err(|_| LiveRenderError)?;
+        indented.push_str("  ");
+        indented.push_str(detail);
+        parts.push(LivePart::UntrustedStyled {
+            style: TextStyle::Muted,
+            text: indented,
+        });
+        parts.push(LivePart::TrustedInline("\n"));
+    }
+    parts.push(LivePart::TrustedInline("\n"));
+    Ok(())
+}
+
+fn append_receipt_parts(
+    parts: &mut Vec<LivePart>,
+    view: &WorkReceiptView,
+) -> Result<(), LiveRenderError> {
+    parts.push(LivePart::UntrustedStyled {
+        style: style_for_tone(view.tone()),
+        text: copy_frame_text(view.headline())?,
+    });
+    parts.push(LivePart::TrustedInline("\n"));
+    for line in [view.counters(), view.effects()].into_iter().flatten() {
+        let mut indented = String::new();
+        indented
+            .try_reserve_exact(line.len().saturating_add(2))
+            .map_err(|_| LiveRenderError)?;
+        indented.push_str("  ");
+        indented.push_str(line);
+        parts.push(LivePart::UntrustedStyled {
+            style: TextStyle::Muted,
+            text: indented,
+        });
+        parts.push(LivePart::TrustedInline("\n"));
+    }
+    parts.push(LivePart::TrustedInline("\n"));
+    Ok(())
+}
+
+fn style_for_tone(tone: TimelineTone) -> TextStyle {
+    match tone {
+        TimelineTone::Accent => TextStyle::Accent,
+        TimelineTone::Positive => TextStyle::Success,
+        TimelineTone::Caution => TextStyle::Warning,
+        TimelineTone::Negative => TextStyle::Error,
+    }
+}
+
+fn copy_frame_text(value: &str) -> Result<String, LiveRenderError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())
+        .map_err(|_| LiveRenderError)?;
+    copy.push_str(value);
+    Ok(copy)
 }
 
 fn turn_end_frame(reason: UiTurnEndReason) -> Result<LiveFrame, LiveRenderError> {
@@ -1263,17 +1731,18 @@ enum Comparison {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::LlmFailure;
     use crate::session::{
-        CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap, StepId, TurnId,
-        UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiOpaquePayload,
-        UiToolFailure, UiTurnEndReason, UnixMillis,
+        CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap, StepId, TurnEndReason,
+        TurnId, UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent, UiIdentity,
+        UiOpaquePayload, UiToolFailure, UiTurnEndReason, UnixMillis,
     };
     use crate::tui::{presentation::PresentedItem, projector::UiProjector};
 
     use super::super::theme::UiRole;
     use super::{
         AttemptState, EnhancedPresenter, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame,
-        LivePart, LiveRenderer, MAX_ATTEMPT_BLOCKS, MAX_ATTEMPT_TEXT_BYTES,
+        LivePart, LiveRenderer, MAX_ATTEMPT_BLOCKS, MAX_ATTEMPT_TEXT_BYTES, TurnEndAnchor,
     };
 
     fn event(seq: u64, kind: CommittedUiKind) -> CommittedUiEvent {
@@ -1317,6 +1786,223 @@ mod tests {
 
         let continuation = presenter.prepare(frame()).unwrap();
         assert_eq!(presented_text(&continuation), "partial");
+    }
+
+    fn enhanced_text(frame: LiveFrame) -> String {
+        let presenter = EnhancedPresenter::new();
+        let prepared = presenter.prepare(frame).unwrap();
+        presented_text(&prepared)
+    }
+
+    #[test]
+    fn enhanced_multiline_text_keeps_structural_line_feeds() {
+        let frame = LiveFrame {
+            parts: vec![LivePart::Untrusted {
+                role: UiRole::Assistant,
+                text: "first\nsecond\u{1b}".to_owned(),
+            }],
+        };
+        let output = enhanced_text(frame);
+        assert!(output.contains("first\nDSH  second"));
+        assert!(output.contains("\\u{1b}"));
+        assert!(!output.contains("first\\nsecond"));
+    }
+
+    #[test]
+    fn enhanced_tools_emit_only_the_first_final_card() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let request = CommittedUiKind::ToolRequested {
+            turn,
+            step,
+            call_id: identity("call-read"),
+            name: identity("read"),
+            arguments: UiOpaquePayload::from_text_for_test(r#"{"file_path":"src/main.rs"}"#),
+        };
+        let mut update = renderer.consume(event(1, request)).unwrap();
+        let mut notice = None;
+        assert!(update.apply_dock_notice(&mut notice));
+        assert_eq!(notice.as_deref(), Some("Requested  Read  src/main.rs"));
+        assert!(update.take_frame(true).is_none());
+        assert!(update.frame.is_none());
+
+        let result = || CommittedUiKind::ToolResult {
+            turn,
+            step,
+            call_id: identity("call-read"),
+            is_error: false,
+            failure: None,
+            content: UiOpaquePayload::from_text_for_test("secret result body"),
+            meta: UiOpaquePayload::from_text_for_test("{}"),
+            surface_replacement_target: None,
+        };
+        let mut first = renderer.consume(event(2, result())).unwrap();
+        assert!(first.apply_dock_notice(&mut notice));
+        assert!(notice.is_none());
+        let output = enhanced_text(first.take_frame(true).unwrap());
+        assert!(output.contains("Completed  Read"));
+        assert!(output.contains("src/main.rs"));
+        assert!(!output.contains("secret result body"));
+
+        let mut duplicate = renderer.consume(event(3, result())).unwrap();
+        assert!(duplicate.take_frame(true).is_none());
+    }
+
+    #[test]
+    fn enhanced_tool_capacity_one_over_degrades_to_a_generic_card() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        for index in 0..256_u16 {
+            renderer
+                .consume(event(
+                    u64::from(index),
+                    CommittedUiKind::ToolRequested {
+                        turn,
+                        step,
+                        call_id: identity(&format!("call-{index}")),
+                        name: identity("read"),
+                        arguments: UiOpaquePayload::from_text_for_test(
+                            r#"{"file_path":"src/lib.rs"}"#,
+                        ),
+                    },
+                ))
+                .unwrap();
+        }
+        renderer
+            .consume(event(
+                256,
+                CommittedUiKind::ToolRequested {
+                    turn,
+                    step,
+                    call_id: identity("call-over"),
+                    name: identity("read"),
+                    arguments: UiOpaquePayload::from_text_for_test(
+                        r#"{"file_path":"src/over.rs"}"#,
+                    ),
+                },
+            ))
+            .unwrap();
+        let mut update = renderer
+            .consume(event(
+                257,
+                CommittedUiKind::ToolResult {
+                    turn,
+                    step,
+                    call_id: identity("call-over"),
+                    is_error: false,
+                    failure: None,
+                    content: UiOpaquePayload::from_text_for_test("secret"),
+                    meta: UiOpaquePayload::from_text_for_test("{}"),
+                    surface_replacement_target: None,
+                },
+            ))
+            .unwrap();
+        let output = enhanced_text(update.take_frame(true).unwrap());
+        assert!(output.contains("Tool result recorded"));
+        assert!(output.contains("details incomplete"));
+        assert!(!output.contains("secret"));
+    }
+
+    #[test]
+    fn one_tool_result_keeps_another_pending_request_in_the_dock() {
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let mut notice = None;
+        for (seq, call, path) in [(1, "call-a", "a.rs"), (2, "call-b", "b.rs")] {
+            let mut update = renderer
+                .consume(event(
+                    seq,
+                    CommittedUiKind::ToolRequested {
+                        turn,
+                        step,
+                        call_id: identity(call),
+                        name: identity("read"),
+                        arguments: UiOpaquePayload::from_text_for_test(&format!(
+                            r#"{{"file_path":"{path}"}}"#
+                        )),
+                    },
+                ))
+                .unwrap();
+            update.apply_dock_notice(&mut notice);
+        }
+        assert_eq!(notice.as_deref(), Some("Requested  Read  b.rs"));
+        let mut first_result = renderer
+            .consume(event(
+                3,
+                CommittedUiKind::ToolResult {
+                    turn,
+                    step,
+                    call_id: identity("call-a"),
+                    is_error: false,
+                    failure: None,
+                    content: UiOpaquePayload::from_text_for_test("ignored"),
+                    meta: UiOpaquePayload::from_text_for_test("{}"),
+                    surface_replacement_target: None,
+                },
+            ))
+            .unwrap();
+        assert!(!first_result.apply_dock_notice(&mut notice));
+        assert_eq!(notice.as_deref(), Some("Requested  Read  b.rs"));
+    }
+
+    #[test]
+    fn enhanced_turn_status_waits_for_the_joined_receipt() {
+        let turn = TurnId::new(1).unwrap();
+        let mut renderer = LiveRenderer::new();
+        let mut start = renderer
+            .consume(event(1, CommittedUiKind::TurnStart { turn }))
+            .unwrap();
+        assert!(start.take_frame(true).is_none());
+        let mut end = renderer
+            .consume(event(
+                2,
+                CommittedUiKind::TurnEnd {
+                    turn,
+                    reason: UiTurnEndReason::Completed,
+                },
+            ))
+            .unwrap();
+        assert!(end.take_frame(true).is_none());
+    }
+
+    #[test]
+    fn receipt_anchor_requires_the_exact_turn_end_sequence_and_reason() {
+        let turn = TurnId::new(1).unwrap();
+        let committed = event(
+            9,
+            CommittedUiKind::TurnEnd {
+                turn,
+                reason: UiTurnEndReason::Completed,
+            },
+        );
+        let anchor = TurnEndAnchor::from_event(&committed).unwrap().unwrap();
+        assert!(anchor.matches(turn, EventSeq::new(9).unwrap(), &TurnEndReason::Completed));
+        assert!(!anchor.matches(turn, EventSeq::new(8).unwrap(), &TurnEndReason::Completed));
+        assert!(!anchor.matches(
+            TurnId::new(2).unwrap(),
+            EventSeq::new(9).unwrap(),
+            &TurnEndReason::Completed
+        ));
+        assert!(!anchor.matches(turn, EventSeq::new(9).unwrap(), &TurnEndReason::Blocked));
+
+        let error_event = event(
+            10,
+            CommittedUiKind::TurnEnd {
+                turn,
+                reason: UiTurnEndReason::Error {
+                    code: "PROVIDER_FAILED".to_owned(),
+                    message: "[omitted 8192-byte text]".to_owned(),
+                },
+            },
+        );
+        let error_anchor = TurnEndAnchor::from_event(&error_event).unwrap().unwrap();
+        let full_reason = TurnEndReason::Error {
+            error: LlmFailure::new("x".repeat(8_192), "PROVIDER_FAILED").unwrap(),
+        };
+        assert!(error_anchor.matches(turn, EventSeq::new(10).unwrap(), &full_reason));
     }
 
     fn render(
@@ -1700,6 +2386,7 @@ mod tests {
         let mut renderer = LiveRenderer {
             attempt: Some(blocks),
             semantic: UiProjector::default(),
+            turn_end: None,
         };
         let mut presenter = InteractivePresenter::new();
         let mut output = String::new();

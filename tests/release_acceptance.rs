@@ -207,7 +207,7 @@ fn installed_dsh_renders_the_real_readme_scene() {
 
     dsh.expect("❯".as_bytes());
     dsh.write(b"Review src/message.txt and prepare the release update\r");
-    dsh.expect(b"Tool finished");
+    dsh.expect(b"Completed  Read");
     dsh.approval_ready_for_call(b"call-readme-patch");
     let selection = dsh.checkpoint();
     dsh.write(b"\x1b[A");
@@ -218,9 +218,10 @@ fn installed_dsh_renders_the_real_readme_scene() {
     );
     capture_snapshot("approval.ansi", &dsh.snapshot());
     dsh.write(b"\r");
-    dsh.expect(b"Allowed once");
-    dsh.expect_occurrences(b"Tool finished", 2);
+    dsh.expect(b"Approved; awaiting result");
+    dsh.expect(b"Updated  src/message.txt");
     dsh.expect(b"Updated the release needle and kept the project checkable.");
+    dsh.expect(b"Turn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     capture_snapshot("overview.ansi", &dsh.snapshot());
     let (status, _) = dsh.exit_cleanly();
@@ -299,25 +300,29 @@ fn installed_dsh_completes_one_safe_resumable_compacting_journey() {
 
     first.expect("❯".as_bytes());
     first.write(b"inspect the project, fix ANSWER, and run its check\r");
-    for tool in [b"list".as_slice(), b"grep", b"read"] {
-        first.expect(tool);
-        first.expect(b"Tool finished");
+    for marker in [
+        b"Completed  List".as_slice(),
+        b"Completed  Search",
+        b"Completed  Read",
+    ] {
+        first.expect(marker);
     }
     first.approval_ready_for_call(b"call-patch");
     let patch_selection = first.checkpoint();
     first.write(b"\x1b[A");
     first.expect_after(patch_selection, b"> Allow once");
     first.write(b"\r");
-    first.expect(b"Allowed once");
-    first.expect(b"Tool finished");
+    first.expect(b"Approved; awaiting result");
+    first.expect(b"Updated  src/config.rs");
     first.approval_ready_for_call(b"call-test");
     let shell_selection = first.checkpoint();
     first.write(b"\x1b[A");
     first.expect_after(shell_selection, b"> Allow once");
     first.write(b"\r");
-    first.expect_occurrences(b"Allowed once", 2);
-    first.expect_occurrences(b"Tool finished", 5);
+    first.expect(b"Approved; awaiting result  Command");
+    first.expect(b"Exit 0");
     first.expect(b"OLD_PREFIX_SENTINEL");
+    first.expect(b"Turn complete");
     first.expect_occurrences("❯".as_bytes(), 2);
     let (status, _) = first.exit_cleanly();
     assert!(status.success());
@@ -362,11 +367,14 @@ fn installed_dsh_completes_one_safe_resumable_compacting_journey() {
     second.expect("❯".as_bytes());
     second.write(b"start a cancellable follow-up\r");
     second.expect(b"partial-before-cancel");
+    let cancelled_ready = second.checkpoint();
     second.write(&[0x03]);
     second.expect(b"stopped; skipped");
+    second.expect_after(cancelled_ready, b"Ready");
     second.expect_occurrences("❯".as_bytes(), 2);
     second.write(b"record a large recent context\r");
     second.expect(b"RECENT_TAIL_ANSWER_SENTINEL");
+    second.expect(b"Turn complete");
     second.expect_occurrences("❯".as_bytes(), 3);
     let (status, _) = second.exit_cleanly();
     let (requests, first_connection_closed) = second_server.finish();
@@ -392,6 +400,7 @@ fn installed_dsh_completes_one_safe_resumable_compacting_journey() {
     third.expect("❯".as_bytes());
     third.write(format!("{target_prompt}\r").as_bytes());
     third.expect(b"continued after the automatic summary");
+    third.expect(b"Turn complete");
     third.expect_occurrences("❯".as_bytes(), 2);
     let (status, _) = third.exit_cleanly();
     let requests = third_server.finish();

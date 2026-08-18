@@ -4,8 +4,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::session::{
-    ApprovalOutcome, CommittedUiKind, EventSeq, StepId, TurnId, UiIdentity, UiOpaquePayload,
-    UiTokenUsage, UiTurnEndReason, UiUserSource,
+    ApprovalOutcome, CommittedUiKind, EventSeq, StepId, TOOL_OUTCOME_UNKNOWN, TurnId, UiIdentity,
+    UiOpaquePayload, UiTokenUsage, UiTurnEndReason, UiUserSource,
 };
 
 const MAX_PROJECTED_TOOLS: usize = 256;
@@ -45,6 +45,12 @@ pub(crate) enum ToolActivityOrigin {
     UnattributedResult,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PatchActivityOperation {
+    Create,
+    Update,
+}
+
 pub(crate) struct ToolActivity {
     pub(crate) turn: TurnId,
     pub(crate) step: StepId,
@@ -59,10 +65,20 @@ pub(crate) struct ToolActivity {
     pub(crate) result_bytes: usize,
     pub(crate) meta_bytes: usize,
     pub(crate) committed_effect: Option<bool>,
+    pub(crate) patch_path: Option<String>,
+    pub(crate) patch_operation: Option<PatchActivityOperation>,
+    pub(crate) patch_additions: Option<usize>,
+    pub(crate) patch_removals: Option<usize>,
+    pub(crate) patch_cleanup_warning: Option<bool>,
     pub(crate) started_process: Option<bool>,
     pub(crate) shell_exit_code: Option<i64>,
     pub(crate) shell_signal: Option<String>,
     pub(crate) shell_timed_out: Option<bool>,
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) plugin_dispatched: Option<bool>,
+    pub(crate) plugin_peer_settled: Option<bool>,
+    pub(crate) plugin_quiescent: Option<bool>,
+    pub(crate) conflicting_effect: bool,
 }
 
 impl fmt::Debug for ToolActivity {
@@ -88,6 +104,14 @@ impl fmt::Debug for ToolActivity {
             .field("result_bytes", &self.result_bytes)
             .field("meta_bytes", &self.meta_bytes)
             .field("committed_effect", &self.committed_effect)
+            .field(
+                "patch_path_bytes",
+                &self.patch_path.as_ref().map_or(0, String::len),
+            )
+            .field("patch_operation", &self.patch_operation)
+            .field("patch_additions", &self.patch_additions)
+            .field("patch_removals", &self.patch_removals)
+            .field("patch_cleanup_warning", &self.patch_cleanup_warning)
             .field("started_process", &self.started_process)
             .field("shell_exit_code", &self.shell_exit_code)
             .field(
@@ -95,6 +119,14 @@ impl fmt::Debug for ToolActivity {
                 &self.shell_signal.as_ref().map_or(0, String::len),
             )
             .field("shell_timed_out", &self.shell_timed_out)
+            .field(
+                "plugin_id_bytes",
+                &self.plugin_id.as_ref().map_or(0, String::len),
+            )
+            .field("plugin_dispatched", &self.plugin_dispatched)
+            .field("plugin_peer_settled", &self.plugin_peer_settled)
+            .field("plugin_quiescent", &self.plugin_quiescent)
+            .field("conflicting_effect", &self.conflicting_effect)
             .finish()
     }
 }
@@ -215,6 +247,7 @@ pub(crate) struct UiProjector {
     orphan_prune_markers: usize,
     conflicting_facts: usize,
     compaction_usage: Option<UiTokenUsage>,
+    degraded: bool,
 }
 
 impl fmt::Debug for UiProjector {
@@ -246,6 +279,7 @@ pub(crate) struct UiProjectorStatus {
     pub(crate) orphan_prune_markers: usize,
     pub(crate) conflicting_facts: usize,
     pub(crate) compaction_usage: Option<UiTokenUsage>,
+    pub(crate) degraded: bool,
 }
 
 impl UiProjector {
@@ -430,12 +464,20 @@ impl UiProjector {
                 );
                 self.retry_count = self.retry_count.saturating_add(1);
             }
-            CommittedUiKind::TurnEnd { reason, .. } => {
+            CommittedUiKind::TurnEnd { turn, reason } => {
                 if let UiTurnEndReason::Aborted { cause } = reason {
                     let _ = cause;
                 }
                 for tool in &mut self.tools {
-                    if !tool.state.is_terminal() {
+                    if tool.turn == *turn
+                        && tool.is_error.is_none()
+                        && matches!(
+                            tool.state,
+                            ToolActivityState::Preparing
+                                | ToolActivityState::AwaitingApproval
+                                | ToolActivityState::Allowed
+                        )
+                    {
                         tool.state = ToolActivityState::OutcomeUnknown;
                     }
                 }
@@ -455,6 +497,7 @@ impl UiProjector {
                 self.orphan_prune_markers = 0;
                 self.conflicting_facts = 0;
                 self.compaction_usage = None;
+                self.degraded = false;
             }
             CommittedUiKind::StepStart { .. }
             | CommittedUiKind::StepEnd { .. }
@@ -496,7 +539,12 @@ impl UiProjector {
             orphan_prune_markers: self.orphan_prune_markers,
             conflicting_facts: self.conflicting_facts,
             compaction_usage: self.compaction_usage,
+            degraded: self.degraded,
         }
+    }
+
+    pub(crate) fn mark_degraded(&mut self) {
+        self.degraded = true;
     }
 
     fn request_tool(
@@ -539,10 +587,20 @@ impl UiProjector {
             result_bytes: 0,
             meta_bytes: 0,
             committed_effect: None,
+            patch_path: None,
+            patch_operation: None,
+            patch_additions: None,
+            patch_removals: None,
+            patch_cleanup_warning: None,
             started_process: None,
             shell_exit_code: None,
             shell_signal: None,
             shell_timed_out: None,
+            plugin_id: None,
+            plugin_dispatched: None,
+            plugin_peer_settled: None,
+            plugin_quiescent: None,
+            conflicting_effect: false,
         });
         Ok(())
     }
@@ -654,10 +712,20 @@ impl UiProjector {
                 result_bytes: 0,
                 meta_bytes: 0,
                 committed_effect: None,
+                patch_path: None,
+                patch_operation: None,
+                patch_additions: None,
+                patch_removals: None,
+                patch_cleanup_warning: None,
                 started_process: None,
                 shell_exit_code: None,
                 shell_signal: None,
                 shell_timed_out: None,
+                plugin_id: None,
+                plugin_dispatched: None,
+                plugin_peer_settled: None,
+                plugin_quiescent: None,
+                conflicting_effect: false,
             });
         }
         let tool = self
@@ -675,7 +743,9 @@ impl UiProjector {
                 | ToolActivityState::Cancelled
                 | ToolActivityState::Unavailable
         ) {
-            tool.state = if is_error || failure_code.is_some() {
+            tool.state = if failure_code == Some(TOOL_OUTCOME_UNKNOWN) {
+                ToolActivityState::OutcomeUnknown
+            } else if is_error || failure_code.is_some() {
                 ToolActivityState::Failed
             } else {
                 ToolActivityState::Completed
@@ -690,7 +760,15 @@ impl UiProjector {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
         {
             if tool.name.as_str() == "apply_patch" {
-                tool.committed_effect = patch_committed(&meta);
+                if let Some(facts) = patch_facts(&meta) {
+                    tool.committed_effect = Some(facts.committed);
+                    tool.patch_path = Some(bounded_summary(facts.path)?);
+                    tool.patch_operation = Some(facts.operation);
+                    let (additions, removals) = unified_diffstat(facts.diff);
+                    tool.patch_additions = Some(additions);
+                    tool.patch_removals = Some(removals);
+                    tool.patch_cleanup_warning = facts.cleanup_warning;
+                }
             }
             if tool.name.as_str() == "bash" {
                 if let Some(facts) = shell_facts(&meta) {
@@ -700,7 +778,21 @@ impl UiProjector {
                     tool.shell_timed_out = facts.timed_out;
                 }
             }
+            if let Some(facts) = plugin_facts(&meta) {
+                tool.plugin_id = Some(bounded_summary(facts.id)?);
+                tool.plugin_dispatched = Some(facts.dispatched);
+                tool.plugin_peer_settled = Some(facts.peer_settled);
+                tool.plugin_quiescent = Some(facts.quiescent);
+            }
         }
+        tool.conflicting_effect = matches!(
+            tool.state,
+            ToolActivityState::Denied
+                | ToolActivityState::Cancelled
+                | ToolActivityState::Unavailable
+        ) && (tool.committed_effect == Some(true)
+            || tool.started_process == Some(true)
+            || tool.plugin_dispatched == Some(true));
         Ok(())
     }
 
@@ -741,7 +833,15 @@ impl UiProjector {
     }
 }
 
-fn patch_committed(meta: &Value) -> Option<bool> {
+struct PatchFacts<'a> {
+    path: &'a str,
+    operation: PatchActivityOperation,
+    diff: &'a str,
+    committed: bool,
+    cleanup_warning: Option<bool>,
+}
+
+fn patch_facts(meta: &Value) -> Option<PatchFacts<'_>> {
     let fields = meta.as_object()?;
     const ALLOWED: &[&str] = &["path", "operation", "diff", "committed", "cleanupWarning"];
     if fields.keys().any(|key| !ALLOWED.contains(&key.as_str()))
@@ -757,7 +857,57 @@ fn patch_committed(meta: &Value) -> Option<bool> {
     {
         return None;
     }
-    fields.get("committed").and_then(Value::as_bool)
+    Some(PatchFacts {
+        path: fields.get("path")?.as_str()?,
+        operation: match fields.get("operation")?.as_str()? {
+            "create" => PatchActivityOperation::Create,
+            "update" => PatchActivityOperation::Update,
+            _ => return None,
+        },
+        diff: fields.get("diff")?.as_str()?,
+        committed: fields.get("committed")?.as_bool()?,
+        cleanup_warning: fields.get("cleanupWarning").and_then(Value::as_bool),
+    })
+}
+
+fn unified_diffstat(diff: &str) -> (usize, usize) {
+    let mut additions = 0_usize;
+    let mut removals = 0_usize;
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk && line.starts_with('+') {
+            additions = additions.saturating_add(1);
+        } else if in_hunk && line.starts_with('-') {
+            removals = removals.saturating_add(1);
+        }
+    }
+    (additions, removals)
+}
+
+struct PluginFacts<'a> {
+    id: &'a str,
+    dispatched: bool,
+    peer_settled: bool,
+    quiescent: bool,
+}
+
+fn plugin_facts(meta: &Value) -> Option<PluginFacts<'_>> {
+    let fields = meta.as_object()?;
+    const KEYS: &[&str] = &["kind", "pluginId", "dispatched", "peerSettled", "quiescent"];
+    if fields.len() != KEYS.len()
+        || KEYS.iter().any(|key| !fields.contains_key(*key))
+        || fields.get("kind")?.as_str()? != "plugin"
+    {
+        return None;
+    }
+    Some(PluginFacts {
+        id: fields.get("pluginId")?.as_str()?,
+        dispatched: fields.get("dispatched")?.as_bool()?,
+        peer_settled: fields.get("peerSettled")?.as_bool()?,
+        quiescent: fields.get("quiescent")?.as_bool()?,
+    })
 }
 
 struct ShellFacts<'a> {

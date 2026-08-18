@@ -212,11 +212,12 @@ fn installed_dsh_runs_both_real_example_plugins_through_approval_and_session_res
     dsh.write(b"use both configured example plugins\r");
     dsh.approval_ready();
     approve_once(&mut dsh);
-    dsh.expect(b"Tool finished");
+    dsh.expect(b"Plugin completed");
     dsh.approval_ready_for_call(b"call-json-format");
     approve_once(&mut dsh);
-    dsh.expect_occurrences(b"Tool finished", 2);
+    dsh.expect_occurrences(b"Plugin completed", 2);
     dsh.expect(b"both example plugins completed");
+    dsh.expect(b"Turn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
     assert!(status.success(), "{}", String::from_utf8_lossy(&transcript));
@@ -257,13 +258,15 @@ fn wrong_id_fault_plugin_never_becomes_a_success_and_is_reaped_on_exit() {
     dsh.write(b"run the configured fault probe\r");
     dsh.approval_ready();
     approve_once(&mut dsh);
-    dsh.expect(b"Tool failed");
+    dsh.expect(b"Outcome unknown");
     dsh.expect(b"fault result handled without replay");
+    dsh.expect(b"Turn complete");
+    dsh.expect(b"1 issue");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
     let transcript = String::from_utf8_lossy(&transcript);
     assert!(status.success(), "{transcript}");
-    assert!(transcript.contains("TOOL_OUTCOME_UNKNOWN"), "{transcript}");
+    assert!(!transcript.contains("TOOL_OUTCOME_UNKNOWN"), "{transcript}");
     let requests = server.finish();
     assert_eq!(requests.len(), 2);
     assert!(last_tool_content(&requests[1]).contains("no trustworthy matching result"));
@@ -296,13 +299,15 @@ fn crash_after_dispatch_is_recorded_once_and_never_replayed_after_resume() {
     dsh.write(b"run the crashing plugin once\r");
     dsh.approval_ready();
     approve_once(&mut dsh);
-    dsh.expect(b"Tool failed");
+    dsh.expect(b"Outcome unknown");
     dsh.expect(b"plugin crash was recorded");
+    dsh.expect(b"Turn complete");
+    dsh.expect(b"1 issue");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
     let transcript = String::from_utf8_lossy(&transcript);
     assert!(status.success(), "{transcript}");
-    assert!(transcript.contains("TOOL_OUTCOME_UNKNOWN"), "{transcript}");
+    assert!(!transcript.contains("TOOL_OUTCOME_UNKNOWN"), "{transcript}");
     assert_eq!(
         fs::read_to_string(&dispatch_marker).unwrap(),
         "dispatched\n"
@@ -322,6 +327,7 @@ fn crash_after_dispatch_is_recorded_once_and_never_replayed_after_resume() {
     resumed.expect("❯".as_bytes());
     resumed.write(b"continue without the crashed plugin\r");
     resumed.expect(b"resume did not replay the call");
+    resumed.expect(b"Turn complete");
     resumed.expect_occurrences("❯".as_bytes(), 2);
     assert!(resumed.exit_cleanly().0.success());
     assert_eq!(
@@ -367,9 +373,10 @@ fn matching_result_settles_the_current_call_before_extra_output_poisons_future_c
         dsh.write(b"run the configured extra-output probe\r");
         dsh.approval_ready();
         approve_once(&mut dsh);
-        dsh.expect(b"Tool finished");
-        dsh.expect(b"Tool failed");
+        dsh.expect(b"Plugin completed");
+        dsh.expect(b"Plugin failed");
         dsh.expect(b"the matching plugin result stayed authoritative");
+        dsh.expect(b"Turn complete");
         dsh.expect_occurrences("❯".as_bytes(), 2);
         let (status, transcript) = dsh.exit_cleanly();
         let transcript = String::from_utf8_lossy(&transcript);
@@ -410,7 +417,7 @@ fn cancellation_is_latched_even_when_the_fault_plugin_returns_a_matching_result(
     dsh.write(b"start the cancellable fault probe\r");
     dsh.approval_ready();
     approve_once(&mut dsh);
-    dsh.expect(b"Allowed once");
+    dsh.expect(b"Approved; awaiting result");
     dsh.write(&[0x03]);
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
@@ -442,8 +449,9 @@ fn matching_value_that_breaks_the_declared_output_schema_is_a_definite_error() {
     dsh.write(b"run the invalid-output probe\r");
     dsh.approval_ready();
     approve_once(&mut dsh);
-    dsh.expect(b"Tool failed");
+    dsh.expect(b"Plugin failed");
     dsh.expect(b"invalid plugin output was handled");
+    dsh.expect(b"Turn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
     let transcript = String::from_utf8_lossy(&transcript);
@@ -475,7 +483,7 @@ fn ignored_plugin_cancellation_is_force_cleaned_before_the_prompt_returns() {
     dsh.write(b"start the uncooperative fault probe\r");
     dsh.approval_ready();
     approve_once(&mut dsh);
-    dsh.expect(b"Allowed once");
+    dsh.expect(b"Approved; awaiting result");
     let marker_deadline = Instant::now() + Duration::from_secs(3);
     while !child_marker.exists() {
         assert!(
@@ -526,17 +534,24 @@ fn protocol_stdout_and_stderr_limits_fail_closed_without_hanging_the_cli() {
         dsh.write(b"run the bounded output fault\r");
         dsh.approval_ready();
         approve_once(&mut dsh);
-        dsh.expect(b"Tool failed");
+        dsh.expect(b"Outcome unknown");
         dsh.expect(b"bounded plugin fault handled");
+        dsh.expect(b"Turn complete");
+        dsh.expect(b"1 issue");
         dsh.expect_occurrences("❯".as_bytes(), 2);
         let (status, transcript) = dsh.exit_cleanly();
         let transcript = String::from_utf8_lossy(&transcript);
         assert!(status.success(), "{mode}: {transcript}");
         assert!(
-            transcript.contains("TOOL_OUTCOME_UNKNOWN"),
+            !transcript.contains("TOOL_OUTCOME_UNKNOWN"),
             "{mode}: {transcript}"
         );
-        assert_eq!(server.finish().len(), 2);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            last_tool_content(&requests[1]).contains("no trustworthy matching result"),
+            "{mode}: the model-visible tool result must retain the unknown outcome"
+        );
     }
 }
 

@@ -189,9 +189,10 @@ fn configured_plugin_is_model_visible_but_dispatches_only_after_terminal_approva
         "selection alone must not dispatch the plugin"
     );
     dsh.write(b"\r");
-    dsh.expect(b"Allowed once");
-    dsh.expect(b"Tool finished");
+    dsh.expect(b"Approved; awaiting result");
+    dsh.expect(b"Plugin completed");
     dsh.expect(b"plugin round complete");
+    dsh.expect(b"Turn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
     let transcript = String::from_utf8_lossy(&transcript);
@@ -367,8 +368,9 @@ fn terminal_reject_and_cancel_never_dispatch_a_plugin_call() {
     rejected.approval_ready();
     rejected.write(b"\r");
     rejected.expect(b"Rejected");
-    rejected.expect(b"Tool failed");
+    rejected.expect(b"Plugin rejected");
     rejected.expect(b"plugin rejection returned to the model");
+    rejected.expect(b"Turn complete");
     rejected.expect_occurrences("❯".as_bytes(), 2);
     assert!(rejected.exit_cleanly().0.success());
     assert_eq!(rejected_server.finish().len(), 2);
@@ -376,7 +378,10 @@ fn terminal_reject_and_cancel_never_dispatch_a_plugin_call() {
 
     let cancelled_workspace = PluginWorkspace::new();
     let cancelled_config = plugin_fixture(&cancelled_workspace.0);
-    let cancelled_server = SequenceSseServer::start(vec![tool_sse()]);
+    let cancelled_server = SequenceSseServer::start(vec![
+        tool_sse(),
+        text_sse("plugin cancellation returned to the model"),
+    ]);
     let mut cancelled = PtyHarness::spawn_color_with_plugin_config(
         &cancelled_server.base_url,
         &cancelled_workspace.0,
@@ -386,10 +391,12 @@ fn terminal_reject_and_cancel_never_dispatch_a_plugin_call() {
     cancelled.write(b"cancel the configured plugin\r");
     cancelled.approval_ready();
     cancelled.write(b"\x1b");
-    cancelled.expect(b"Cancelled");
+    cancelled.expect(b"Plugin cancelled");
+    cancelled.expect(b"plugin cancellation returned to the model");
+    cancelled.expect(b"Turn complete");
     cancelled.expect_occurrences("❯".as_bytes(), 2);
     assert!(cancelled.exit_cleanly().0.success());
-    assert_eq!(cancelled_server.finish().len(), 1);
+    assert_eq!(cancelled_server.finish().len(), 2);
     assert!(!cancelled_workspace.0.join("plugin-calls.log").exists());
 }
 
@@ -407,6 +414,7 @@ fn invalid_plugin_arguments_return_a_result_without_approval_or_dispatch() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"send an invalid plugin call\r");
     dsh.expect(b"invalid arguments observed");
+    dsh.expect(b"Turn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
     let transcript = String::from_utf8_lossy(&transcript);

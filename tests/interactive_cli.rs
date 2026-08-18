@@ -286,7 +286,7 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"show the styled interface\r");
     dsh.expect(b"\x1b[36mDSH  styled answer");
-    dsh.expect(b"\x1b[32mDone");
+    dsh.expect(b"\x1b[1;36mTurn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
 
@@ -424,7 +424,7 @@ fn enhanced_dock_keeps_cbreak_across_idle_and_restores_it_for_suspend() {
     let turn_checkpoint = dsh.checkpoint();
     dsh.write(b"continue after enhanced suspension\r");
     dsh.expect(b"answer after enhanced suspension");
-    dsh.expect_after(turn_checkpoint, b"Done");
+    dsh.expect_after(turn_checkpoint, b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -498,7 +498,7 @@ fn enhanced_ctrl_c_keeps_the_screen_ledger_usable_for_the_next_turn() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"continue after cancellation\r");
     dsh.expect(b"second turn still aligned");
-    dsh.expect(b"Done");
+    dsh.expect(b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let (requests, first_closed) = server.finish();
 
@@ -531,7 +531,7 @@ fn enhanced_composer_edits_fragmented_unicode_and_distinguishes_ctrl_j_from_ente
     dsh.write(&[0x05]);
     dsh.write(b"\ntail\r");
     dsh.expect(b"unicode composer accepted");
-    dsh.expect_after(turn_checkpoint, b"Done");
+    dsh.expect_after(turn_checkpoint, b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -574,7 +574,7 @@ fn enhanced_resize_reanchors_the_full_screen_dock_and_preserves_the_draft() {
     );
     dsh.write(b"\r");
     dsh.expect(b"resized draft accepted");
-    dsh.expect(b"Done");
+    dsh.expect(b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -628,7 +628,7 @@ fn fragmented_bracketed_paste_is_one_draft_and_never_submits_its_enter_bytes() {
     dsh.expect(b"Paste ready");
     dsh.write(b"\r");
     dsh.expect(b"atomic paste accepted");
-    dsh.expect_after(turn_checkpoint, b"Done");
+    dsh.expect_after(turn_checkpoint, b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -664,7 +664,7 @@ fn a_completed_paste_fence_discards_a_later_read_before_enter_can_submit() {
     dsh.write(b"\r");
     dsh.expect(b"paste guard answer");
     server.release();
-    dsh.expect(b"Done");
+    dsh.expect(b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -701,7 +701,7 @@ fn a_rejected_oversized_paste_fence_cannot_submit_the_existing_draft() {
     dsh.write(b"\r");
     dsh.expect(b"rejected paste answer");
     server.release();
-    dsh.expect(b"Done");
+    dsh.expect(b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -733,7 +733,7 @@ fn rejected_escape_sequence_discards_the_same_read_enter_without_losing_the_draf
     dsh.write(b"\r");
     dsh.expect(b"invalid guard answer");
     server.release();
-    dsh.expect(b"Done");
+    dsh.expect(b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -765,7 +765,7 @@ fn input_typed_during_a_turn_is_queued_and_admitted_only_after_settlement() {
     dsh.expect(b"first-turn-finished");
     dsh.expect(b"1 item");
     dsh.expect(b"queued-turn-finished");
-    dsh.expect_after(journey_checkpoint, b"Done");
+    dsh.expect_after(journey_checkpoint, b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -935,7 +935,7 @@ fn enhanced_resize_during_a_partial_stream_reanchors_without_cancelling_the_turn
     dsh.expect_after(resize, b"Working | type the next prompt while dsh runs");
     server.release();
     dsh.expect(b"continuation-after-resize");
-    dsh.expect(b"Done");
+    dsh.expect(b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -975,7 +975,7 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     dsh.expect_after(compact, b"> Allow once");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
     dsh.write(b"\r");
-    dsh.expect(b"Allowed once");
+    dsh.expect(b"Updated  note.txt");
     dsh.expect(b"styled patch finished");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
@@ -1031,13 +1031,40 @@ fn enhanced_approval_rejects_printable_same_read_and_pasted_authority() {
     dsh.expect_after(selection, b"Arrow keys move | Enter confirms | Esc stops");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
     dsh.write(b"\r");
-    dsh.expect(b"Allowed once");
+    dsh.expect(b"Updated  note.txt");
     dsh.expect(b"enhanced approval finished");
-    dsh.expect(b"Done");
-    let (status, _) = dsh.exit_cleanly();
+    dsh.expect(b"Turn complete");
+    let (status, transcript) = dsh.exit_cleanly();
 
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(
+        transcript
+            .windows(b"Updated  note.txt".len())
+            .filter(|window| *window == b"Updated  note.txt")
+            .count(),
+        1
+    );
+    for obsolete in [
+        b"Tool requested".as_slice(),
+        b"Tool finished",
+        b"Allowed once",
+    ] {
+        assert!(
+            !transcript
+                .windows(obsolete.len())
+                .any(|window| window == obsolete)
+        );
+    }
+    let card = transcript
+        .windows(b"Updated  note.txt".len())
+        .position(|window| window == b"Updated  note.txt")
+        .unwrap();
+    let receipt = transcript
+        .windows(b"Turn complete".len())
+        .position(|window| window == b"Turn complete")
+        .unwrap();
+    assert!(card < receipt);
     assert_eq!(server.finish().len(), 2);
 }
 

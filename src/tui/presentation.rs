@@ -2,6 +2,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use super::visible::must_escape;
+
 const MAX_PRESENTED_ITEMS: usize = 128 * 1024;
 const MAX_PRESENTED_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -91,7 +93,10 @@ impl PresentedChunkBuilder {
         if text.is_empty() {
             return Ok(());
         }
-        if text.chars().any(|character| character.is_control()) {
+        if text
+            .chars()
+            .any(|character| character.is_control() || must_escape(character))
+        {
             return Err(PresentationError::InvalidText);
         }
         let next_bytes = self
@@ -168,7 +173,13 @@ mod tests {
 
     #[test]
     fn terminal_controls_and_newlines_cannot_hide_in_text_runs() {
-        for text in ["bad\ntext", "bad\rtext", "bad\u{1b}text", "bad\ttext"] {
+        for text in [
+            "bad\ntext",
+            "bad\rtext",
+            "bad\u{1b}text",
+            "bad\ttext",
+            "bad\u{202e}text",
+        ] {
             let mut builder = PresentedChunk::builder();
             assert_eq!(
                 builder.push_text(TextStyle::Plain, text),

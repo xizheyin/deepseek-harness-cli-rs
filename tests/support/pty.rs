@@ -16,6 +16,7 @@ use rustix::process::{
 const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const TEST_API_KEY: &str = "test-key-for-loopback-only";
 const SECRET_WINDOW_BYTES: usize = 64;
+static PTY_LAUNCH_LOCK: Mutex<()> = Mutex::new(());
 
 fn open_test_pty() -> (blocking::Pty, blocking::Pts) {
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -513,6 +514,13 @@ impl PtyHarness {
             initial_rows,
             initial_columns,
         } = launch;
+        // Darwin can briefly fail terminal admission while several tests
+        // allocate and attach controlling terminals at once. Serialize only
+        // allocation through child exec; the journeys still run in parallel
+        // after their independent terminal ownership is established.
+        let launch_guard = PTY_LAUNCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (master, slave) = open_test_pty();
         let mut termios =
             rustix::termios::tcgetattr(&slave).expect("PTY terminal settings should be readable");
@@ -649,6 +657,7 @@ impl PtyHarness {
             command = command.env(name, value);
         }
         let child = command.spawn(slave).expect("dsh should spawn on the PTY");
+        drop(launch_guard);
         Self {
             master: Some(master),
             child: Some(child),
@@ -978,6 +987,9 @@ impl JobControlHarness {
     pub const SHELL_PROMPT: &'static [u8] = b"JC_BASH> ";
 
     pub fn spawn(base_url: &str, workspace: &Path) -> Self {
+        let launch_guard = PTY_LAUNCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (master, slave) = open_test_pty();
         master
             .resize(Size::new(24, 120))
@@ -1006,6 +1018,7 @@ impl JobControlHarness {
             .env("NO_COLOR", "1")
             .spawn(slave)
             .expect("interactive Bash should spawn on the PTY");
+        drop(launch_guard);
         let shell_sid = Pid::from_child(&shell);
         assert_eq!(getpgid(Some(shell_sid)).ok(), Some(shell_sid));
         assert_eq!(getsid(Some(shell_sid)).ok(), Some(shell_sid));
