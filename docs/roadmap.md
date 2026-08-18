@@ -105,6 +105,11 @@ sandbox. Completion requires real installed-binary PTY journeys and screenshots,
 hostile-control and signal restoration tests, bounded resize/stream/paste/queue
 tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
+The current green checkpoint implements the bounded assistant-message markup
+subset for headings, lists, quotes, inline code, fenced code, and fenced
+`diff`/`patch`. Semantic action-preview diff, tables, alternate views,
+screenshots, and final platform evidence still prevent Phase 11 completion.
+
 ## Still deferred
 
 - Web or desktop GUI

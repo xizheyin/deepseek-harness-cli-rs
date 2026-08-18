@@ -9,9 +9,11 @@ no final release candidate, Phase 11 completion claim, screenshot digest, or
 platform success yet. A production-reachable enhanced composer, inline Dock,
 truth-safe final tool cards, and joined turn receipt now exist on conservative
 terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
-11 is still partial because Markdown/diff, Inspect/Review, theme polish, the
-Session picker, installed Phase 11 acceptance, real screenshots, real-emulator
-evidence, and dual-platform CI are not complete.
+11 now also has bounded assistant-only Markdown/code/fenced-diff presentation.
+It is still partial because semantic `apply_patch` preview, tables,
+Inspect/Review, theme polish, the Session picker, installed Phase 11
+acceptance, real screenshots, real-emulator evidence, and same-candidate
+dual-platform CI are not complete.
 
 ## Frozen boundary
 
@@ -29,8 +31,9 @@ The implementation work is divided into these checkpoints:
 2. long-lived cbreak ownership, Unicode decoder/composer, history, safe paste,
    next-turn queue, bounded inline dock, enhanced approval, and resize recovery;
 3. truth-safe semantic tool cards and the joined turn receipt;
-4. Markdown/diff, Focus/Inspect/Review, themes, context, compaction, commands,
-   suggestions, and Session picker;
+4. bounded assistant markup, then semantic action-preview diff, tables,
+   Focus/Inspect/Review, themes, context, compaction, commands, suggestions,
+   and Session picker;
 5. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
@@ -182,10 +185,71 @@ safety, terminal, or UX issue in this slice.
 
 This remains a green implementation checkpoint, not Phase 11 completion. A
 locally interrupted turn still uses the already accepted signal-safe
-`stopped; skipped …` summary rather than the ordinary joined receipt.
-Markdown/diff rendering, Inspect/Review, context/compaction presentation,
-themes, Session picker, final screenshots, real-emulator capture, installed
-Phase 11 acceptance, and same-candidate macOS/Ubuntu CI remain pending.
+`stopped; skipped …` summary rather than the ordinary joined receipt. The next
+section records the bounded assistant-markup slice; semantic action-preview
+diff, tables, Inspect/Review, context/compaction presentation, themes, Session
+picker, final screenshots, real-emulator capture, installed Phase 11
+acceptance, and same-candidate macOS/Ubuntu CI remain pending.
+
+## Bounded assistant-markup slice — 2026-08-19
+
+Implementation commit
+`1ab879433d5f213eedf42ac67a074b47ad44830b` adds production-reachable semantic
+styling for assistant paragraphs, level 1–3 headings, bullet and numbered
+lists, quotes, paired single-backtick inline code, triple-backtick code fences,
+and case-insensitive `diff`/`patch` fences. The subset is intentionally small:
+tables, emphasis, links, images, and HTML are not interpreted. Real canonical
+`apply_patch` approval previews remain safely escaped Warning text rather than
+semantic diff rows.
+
+The parser receives visible-control-sanitized text and the closed presentation
+builder rejects controls a second time. Parsing is independent of Provider
+fragment boundaries. A matching authoritative assistant final may close a
+fence at EOF without a trailing line feed; retry, correction of an old stream,
+stream-key change, `StepEnd`, `TurnEnd`, or Ctrl+C instead aborts pending syntax
+as ordinary assistant text. A partial fence therefore cannot be made to look
+complete by cancellation.
+
+The implemented resource contract is:
+
+- 64 sanitized UTF-8 bytes for a line-prefix candidate;
+- 4 KiB for a complete inline-code candidate, including delimiters;
+- 32 ASCII bytes for a fence language label, restricted to alphanumerics and
+  `_+.-`;
+- 64 KiB for one complete retained fence, including delimiters and line feeds;
+- 4,096 semantic non-plain style starts per assistant stream;
+- a 96 × 1,024-item presentation-frame soft budget with 8,208 items of
+  conservative parser headroom;
+- a 768 KiB sanitized-text soft budget per presentation frame;
+- the existing 128 × 1,024-item and 1 MiB `PresentedChunk` hard limits.
+
+Inline, fence, and style-run overflow falls back to ordinary copyable text.
+Frame item/text overflow produces exactly one fixed
+`[assistant display omitted: presentation limit exceeded]` marker and suppresses
+the remaining display for that assistant block. Session facts remain intact and
+the Agent turn continues. Sanitizer expansion is measured before the visible
+output length can cross the markup soft limit, so a raw chunk made mostly of
+controls or bidi/Cf characters follows the same omission path rather than
+becoming an output failure.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64 with fake models,
+loopback HTTP, temporary workspaces, and obvious fake credentials. No real API
+key, public network request, or model billing was used. `./scripts/verify.sh`
+passed on the implementation commit: formatting, all-target checks, 651
+library tests plus 330 other tests (981 total), zero failed/ignored, Clippy with
+warnings denied, and whitespace checks. Focused evidence includes 16 markup
+tests, 23 live-renderer tests, 101 TUI tests, and 65 tests in the real-binary PTY
+target (63 journeys plus 2 harness regressions). The deterministic terminal
+model covers 44/80/112 columns under both supported history policies; enhanced
+PTY covers fragmented heading/code/diff/inline output and Ctrl+C during an open
+fence, while linear PTY preserves literal source with zero ESC bytes. Two
+independent read-only reviews found no remaining P0/P1 safety, truth, terminal,
+or integration issue.
+
+This is a green implementation checkpoint, not Phase 11 completion. Semantic
+action-preview diff, tables, alternate views, themes, Session picker,
+installed-binary acceptance, current screenshots, real-emulator capture, and
+same-candidate macOS/Ubuntu CI remain pending.
 
 ## Evidence pending
 

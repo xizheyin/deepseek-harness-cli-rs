@@ -5,9 +5,11 @@
 Phase 11 is a user-approved post-v0.1 product-quality extension. The Phase 9
 linear renderer remains the tested escape hatch. Production-reachable slices
 now add the owned composer, inline dock, one final truth-safe card per settled
-tool, and one joined turn receipt. Markdown/diff, Inspect/Review, themes,
-Session picker, installed screenshots, and the real-emulator matrix remain
-incomplete.
+tool, one joined turn receipt, and bounded assistant-only presentation for
+headings, lists, quotes, inline code, fenced code, and fenced `diff`/`patch`.
+Semantic styling for real `apply_patch` previews, tables, Inspect/Review,
+themes, Session picker, installed screenshots, and the real-emulator matrix
+remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.
@@ -445,23 +447,34 @@ Each output batch keeps the existing absolute five-second write deadline.
 
 ## Markdown, code, and diff
 
-The first implementation supports a bounded, streaming-safe subset:
+The production path supports a bounded, streaming-safe subset only for
+assistant text:
 
-- paragraphs and soft wrapping;
-- headings levels 1–3;
-- bullet and numbered lists;
-- block quotes;
-- inline code;
-- fenced code with language label;
-- simple tables that linearize below 80 columns;
-- canonical unified diff with file headers, hunks, additions, deletions, and
-  context.
+- paragraphs and terminal soft wrapping;
+- headings made from one to three `#` characters followed by a space;
+- `- `, `* `, and `+ ` bullets, plus one- to three-digit numbered markers
+  followed by `. `;
+- `> ` block quotes;
+- paired single-backtick inline code;
+- line-leading triple-backtick fences whose optional language label is at most
+  32 ASCII bytes and contains only alphanumerics or `_+.-`;
+- case-insensitive `diff` or `patch` fences with visual file-header, hunk,
+  addition, deletion, and context styles.
 
-Untrusted content is parsed into semantic spans only after terminal-control
-sanitization. Raw ANSI is never interpreted. Unterminated streaming syntax is
-displayed as ordinary text until the final authoritative message resolves it.
-Reasoning is a collapsed `Thinking · elapsed` item in Focus and expanded only
-in Inspect. Code and diff retain copyable plain text in scrollback.
+The parser does not decode HTML entities or interpret raw ANSI. Tables,
+emphasis, links, images, and HTML rendering remain unimplemented. Diff styling
+currently applies only to assistant fenced `diff`/`patch`; the real canonical
+`apply_patch` approval preview remains a safely escaped Warning block.
+
+Untrusted content is converted to visible text before parsing, and the closed
+presentation builder rejects terminal controls again. Only a matching
+authoritative assistant final may recognize a closing fence at EOF without a
+trailing line feed. A stream-key change, retry/correction boundary, `StepEnd`,
+`TurnEnd`, or cancellation aborts pending syntax and flushes it as ordinary
+assistant text; an abort never promotes incomplete output to code. Code and
+diff retain copyable source text in native scrollback. Reasoning remains plain
+bounded text in the current Focus slice; its future Inspect presentation is not
+claimed here.
 
 ## Approval
 
@@ -580,6 +593,13 @@ text never controls it and the default is off.
 | projected tool summary / Dock activity source | 4 KiB UTF-8 each |
 | final tool-card headline / detail | 256 UTF-8 bytes each |
 | receipt headline / counters / effects | 4 KiB UTF-8 each |
+| markup line-prefix candidate | 64 sanitized UTF-8 bytes |
+| complete inline-code candidate, including delimiters | 4 KiB sanitized UTF-8 |
+| fence language label | 32 ASCII bytes |
+| complete retained fence candidate, including delimiters/newlines | 64 KiB sanitized UTF-8 |
+| semantic non-plain style starts | 4,096 per assistant stream |
+| markup presentation-frame soft item budget | 96 × 1,024 items, including 8,208-item conservative headroom |
+| markup presentation-frame soft text budget | 768 KiB sanitized UTF-8 |
 | sanitized owned text / presented text | 1 MiB |
 | presented items | 128 Ki items |
 | screen transaction | 2 MiB |
@@ -595,10 +615,16 @@ text never controls it and the default is off.
 | terminal write batch | existing 8 KiB chunks and 5-second deadline |
 | poisoned visual reset | 250 ms |
 
-These UI text limits apply to source bytes before visible-control sanitizer
-expansion. Implemented input, queue, decoder, and screen limits have exact and
-one-over tests. The new card, receipt, and Dock text limits are bounded, while
-their complete exact/one-over evidence remains a release-checkpoint gate.
+Input, queue, card, receipt, and Dock limits apply to source UTF-8 bytes unless
+their row says otherwise. Markup limits explicitly apply after visible-control
+sanitization. Inline/fence/style overflow degrades to ordinary copyable text;
+frame item/text overflow emits one fixed
+`[assistant display omitted: presentation limit exceeded]` marker and suppresses
+the remainder of that assistant block's display. These are presentation-only
+decisions: they neither modify Session facts nor cancel a valid Agent turn.
+Implemented markup, input, queue, decoder, and screen limits have exact and
+one-over tests. Complete exact/one-over evidence for every card, receipt, and
+Dock field remains a release-checkpoint gate.
 Existing Session, Provider, tool, approval-preview, and terminal-output limits
 remain in force.
 
@@ -665,9 +691,14 @@ remain in force.
    lifecycle, emitted by the first non-replacement result or a turn-end unknown
    fallback; strict patch/Shell/plugin facts; and an exact Session/TurnOutcome
    receipt join.
-5. **Remaining product checkpoint**: Markdown/diff, Focus/Inspect/Review,
-   commands/suggestions, themes, context/compaction, and session picker.
-6. **Release checkpoint**: remove the replaced log renderer, installed-binary
+5. **Bounded assistant markup (green)**: fragment-independent headings, lists,
+   quotes, inline code, fenced code and fenced diff; authoritative-finish versus
+   abort semantics; visible-control safety; graceful display omission;
+   44/80/112-column terminal models; and enhanced/linear PTY evidence.
+6. **Remaining product checkpoint**: semantic `apply_patch` preview, tables,
+   Focus/Inspect/Review, commands/suggestions, themes, context/compaction, and
+   session picker.
+7. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status
    commit.

@@ -1265,10 +1265,14 @@ and inline-Dock path: long-lived cbreak, Unicode editing, safe paste, bounded
 next-turn FIFO, full-screen-scroll ownership, and directional approval. It now
 also folds each committed tool lifecycle into one truth-safe final card and
 joins committed `turn/end` with the exact `TurnOutcome` for a compact receipt.
-These terminal-specific behaviors have no upstream visual oracle, so
-`docs/compatibility.md` remains `partial`. Markdown/diff, Inspect/Review,
-installed Phase 11 evidence, screenshots, and the real-emulator/platform matrix
-must exist before any broader
+Committed assistant text now also has bounded, assistant-only presentation for
+headings, lists, quotes, inline code, fenced code, and fenced `diff`/`patch`.
+Parsing happens only after visible-control sanitization and changes no Session
+or Agent fact. The real `apply_patch` approval preview is still a safely escaped
+Warning block rather than semantic diff output. These terminal-specific
+behaviors have no upstream visual oracle, so `docs/compatibility.md` remains
+`partial`. Tables, Inspect/Review, installed Phase 11 evidence, screenshots,
+and the real-emulator/platform matrix must exist before any broader
 `intentional-difference` completion claim.
 
 The complete state, layout, safety, resource, and test design was frozen in
