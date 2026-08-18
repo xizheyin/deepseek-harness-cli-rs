@@ -1,7 +1,10 @@
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{Receiver, SyncSender, sync_channel},
+    sync::{
+        Condvar, Mutex,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -9,42 +12,94 @@ use std::{
 // Match the production provider request ceiling so a valid large-session
 // second request is not rejected by the offline fixture server first.
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_TERMINAL_TESTS: usize = 8;
+static TERMINAL_TEST_PERMITS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct TerminalTestPermit;
 
 pub struct SplitSseServer {
     pub base_url: String,
     release: Option<SyncSender<()>>,
     worker: Option<thread::JoinHandle<Option<String>>>,
+    _terminal_permit: TerminalTestPermit,
 }
 
 pub struct SequenceSseServer {
     pub base_url: String,
     worker: Option<thread::JoinHandle<Vec<String>>>,
+    _terminal_permit: TerminalTestPermit,
 }
 
 pub struct CancelThenSseServer {
     pub base_url: String,
     worker: Option<thread::JoinHandle<(Vec<String>, bool)>>,
+    _terminal_permit: TerminalTestPermit,
 }
 
 pub struct GatedFirstSseServer {
     pub base_url: String,
     release: Option<SyncSender<()>>,
     worker: Option<thread::JoinHandle<Vec<String>>>,
+    _terminal_permit: TerminalTestPermit,
 }
 
 pub struct StalledSseServer {
     pub base_url: String,
     worker: Option<thread::JoinHandle<(String, bool)>>,
+    _terminal_permit: TerminalTestPermit,
 }
 
 pub struct BacklogThenStalledSseServer {
     pub base_url: String,
     second_request_ready: Receiver<()>,
     worker: Option<thread::JoinHandle<(Vec<String>, bool)>>,
+    _terminal_permit: TerminalTestPermit,
+}
+
+fn acquire_terminal_test_permit() -> TerminalTestPermit {
+    // The fake server starts its five-second accept deadline before the PTY is
+    // created, so reserve scarce terminal capacity here rather than later in
+    // PtyHarness. This keeps real parallel coverage without exhausting the
+    // macOS CI PTY allocator.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (in_use, changed) = &TERMINAL_TEST_PERMITS;
+    let mut in_use = in_use
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *in_use >= MAX_CONCURRENT_TERMINAL_TESTS {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for a terminal test permit"
+        );
+        let (next, timeout) = changed
+            .wait_timeout(in_use, deadline.saturating_duration_since(now))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        in_use = next;
+        assert!(
+            !timeout.timed_out() || *in_use < MAX_CONCURRENT_TERMINAL_TESTS,
+            "timed out waiting for a terminal test permit"
+        );
+    }
+    *in_use += 1;
+    TerminalTestPermit
+}
+
+impl Drop for TerminalTestPermit {
+    fn drop(&mut self) {
+        let (in_use, changed) = &TERMINAL_TEST_PERMITS;
+        let mut in_use = in_use
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(*in_use > 0);
+        *in_use = in_use.saturating_sub(1);
+        changed.notify_one();
+    }
 }
 
 impl SplitSseServer {
     pub fn start(first: &'static str, second: &'static str) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
         listener
             .set_nonblocking(true)
@@ -88,6 +143,7 @@ impl SplitSseServer {
             base_url,
             release: Some(release),
             worker: Some(worker),
+            _terminal_permit: terminal_permit,
         }
     }
 
@@ -110,6 +166,7 @@ impl SplitSseServer {
 
 impl SequenceSseServer {
     pub fn start(bodies: Vec<String>) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
         listener
             .set_nonblocking(true)
@@ -141,6 +198,7 @@ impl SequenceSseServer {
         Self {
             base_url,
             worker: Some(worker),
+            _terminal_permit: terminal_permit,
         }
     }
 
@@ -155,6 +213,7 @@ impl SequenceSseServer {
 
 impl CancelThenSseServer {
     pub fn start(partial: String, completed: String) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
         listener
             .set_nonblocking(true)
@@ -213,6 +272,7 @@ impl CancelThenSseServer {
         Self {
             base_url,
             worker: Some(worker),
+            _terminal_permit: terminal_permit,
         }
     }
 
@@ -227,6 +287,7 @@ impl CancelThenSseServer {
 
 impl GatedFirstSseServer {
     pub fn start(first: String, second: String, remaining: Vec<String>) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
         listener
             .set_nonblocking(true)
@@ -291,6 +352,7 @@ impl GatedFirstSseServer {
             base_url,
             release: Some(release),
             worker: Some(worker),
+            _terminal_permit: terminal_permit,
         }
     }
 
@@ -314,6 +376,7 @@ impl GatedFirstSseServer {
 
 impl StalledSseServer {
     pub fn start(partial: String) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
         listener
             .set_nonblocking(true)
@@ -353,6 +416,7 @@ impl StalledSseServer {
         Self {
             base_url,
             worker: Some(worker),
+            _terminal_permit: terminal_permit,
         }
     }
 
@@ -367,6 +431,7 @@ impl StalledSseServer {
 
 impl BacklogThenStalledSseServer {
     pub fn start(first_response: String) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
         listener
             .set_nonblocking(true)
@@ -416,6 +481,7 @@ impl BacklogThenStalledSseServer {
             base_url,
             second_request_ready,
             worker: Some(worker),
+            _terminal_permit: terminal_permit,
         }
     }
 
