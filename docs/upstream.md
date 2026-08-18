@@ -1242,6 +1242,31 @@ Vitest 4.1.8 reported 9 files and 291 tests passed. This validates the cited
 in-process registry/schema and subprocess lifecycle facts; it does not create or
 imply an upstream NDJSON-plugin protocol.
 
+## Phase 11 inspection
+
+Phase 11 retains the Phase 7 semantic research rather than claiming a new
+terminal-visual baseline. The fixed upstream still has no built-in human TUI.
+The relevant pinned paths are ACP multi-turn/cancel/approval, Agent partial and
+final message ownership, user-approval ordering, Web conversation projection,
+running-input submission policy, approval composer takeover, and applied-diff
+models already listed under Phase 7. Those facts continue to constrain what the
+Rust UI may display or submit.
+
+On 2026-08-18, the current public Claude Code interactive, fullscreen,
+accessibility, permissions, status-line, and keybinding documentation was also
+reviewed as a product-UX benchmark. It documents multiline editing, history,
+running-input queueing, collapsible tools, transcript inspection, responsive
+approval, fullscreen virtualization, and accessible linear fallback. This is
+not part of the pinned DeepSeek Harness commit and is not a compatibility
+oracle. Rust deliberately keeps native scrollback and the existing Unix signal
+contract, supplies its own visual language, and records the resulting behavior
+as `planned` in `docs/compatibility.md`. It may become an
+`intentional-difference` only after the production and cross-platform behavior
+tests exist.
+
+The complete state, layout, safety, resource, and test design is frozen in
+`docs/design/tui-v2.md` before production implementation.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

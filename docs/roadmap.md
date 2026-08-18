@@ -1,6 +1,9 @@
 # Product Roadmap
 
-This roadmap records implementation status. Phases 0–9 remain the finite v0.1 plan; Phase 10 is an explicitly approved post-v0.1 extension. This is a plan, not a list of current product features. `README.md` remains the source for behavior that users can run today.
+This roadmap records implementation status. Phases 0–9 remain the finite v0.1
+plan; Phases 10–11 are explicitly approved post-v0.1 extensions. This is a
+plan, not a list of current product features. `README.md` remains the source
+for behavior that users can run today.
 
 | Phase | Scope | Status | Acceptance record |
 | --- | --- | --- | --- |
@@ -15,6 +18,7 @@ This roadmap records implementation status. Phases 0–9 remain the finite v0.1 
 | 8 | Local session continuity and one-pass automatic context compaction | `complete` | [`validation/phase-8.md`](validation/phase-8.md) |
 | 9 | v0.1 integration and release candidate | `complete` | [`validation/phase-9.md`](validation/phase-9.md) |
 | 10 | Bounded subprocess tool plugins and examples | `complete` | [`validation/phase-10.md`](validation/phase-10.md) |
+| 11 | TUI v2: semantic conversation UI, composer, dock, review, and accessibility | `in-progress` | [`validation/phase-11.md`](validation/phase-11.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -76,6 +80,30 @@ usability repair, not completion of this Phase 9 gate.
 Phase 10 starts only after Phase 9 is complete. It adds explicitly configured local tool-plugin executables, not Cordis/npm compatibility or a general extension framework. The first protocol stays deliberately small: bounded versioned NDJSON over stdin/stdout, targeting only `hello`, `call`, `cancel`, and `result`; stderr is bounded diagnostics. Plugin tools still pass through dsh's existing schema validation, approval, append-only intent/result recording, cancellation, timeout, and owned process cleanup.
 
 Acceptance requires two useful no-side-effect examples (`text-stats` and `json-format`) plus one protocol/cancellation fault plugin, all exercised through the real CLI. The default offline matrix must cover malformed and oversized messages, crash, timeout, cancellation, backpressure, restart/configuration, and absence of orphan processes on macOS and Ubuntu. A plugin remains a trusted local executable rather than a sandboxed capability.
+
+## Phase 11 TUI v2 boundary (2026-08-18)
+
+The user explicitly raised the post-v0.1 terminal-experience target after
+reviewing the installed Phase 9 screenshots. Phase 11 replaces the current
+developer-log presentation with a polished, quiet, and trustworthy hybrid
+inline TUI while preserving the already accepted Agent, approval, Session, and
+process-cleanup semantics.
+
+The default enhanced renderer keeps completed conversation content in native
+terminal scrollback and owns only a small dynamic dock for the composer,
+current work, and approval. It must add a semantic UI projection, one
+human-readable lifecycle per tool call, bounded Markdown/code/diff rendering,
+a Unicode multiline composer, safe bracketed paste, visible drafts/queued
+follow-ups, responsive 44/80/112-column layouts, Focus/Inspect/Review views,
+work receipts, context/compaction facts, semantic themes, and an equivalent
+plain/screen-reader path. Internal IDs and duplicated event-log lines are not a
+user interface.
+
+Phase 11 does not change the DeepSeek Harness semantic baseline, bypass
+approval, add a Web/desktop GUI, introduce background agents, or claim a
+sandbox. Completion requires real installed-binary PTY journeys and screenshots,
+hostile-control and signal restoration tests, bounded resize/stream/paste/queue
+tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 ## Still deferred
 
