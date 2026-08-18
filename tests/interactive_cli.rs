@@ -1138,7 +1138,7 @@ fn short_approval_answer_allows_one_patch_after_the_preview() {
 }
 
 #[test]
-fn fragmented_arrow_selection_requires_enter_before_it_applies_a_patch() {
+fn arrow_selection_requires_enter_before_it_applies_a_patch() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let server = SequenceSseServer::start(vec![
         tool_sse(
@@ -1156,11 +1156,7 @@ fn fragmented_arrow_selection_requires_enter_before_it_applies_a_patch() {
     dsh.expect(b"dsh > ");
     dsh.write(b"change note with the selector\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b");
-    std::thread::sleep(Duration::from_millis(5));
-    dsh.write(b"[");
-    std::thread::sleep(Duration::from_millis(5));
-    dsh.write(b"A");
+    dsh.write(b"\x1b[A");
     dsh.expect(b"[x] Allow once");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
     dsh.write(b"\r");

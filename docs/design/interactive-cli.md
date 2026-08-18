@@ -1128,10 +1128,11 @@ approval owner follow the same restore-before-exit rule.
 
 ### Phase 9 evidence and README screenshots
 
-Default PTY tests add fragmented arrow input, default-Enter Reject, explicit
-Allow, Escape/Cancel, Ctrl+C, selector-active Ctrl+Z and termination, EOF, stale
-paste, unknown sequence, output failure, zero-width fallback, and a harness-wide
-exact before/after `Termios` assertion. Styled tests also prove that only
+Selector unit tests add fragmented arrow input. Default PTY tests add arrow-key
+selection, default-Enter Reject, explicit Allow, Escape/Cancel, Ctrl+C,
+selector-active Ctrl+Z and termination, EOF, stale paste, unknown sequence,
+output failure, zero-width fallback, and a harness-wide exact before/after
+`Termios` assertion. Styled tests also prove that only
 product-owned bytes contain ANSI and that `--no-color` contains none. The
 output-failure fixture enters before cbreak; restore on an active output failure
 is additionally reviewed through the owned state machine rather than presented
