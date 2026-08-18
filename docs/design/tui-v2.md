@@ -5,11 +5,10 @@
 Phase 11 is a user-approved post-v0.1 product-quality extension. The Phase 9
 linear renderer remains the tested escape hatch. Production-reachable slices
 now add the owned composer, inline dock, one final truth-safe card per settled
-tool, one joined turn receipt, and bounded assistant-only presentation for
-headings, lists, quotes, inline code, fenced code, and fenced `diff`/`patch`.
-Semantic styling for real `apply_patch` previews, tables, Inspect/Review,
-themes, Session picker, installed screenshots, and the real-emulator matrix
-remain incomplete.
+tool, one joined turn receipt, bounded assistant-only presentation, and a
+generator-provenanced semantic preview for real `apply_patch` approvals.
+Tables, Inspect/Review, themes, Session picker, installed screenshots, and the
+real-emulator matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.
@@ -484,15 +483,27 @@ before the approval UI exists. The preview is appended once to scrollback; the
 dock then presents the decision:
 
 ```text
-? Permission required · Modify 1 file
-  src/message.txt · +1 −1
-  Writes one workspace file. No shell command.
+Approval required
+Proposed update · not applied
+  src/message.txt · +1 -1 · 1 hunk
+  One workspace file · no shell command
 
-    Allow once      ● Reject      Stop turn
-    ←/→ choose · Enter confirm · Esc stop
+--- a/src/message.txt
++++ b/src/message.txt
+@@ -1 +1 @@
+-old
++new
+
+Approval required | proposed action above
+  Allow once | apply exact preview
+> Reject | make no change
+  Stop turn | cancel work
+Not sandboxed | Reject is the safe default
+Arrow keys move | Enter confirms | Esc stops
 ```
 
-The patch tool signs this view while it builds the canonical single-file diff.
+The patch tool attaches closed provenance while it builds the canonical
+single-file diff. This is a Rust type boundary, not a cryptographic signature.
 One immutable preview string remains the source for the approval card and the
 eventual tool-result `meta.diff`; a compact, bounded row-kind vector records
 file headers, hunks, context, additions, removals, and no-newline markers.
@@ -507,9 +518,9 @@ the closed canonical-patch presentation. The row vector is aligned with every
 physical preview line and is validated before the prompt can exist. This also
 keeps hunk content such as `--- a/decoy` classified as a deletion rather than a
 file header. The enhanced presenter first makes every variable character
-terminal-visible, then applies the signed row styles without changing the
-copyable text. The linear renderer ignores the metadata and preserves its
-complete zero-ESC record.
+terminal-visible, then applies the provenance-tagged row styles without
+changing the copyable text. The linear renderer ignores the metadata and
+preserves its complete zero-ESC record.
 
 The card says **proposed** / **not applied** until a real tool result arrives.
 It shows the closed operation, path, hunk and line counts, the fact that this is
@@ -725,7 +736,7 @@ remain in force.
    quotes, inline code, fenced code and fenced diff; authoritative-finish versus
    abort semantics; visible-control safety; graceful display omission;
    44/80/112-column terminal models; and enhanced/linear PTY evidence.
-6. **Canonical patch approval (in progress)**: generator-signed, single-source
+6. **Canonical patch approval (green)**: generator-provenanced, single-source
    `apply_patch` facts; one copyable semantic diff card; unchanged linear
    record; and the existing default-Reject input fence.
 7. **Remaining product checkpoint**: tables, Focus/Inspect/Review,

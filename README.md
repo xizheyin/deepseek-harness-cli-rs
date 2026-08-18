@@ -94,7 +94,8 @@ dsh --workspace .
 **Reject**；只有当前审批中先按方向键、再单独按一次 <kbd>Enter</kbd> 才能授权。
 同一次读取里的“方向键+回车”、可打印的 `y`、粘贴、Ctrl+J 和未知转义序列都不能
 授权，<kbd>Esc</kbd> 会停止当前回合。`h/j/k/l`、Tab 和 `y/n/c` 只保留在线性兼容
-选择器中。
+选择器中。真实 `apply_patch` 还会显示 `Proposed` / `not applied`、工作区相对路径、
+`+N/-N`、hunk 数和完整语义 diff；看起来像 diff 的普通文本不会获得这种可信样式。
 
 增强界面把一次工具请求、审批和结果合并成至多一张最终卡片；普通读取、补丁、Shell
 和插件不会再各打印一串内部事件。普通回合完成时会追加 `Turn complete` 收据，其他
@@ -105,8 +106,8 @@ dsh --workspace .
 增强界面还会为 assistant 回答中的 1–3 级标题、项目/编号列表、引用、行内代码、
 围栏代码，以及标记为 `diff`/`patch` 的围栏 diff 提供语义样式。流式响应如何分块不会
 改变最终文字和样式；线性后备仍输出可复制的纯文本且不含 ESC。这是有限子集，不是完整
-Markdown：表格、强调、链接、图片和 HTML 尚未支持；真实 `apply_patch` 审批 diff 目前
-仍显示为经过安全转义的普通 Warning 文本。
+Markdown：表格、强调、链接、图片和 HTML 尚未支持；真实 `apply_patch` 审批 diff
+使用工具生成时附带的封闭行类型显示文件头、hunk、新增和删除，且不依赖文本前缀猜测。
 
 <p align="center">
   <img src="docs/assets/dsh-approval.png" alt="dsh-rs 补丁审批选择器，默认选中 Reject，可移动到 Allow once" width="1128">
@@ -223,7 +224,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
 | Phase 10 | 已完成：受限的本地子进程工具插件、两个真实示例和故障矩阵已通过双平台验收 |
-| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据和 assistant 有限 Markdown/代码/围栏 diff 已有真实路径；语义化补丁预览、Inspect/Review、截图与双平台验收未完成 |
+| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff 和真实补丁语义预览已有生产路径；Inspect/Review、截图与双平台验收未完成 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -238,7 +239,7 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
 - 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
-- Phase 11 只实现 assistant 的有限 Markdown/代码/围栏 diff；表格、语义化 `apply_patch` 预览、Focus/Inspect/Review、主题、Session picker 和最终安装版截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
+- Phase 11 只实现 assistant 的有限 Markdown/代码/围栏 diff 和真实单文件 `apply_patch` 语义预览；表格、Focus/Inspect/Review、主题、Session picker 和最终安装版截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
 - Auto 暂不在 tmux、GNU Screen、Zellij、未知终端或初始小于 44×12 的窗口启用增强界面；已进入增强模式后可缩到 12×5，继续缩小会安全恢复并退出；
 - primary-screen resize/reflow/copy 目前只有确定性终端模型和 PTY 字节证据，真实 iTerm/Terminal/VS Code 矩阵仍待完成；
 - Windows 以及未列入发布矩阵的 Unix 平台尚未支持。

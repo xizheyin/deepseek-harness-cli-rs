@@ -105,10 +105,12 @@ sandbox. Completion requires real installed-binary PTY journeys and screenshots,
 hostile-control and signal restoration tests, bounded resize/stream/paste/queue
 tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
-The current green checkpoint implements the bounded assistant-message markup
-subset for headings, lists, quotes, inline code, fenced code, and fenced
-`diff`/`patch`. Semantic action-preview diff, tables, alternate views,
-screenshots, and final platform evidence still prevent Phase 11 completion.
+The current green checkpoints implement bounded assistant-message markup plus
+a generator-provenanced semantic card for the real single-file `apply_patch`
+approval preview. The exact canonical source is still shown before the existing
+default-Reject selector, while lookalike generic text remains opaque. Tables,
+alternate views, screenshots, and final platform evidence still prevent Phase
+11 completion.
 
 ## Still deferred
 

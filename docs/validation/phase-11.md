@@ -9,11 +9,11 @@ no final release candidate, Phase 11 completion claim, screenshot digest, or
 platform success yet. A production-reachable enhanced composer, inline Dock,
 truth-safe final tool cards, and joined turn receipt now exist on conservative
 terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
-11 now also has bounded assistant-only Markdown/code/fenced-diff presentation.
-It is still partial because semantic `apply_patch` preview, tables,
-Inspect/Review, theme polish, the Session picker, installed Phase 11
-acceptance, real screenshots, real-emulator evidence, and same-candidate
-dual-platform CI are not complete.
+11 now also has bounded assistant-only Markdown/code/fenced-diff presentation
+and a generator-provenanced semantic preview for real built-in `apply_patch`
+approvals. It is still partial because tables, Inspect/Review, theme polish,
+the Session picker, installed Phase 11 acceptance, real screenshots,
+real-emulator evidence, and same-candidate dual-platform CI are not complete.
 
 ## Frozen boundary
 
@@ -31,10 +31,10 @@ The implementation work is divided into these checkpoints:
 2. long-lived cbreak ownership, Unicode decoder/composer, history, safe paste,
    next-turn queue, bounded inline dock, enhanced approval, and resize recovery;
 3. truth-safe semantic tool cards and the joined turn receipt;
-4. bounded assistant markup, then semantic action-preview diff, tables,
-   Focus/Inspect/Review, themes, context, compaction, commands, suggestions,
-   and Session picker;
-5. installed-binary PTY journey, real screenshots, clean-target repository
+4. bounded assistant markup and semantic canonical-patch approval preview;
+5. tables, Focus/Inspect/Review, themes, context, compaction, commands,
+   suggestions, and Session picker;
+6. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
 ## Semantic foundation slice — 2026-08-19
@@ -186,8 +186,8 @@ safety, terminal, or UX issue in this slice.
 This remains a green implementation checkpoint, not Phase 11 completion. A
 locally interrupted turn still uses the already accepted signal-safe
 `stopped; skipped …` summary rather than the ordinary joined receipt. The next
-section records the bounded assistant-markup slice; semantic action-preview
-diff, tables, Inspect/Review, context/compaction presentation, themes, Session
+sections record bounded assistant markup and the canonical-patch approval
+slice; tables, Inspect/Review, context/compaction presentation, themes, Session
 picker, final screenshots, real-emulator capture, installed Phase 11
 acceptance, and same-candidate macOS/Ubuntu CI remain pending.
 
@@ -246,10 +246,67 @@ fence, while linear PTY preserves literal source with zero ESC bytes. Two
 independent read-only reviews found no remaining P0/P1 safety, truth, terminal,
 or integration issue.
 
-This is a green implementation checkpoint, not Phase 11 completion. Semantic
-action-preview diff, tables, alternate views, themes, Session picker,
-installed-binary acceptance, current screenshots, real-emulator capture, and
-same-candidate macOS/Ubuntu CI remain pending.
+This is a green implementation checkpoint, not Phase 11 completion. The next
+section records the canonical-patch approval slice. Tables, alternate views,
+themes, Session picker, installed-binary acceptance, current screenshots,
+real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+
+## Canonical patch-approval slice — 2026-08-19
+
+Implementation commit
+`a06d43a9fd6175264fdb1e997fc9d0e163832f27` makes the real built-in
+`apply_patch` approval preview semantic without changing the Session schema or
+permission policy. Patch preparation now produces the canonical single-file
+diff and, at that same boundary, a bounded row-kind vector plus closed
+operation, path, hunk, addition, and removal counts. This is process-local Rust
+type provenance, not a cryptographic signature.
+
+The immutable canonical text is shared through `Arc<str>` by the prepared
+prompt, terminal request, decline result, and commit-result builders. The
+enhanced presenter therefore shows `Proposed` / `not applied`, the
+workspace-relative path, `+N/-N`, hunk count, one-file/no-Shell scope, and the
+complete copyable diff. Row styles come from the generator rather than text
+prefixes, so hunk content such as `--- a/decoy` remains a removal and
+`+++ b/decoy` remains an addition. Generic prompts created through
+`ApprovalPrompt::new` remain opaque even if their tool name and text look like
+a patch.
+
+All variable path and content text is made terminal-visible before the
+provenance-tagged row styles are applied, and the closed presentation builder
+rejects controls a second time. Debug output retains only kind, byte, row, and
+counter facts. The existing 64 KiB preview, new 4 KiB path, and at-most-64-Ki
+row-entry provenance bounds have exact/one-over coverage. A preview must be
+fully committed to `InlineScreen` before the existing quiet/flush approval
+fence can arm; build, output,
+deadline, cancellation, or terminal failure still prevents the file effect.
+Enhanced Focus hides internal call IDs for this card. Linear mode ignores the
+presentation metadata and retains the complete Phase 9 record with zero ESC.
+
+Responsive evidence covers full 44/80/112-column approval surfaces and the
+12×5/15×6 compact rescue, where `Not applied` and the default `Reject` remain
+visible. A real PTY uses header-looking hunk content, verifies header/hunk/red/
+green styles, resizes before confirmation, proves the file is unchanged until
+a later Enter, and observes each immutable diff sentinel once. Other PTY tests
+retain printable/same-read/paste/Ctrl+J rejection, bidi-visible linear output,
+output-deadline failure without a write, signals, suspension, and terminal
+restoration. The installed README and resumable release journeys now wait for
+the user-visible approval surface rather than an internal patch call ID.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64 with fake models,
+loopback HTTP, temporary workspaces, and obvious fake credentials. No real API
+key, public network request, or model billing was used. The final same-tree
+`./scripts/verify.sh` passed: formatting, all-target checks, 659 library tests
+plus 330 other tests (989 total), zero failed/ignored, Clippy with warnings
+denied, and whitespace checks. Focused evidence is green: 2
+approval-provenance tests, 8 patch-generator tests, 6 approval-join tests, 27
+live-renderer tests, 6 Dock layout tests, 19 real file-change tests, 65 tests in
+the real-binary PTY target (63 journeys plus 2 harness regressions), and all 4
+release-acceptance tests. Three independent read-only reviews found no
+remaining P0/P1 safety, UX, or integration issue.
+
+This is a green product checkpoint, not Phase 11 completion. It does not add
+multi-file patches, diff-driven permission decisions, Review mode, tables,
+themes, screenshots, or a new upstream compatibility claim.
 
 ## Evidence pending
 
