@@ -26,7 +26,8 @@ events are model-visible. Do not put unrelated secrets in those values.
 | `--list-sessions` | off | List bounded local Session headers |
 | `--resume <SESSION_ID>` | new Session | Continue one validated stored Session |
 | `--plugin-config <PATH>` | no plugins | Start the explicitly configured local tool plugins for this process |
-| `--no-color` | color when supported | Disable product-owned ANSI styling |
+| `--tui <MODE>` | `auto` | Choose `auto`, `enhanced`, or strict zero-ESC `linear` terminal presentation |
+| `--no-color` | color when supported | Disable ANSI and force the linear terminal presentation |
 
 Run `dsh --help` for exact syntax and mutually exclusive combinations.
 
@@ -38,8 +39,16 @@ Run `dsh --help` for exact syntax and mutually exclusive combinations.
 | `DEEPSEEK_BASE_URL` | Optional trusted base URL; HTTPS only, except loopback HTTP for offline tests |
 | `DSH_SESSION_ROOT` | Optional absolute Session directory override |
 | `XDG_STATE_HOME` | Linux state base when `DSH_SESSION_ROOT` is absent |
-| `NO_COLOR` | Presence disables ANSI styling |
-| `TERM=dumb` | Also selects the plain terminal presentation |
+| `NO_COLOR` | Presence disables ANSI and selects linear presentation |
+| `TERM=dumb` | Also selects the linear presentation |
+
+Auto selects the enhanced composer and inline Dock only for a colored
+`TERM=xterm*` session, with no `TMUX`, `STY`, or `ZELLIJ` marker, whose initial
+size is at least 44 columns by 12 rows. Unknown terminals, known multiplexers,
+smaller windows, and color opt-outs start in the zero-ESC linear path. Explicit
+`--tui enhanced` is the opt-in escape hatch for a known multiplexer, but it uses
+the same initial geometry gate. Once enhanced is active it has a compact 12×5
+resize rescue; below that it restores the terminal and fails closed.
 
 The HTTP client does not follow redirects and ignores system proxy settings.
 Choosing a custom HTTPS endpoint still grants that endpoint the API key and

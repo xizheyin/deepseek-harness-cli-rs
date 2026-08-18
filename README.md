@@ -30,7 +30,7 @@ TypeScript 源码的逐行翻译。
   <img src="docs/assets/dsh-overview.png" alt="dsh-rs 在终端中读取文件、展示补丁并完成修改" width="1128">
 </p>
 
-<p align="center"><sub>真实安装版 <code>dsh</code> 在 PTY 中运行；模型响应来自离线 loopback fixture，不调用真实 API，也不消耗额度。</sub></p>
+<p align="center"><sub>Phase 9 旧版滚动输出界面的真实安装证据；模型响应来自离线 loopback fixture，不调用真实 API，也不消耗额度。Phase 11 增强界面的新截图仍待最终验收生成。</sub></p>
 
 ## 快速开始
 
@@ -42,8 +42,10 @@ export DEEPSEEK_API_KEY='你的 DeepSeek API Key'
 dsh --workspace .
 ```
 
-看到彩色提示符 `❯` 后，直接输入任务并按回车；`--no-color` 模式下提示符是
-`dsh >`。例如：
+默认 `--tui auto` 会在有颜色、`xterm*`、非 tmux/Screen/Zellij 且初始窗口至少
+44×12 时启用增强界面。看到 `❯` 后直接输入任务并按回车；其他环境会保守使用
+零 ESC 的 `dsh >` 线性界面。可用 `--tui enhanced` 或 `--tui linear` 明确选择；
+`--no-color`、`NO_COLOR` 和 `TERM=dumb` 会强制线性界面。例如：
 
 ```text
 请先了解这个项目，再告诉我最值得修复的三个问题。
@@ -60,7 +62,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
 | 文件修改 | 严格的单文件 `apply_patch`，执行前展示实际 diff，并检查路径、符号链接和并发修改 |
 | 命令执行 | 经审批的前台 `bash`，限制输出和运行时间，并在正常可观察路径下终止、回收同进程组工作 |
-| 交互控制 | 多轮对话、实时状态、审批、Ctrl+C 取消当前回合，以及干净的 EOF/暂停处理 |
+| 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、审批、Ctrl+C 取消，以及严格线性后备 |
 | 脚本模式 | `--prompt` 或管道输入；不会停下来等待审批，并安全拒绝写文件或 Shell 请求 |
 | 长会话 | 有上限的本地 JSONL、会话列表与恢复，以及一次有界的自动上下文摘要 |
 | 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
@@ -73,21 +75,32 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 dsh --workspace .
 ```
 
+增强界面提供下面的 Composer 编辑键；若自动回退到线性兼容界面，则按终端的普通
+整行输入方式操作。
+
 | 输入 | 行为 |
 | --- | --- |
 | `/help` | 显示会话内帮助 |
 | `/exit` 或 `/quit` | 等待清理后退出 |
+| <kbd>Enter</kbd> | 空闲时发送；当前回合运行时加入下一回合 FIFO |
+| <kbd>Ctrl</kbd> + <kbd>J</kbd> | 在增强 Composer 中插入换行 |
+| 方向键、Home/End、Backspace/Delete | 按 Unicode 字素编辑；上下方向在边界浏览本进程已提交历史 |
+| <kbd>Ctrl</kbd> + <kbd>R</kbd> / <kbd>Ctrl</kbd> + <kbd>_</kbd> | 反向搜索历史 / 撤销；Ctrl+Z 保留给暂停 |
 | <kbd>Ctrl</kbd> + <kbd>C</kbd> | 取消当前回合，清理完成后继续当前会话 |
 | <kbd>Ctrl</kbd> + <kbd>D</kbd> | 安全结束会话 |
 | <kbd>Ctrl</kbd> + <kbd>Z</kbd> | 先清理当前回合再暂停；回到 Shell 后可用 `fg` 恢复 |
 
-文件修改或 Shell 执行前会显示完整预览和三项选择器。用方向键、`h/j/k/l`、
-<kbd>Tab</kbd> 或 `y/n/c` 移动选择，按 <kbd>Enter</kbd> 确认；默认选中
-**Reject**，按 <kbd>Esc</kbd> 取消。
+文件修改、Shell 或插件执行前会显示完整预览和三项选择器。增强界面默认选中
+**Reject**；只有当前审批中先按方向键、再单独按一次 <kbd>Enter</kbd> 才能授权。
+同一次读取里的“方向键+回车”、可打印的 `y`、粘贴、Ctrl+J 和未知转义序列都不能
+授权，<kbd>Esc</kbd> 会停止当前回合。`h/j/k/l`、Tab 和 `y/n/c` 只保留在线性兼容
+选择器中。
 
 <p align="center">
   <img src="docs/assets/dsh-approval.png" alt="dsh-rs 补丁审批选择器，默认选中 Reject，可移动到 Allow once" width="1128">
 </p>
+
+<p align="center"><sub>这也是 Phase 9 旧版选择器截图；Phase 11 增强审批截图将在安装版截图门禁完成后替换。</sub></p>
 
 ### 一次性脚本调用
 
@@ -106,7 +119,7 @@ dsh --help
 ```
 
 主要参数包括 `--workspace`、`--model`、`--prompt`、`--list-sessions`、
-`--resume`、`--plugin-config` 和 `--no-color`。
+`--resume`、`--plugin-config`、`--tui` 和 `--no-color`。
 
 ### 配置
 
@@ -119,7 +132,7 @@ dsh --help
 | `DEEPSEEK_BASE_URL` | 可选的可信 API 地址；只允许 HTTPS，离线测试可用环回 HTTP |
 | `DSH_SESSION_ROOT` | 可选的绝对会话目录，适合测试或运维隔离 |
 | `XDG_STATE_HOME` | Linux 未设置会话目录覆盖时的状态目录基准 |
-| `NO_COLOR` | 存在即关闭颜色；`TERM=dumb` 和 `--no-color` 也会关闭颜色 |
+| `NO_COLOR` | 存在即关闭颜色并选择线性界面；`TERM=dumb` 和 `--no-color` 同样如此 |
 
 默认会话目录是 macOS 的 `~/Library/Application Support/dsh/sessions`，以及 Linux
 的 `$XDG_STATE_HOME/dsh/sessions`；未设置 `XDG_STATE_HOME` 时使用
@@ -198,6 +211,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
 | Phase 10 | 已完成：受限的本地子进程工具插件、两个真实示例和故障矩阵已通过双平台验收 |
+| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock 和增强审批已有真实路径；产品卡片/视图、截图与双平台验收未完成 |
 
 当前候选已通过本地 macOS arm64 验收，以及 GitHub-hosted `macos-14` arm64 和
 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件安装版旅程。Windows
@@ -211,6 +225,9 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 - `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
 - 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
+- Phase 11 增强界面尚无 Markdown/diff 专用渲染、Focus/Inspect/Review、主题、Session picker 或最终安装版截图；
+- Auto 暂不在 tmux、GNU Screen、Zellij、未知终端或初始小于 44×12 的窗口启用增强界面；已进入增强模式后可缩到 12×5，继续缩小会安全恢复并退出；
+- primary-screen resize/reflow/copy 目前只有确定性终端模型和 PTY 字节证据，真实 iTerm/Terminal/VS Code 矩阵仍待完成；
 - Windows 以及未列入发布矩阵的 Unix 平台尚未支持。
 
 查看完整的 [Roadmap](docs/roadmap.md) 和逐项的

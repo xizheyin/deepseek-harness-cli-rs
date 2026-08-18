@@ -1259,16 +1259,18 @@ running-input queueing, collapsible tools, transcript inspection, responsive
 approval, fullscreen virtualization, and accessible linear fallback. This is
 not part of the pinned DeepSeek Harness commit and is not a compatibility
 oracle. Rust deliberately keeps native scrollback and the existing Unix signal
-contract and supplies its own visual language. The first partial semantic
-substrate now projects bounded committed facts and correlates tool, approval,
-result, compaction, usage, and prune-replacement state behind the unchanged
-Phase 9 renderer. `docs/compatibility.md` therefore records `partial`, not a
-shipped TUI. It may become an `intentional-difference` only after the complete
-production renderer, input path, installed journey, and cross-platform behavior
-tests exist.
+contract and supplies its own visual language. The partial implementation now
+projects bounded committed facts and has a production-reachable enhanced input
+and inline-Dock path: long-lived cbreak, Unicode editing, safe paste, bounded
+next-turn FIFO, full-screen-scroll ownership, and directional approval. This
+terminal-specific behavior has no upstream visual oracle, so
+`docs/compatibility.md` remains `partial`. Semantic tool cards/receipts,
+Markdown/diff, Inspect/Review, installed Phase 11 evidence, screenshots, and
+the real-emulator/platform matrix must exist before any broader
+`intentional-difference` completion claim.
 
-The complete state, layout, safety, resource, and test design is frozen in
-`docs/design/tui-v2.md` before production implementation.
+The complete state, layout, safety, resource, and test design was frozen in
+`docs/design/tui-v2.md` before the production slices began.
 
 ## Local research copy
 

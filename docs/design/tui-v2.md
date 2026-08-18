@@ -2,11 +2,14 @@
 
 ## Status and decision
 
-Phase 11 is a user-approved post-v0.1 product-quality extension. The current
-Phase 9 renderer is safe and tested, but its output is a colored stream of
-Session events rather than a coherent conversation interface. Phase 11 keeps
-the accepted Agent, Session, approval, cancellation, and process semantics and
-replaces only their interactive presentation and input ownership.
+Phase 11 is a user-approved post-v0.1 product-quality extension. The Phase 9
+linear renderer remains the tested escape hatch. A production-reachable first
+enhanced slice now adds the owned composer and inline dock described below,
+while tool cards, receipts, Markdown/diff, Inspect/Review, themes, Session
+picker, installed screenshots, and the real-emulator matrix remain incomplete.
+Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
+approval, cancellation, and process semantics and replaces only their
+interactive presentation and input ownership.
 
 The primary design is a **hybrid inline TUI**:
 
@@ -19,12 +22,17 @@ small dynamic dock:         composer, current activity, queued prompts,
 ```
 
 The default Focus path does not use the alternate screen. Native selection,
-search, copy, tmux scrollback, and ordinary terminal history remain available.
+search, copy, and ordinary terminal history remain available on the verified
+primary-screen profiles. Auto mode conservatively avoids tmux, GNU Screen, and
+Zellij; users may explicitly request enhanced mode there, but no cross-emulator
+scrollback guarantee is claimed yet.
 Inspect, Review, and the startup Session picker may enter a temporary
 alternate-screen workspace only after an explicit user command; leaving it
 restores the inline transcript and draft. A bounded plain renderer remains
 authoritative for `--tui linear`, `--no-color`, `NO_COLOR`, `TERM=dumb`,
-non-TTY output, and screen-reader use.
+non-TTY output, and screen-reader use. `--tui auto` selects enhanced only for a
+colored `xterm*` profile with no known multiplexer and an initial size of at
+least 44 columns by 12 rows; every other profile starts in linear mode.
 
 ## Evidence and comparison boundary
 
@@ -214,8 +222,11 @@ and uses text changes only.
   Enter queue · Ctrl+C stop
 ```
 
-Below 44 columns or 12 rows, the enhanced dock falls back to the linear plain
-presentation rather than hiding approval or corrupting cursor accounting.
+An initial terminal below 44 columns or 12 rows starts in the linear plain
+presentation. Once enhanced mode owns the terminal, a resize down to 12×5 uses
+a four-row compact rescue dock so drafts and approvals remain visible. A resize
+below 12×5 clears uncertain geometry, restores the terminal, and fails closed;
+switching a live cbreak session into canonical linear input is not guessed.
 
 ## User-facing state
 
@@ -354,8 +365,9 @@ approval key can count.
 The composer supports:
 
 - UTF-8 assembly across reads and grapheme-safe cursor/delete operations;
-- Left/Right, Home/End, Ctrl+A/E, Backspace/Delete, Ctrl+W/U/K, undo, and bounded
-  yank;
+- Left/Right, Home/End, Ctrl+A/E, Backspace/Delete, Ctrl+W/U/K, `Ctrl+_`
+  undo, and bounded yank. `Ctrl+Z` remains the kernel suspend character and is
+  never reused for undo;
 - Up/Down bounded in-session history when the cursor cannot move vertically;
 - Ctrl+R bounded reverse history search;
 - Ctrl+J or Shift+Enter where the terminal reports it for a newline; Enter for
@@ -382,8 +394,10 @@ or shutdown never sends them automatically; they remain visible until the
 process can safely offer editing again, otherwise they disappear with process
 memory and were never recorded as user messages.
 
-Prompt history is derived from current/resumed Session user messages and kept
-only in bounded process memory. Phase 11 writes no separate history file.
+Prompt history currently records committed human prompts observed by this
+process and keeps them only in bounded memory. Rebuilding it from a resumed
+Session snapshot is still part of the later Session-picker/history slice.
+Phase 11 writes no separate history file.
 
 Attaching the UI returns a `UiFeed` with a bounded initial snapshot plus the
 live receiver. A new Session has an empty snapshot. A resumed Session rebuilds
@@ -396,17 +410,32 @@ messages without a separately bounded journal scan.
 
 ## Scrollback and dock rendering
 
-Completed transcript blocks are appended exactly once. Dynamic content is
-limited to the bottom dock. The renderer records the previous dock row count,
-moves only within that owned region, clears each owned row, writes a complete
-replacement, and restores the logical composer cursor. It never guesses a
-fixed `CursorUp(5)`.
+Completed transcript blocks are appended exactly once through structured
+`PresentedChunk` runs. `InlineScreen` is the sole cursor owner: the primary
+screen always uses full-screen scrolling (`CSI r`, never a partial DECSTBM), a
+fixed-height dock occupies the bottom rows, and the composer uses a software
+cursor. Initial attachment emits `dock_rows + 1` full-screen line feeds so the
+pre-existing bottom of the terminal moves into native history instead of being
+overwritten. Input-only redraws clear and replace only the owned dock and never
+replay transcript text.
 
-`SIGWINCH` or a detected winsize change invalidates layout. The renderer first
-clears the old owned dock conservatively, recomputes Unicode display widths,
-reflows the new dock, and redraws without re-appending committed transcript.
-If the width/height is zero or below the enhanced minimum, it switches to the
-linear renderer. Resize cannot decide an approval or submit a prompt.
+Each coordinate batch is staged against one ledger generation and committed
+only after the whole write succeeds. A zero-byte resize can be restaged. A
+partially written coordinate batch poisons the ledger; the driver then clears
+the uncertain visible viewport with ED2, keeps bracketed paste enabled during
+in-process recovery, establishes a fresh transcript boundary, and redraws the
+dock. Suspend and exit use a separate reset that disables paste and shows the
+real cursor before restoring termios. Clearing the viewport is an intentional
+failure-path tradeoff: it prevents a partial private draft or approval from
+being scrolled into history, while committed facts remain in Session.
+
+`SIGWINCH` or a detected winsize change recomputes Unicode display widths and
+starts a fresh transcript boundary; it does not claim that an unfinished
+physical line can be portably reflowed after the emulator has already resized.
+The small deterministic terminal model covers full-screen-only and
+top-anchored history policies, while real xterm/iTerm/Terminal/VS Code shrink,
+reflow, and copy behavior remains a release-checkpoint matrix. Resize cannot
+decide an approval or submit a prompt.
 
 Ordinary stream refresh is capped at 30 frames/second, spinner animation at
 8 frames/second, and idle mode has no periodic wake. Input, signal, approval,
@@ -512,15 +541,18 @@ text never controls it and the default is off.
 - `CommittedUiEvent` remains the live fact boundary.
 - Model, tool, path, diff, error, queue, and Session text pass through the
   existing visible-control sanitizer before layout.
-- ANSI is produced only by a closed `TerminalCommand` enum; no untrusted value
-  becomes a cursor count, SGR parameter, OSC payload, or terminal query.
+- Untrusted text becomes sanitized `PresentedChunk` items with closed
+  `TextStyle` roles. Only `InlineScreen` serializes fixed cursor/clear/SGR
+  commands; no untrusted value becomes a cursor count, SGR parameter, OSC
+  payload, or terminal query.
 - Entering enhanced mode flushes stale input and enables bracketed paste only
   after exact termios capture. Leaving or suspending disables paste, leaves any
   optional alternate screen, and restores termios in that order, including
   panic/unwind best effort.
 - Ctrl+C/Z and terminating signals preserve the existing tools-first cleanup
   and Session shutdown order.
-- A partially written frame is discarded visually; it does not roll back or
+- A partially written coordinate frame poisons the screen ledger and is
+  recovered with the bounded ED2 path above; it does not roll back, replay, or
   fabricate a Session fact.
 - Output failure, resize, and unknown input fail closed. They cannot authorize
   or start a side effect.
@@ -530,9 +562,18 @@ text never controls it and the default is off.
 | Resource | Limit |
 | --- | ---: |
 | composer prompt | 64 KiB UTF-8 |
+| undo history | 128 inverse edits and 1 MiB deleted payload |
+| yank buffer | 64 KiB UTF-8 |
 | queue items | 8 |
+| one queued prompt | 64 KiB UTF-8 |
 | queued prompt aggregate | 256 KiB |
 | in-memory prompt history | 128 entries and 1 MiB |
+| bracketed paste | 64 KiB UTF-8 |
+| CSI sequence | 32 bytes |
+| sanitized owned text / presented text | 1 MiB |
+| presented items | 128 Ki items |
+| screen transaction | 2 MiB |
+| retained split grapheme | 1 KiB |
 | visible suggestion rows | 12 |
 | file suggestion candidates | 256 |
 | dynamic dock | 24 rows |
@@ -540,7 +581,9 @@ text never controls it and the default is off.
 | ordinary refresh | 30 FPS |
 | animation refresh | 8 FPS |
 | enhanced minimum | 44 columns × 12 rows |
+| already-enhanced compact rescue | 12 columns × 5 rows |
 | terminal write batch | existing 8 KiB chunks and 5-second deadline |
+| poisoned visual reset | 250 ms |
 
 Every count and byte limit receives exact and one-over tests. Existing Session,
 Provider, tool, approval-preview, and terminal-output limits remain in force.
@@ -596,18 +639,19 @@ Provider, tool, approval-preview, and terminal-output limits remain in force.
 
 ## Implementation checkpoints
 
-1. **Design checkpoint**: this document, roadmap/compatibility/upstream status,
-   state tables, wireframes, and the frozen semantic/input red-test inventory.
-2. **Semantic checkpoint**: `src/tui` reducer, semantic presentation, tool
-   lifecycle, work receipt, and plain golden renderer while old UI remains the
-   production enhanced path.
-3. **Composer checkpoint**: owned long-lived cbreak, decoder, Unicode editing,
-   history, paste, queue, exact restoration, and PTY failures.
-4. **Dock checkpoint**: scrollback commit, dynamic redraw, resize, throttling,
-   contextual hints, and responsive layouts.
-5. **Product checkpoint**: Markdown/diff, approval, Focus/Inspect/Review,
+1. **Design checkpoint (green)**: this document, roadmap/compatibility/upstream
+   status, state tables, wireframes, and the frozen red-test inventory.
+2. **Semantic foundation (green)**: bounded committed UI facts, reducer,
+   correlation, truth-safe metadata, and fail-open shadow observation. The
+   receipt and final tool-card renderer remain Product work.
+3. **Composer + inline Dock (green)**: owned long-lived cbreak, decoder,
+   Unicode editing, current-process history, paste fences, FIFO, full-screen
+   scroll ledger, compact layouts, enhanced approval, exact restoration, and
+   PTY failures. This is the first production enhanced path.
+4. **Product checkpoint**: semantic tool cards/receipt, Markdown/diff,
+   Focus/Inspect/Review,
    commands/suggestions, themes, context/compaction, and session picker.
-6. **Release checkpoint**: remove the replaced log renderer, installed-binary
+5. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status
    commit.
