@@ -1,5 +1,6 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum UiRole {
+    User,
     Assistant,
     Reasoning,
     Tool,
@@ -24,6 +25,7 @@ impl UiTheme {
 
     pub(super) const fn role_prefix(self, role: UiRole) -> &'static str {
         match (self, role) {
+            (Self::Plain, UiRole::User) => "you | ",
             (Self::Plain, UiRole::Assistant) => "assistant | ",
             (Self::Plain, UiRole::Reasoning) => "reasoning | ",
             (Self::Plain, UiRole::Tool) => "tool | ",
@@ -33,6 +35,7 @@ impl UiTheme {
             (Self::Plain, UiRole::Preview) => "preview | ",
             (Self::Plain, UiRole::Dsh) => "dsh | ",
             (Self::Plain, UiRole::Error) => "error | ",
+            (Self::Color, UiRole::User) => "\x1b[1;35m◆ you\x1b[0m  ",
             (Self::Color, UiRole::Assistant) => "\x1b[1;36m◆ dsh\x1b[0m  ",
             (Self::Color, UiRole::Reasoning) => "\x1b[2m  Thinking\x1b[0m  ",
             (Self::Color, UiRole::Tool) => "\x1b[35m  › tool\x1b[0m  ",
@@ -90,6 +93,7 @@ mod tests {
     #[test]
     fn plain_theme_contains_no_terminal_escape_sequences() {
         for role in [
+            UiRole::User,
             UiRole::Assistant,
             UiRole::Reasoning,
             UiRole::Tool,

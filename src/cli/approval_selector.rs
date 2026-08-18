@@ -1,6 +1,9 @@
-use std::{fmt::Write as _, time::Duration};
+use std::{fmt::Write as _, ops::ControlFlow, time::Duration};
 
-use crate::session::ApprovalOutcome;
+use crate::{
+    session::ApprovalOutcome,
+    tui::key_decoder::{InputError, InputEvent, Key, KeyDecoder},
+};
 
 use super::{
     approval::{ApprovalAnswer, parse_approval_answer},
@@ -14,6 +17,12 @@ pub(super) enum ApprovalSelection {
     AllowOnce,
     Reject,
     Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ApprovalInputProfile {
+    LinearRecord,
+    EnhancedDirectional,
 }
 
 impl ApprovalSelection {
@@ -43,13 +52,6 @@ impl ApprovalSelection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EscapeState {
-    None,
-    Escape,
-    ControlSequence,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelectorUpdate {
     None,
     Redraw,
@@ -63,24 +65,35 @@ pub(super) struct SelectorRenderError;
 
 pub(super) struct ApprovalSelector {
     selected: ApprovalSelection,
+    profile: ApprovalInputProfile,
     record: [u8; MAX_APPROVAL_RECORD_BYTES],
     record_len: usize,
-    escape: EscapeState,
+    decoder: KeyDecoder,
+    feed_serial: u64,
+    allow_focus_serial: Option<u64>,
+    draining_rejected_sequence: bool,
+    draining_rejected_paste: bool,
 }
 
 impl ApprovalSelector {
-    pub(super) const fn new() -> Self {
-        Self {
+    pub(super) fn new(profile: ApprovalInputProfile) -> Result<Self, InputError> {
+        let mut decoder = KeyDecoder::default();
+        decoder.reset_epoch()?;
+        Ok(Self {
             // Enter must be safe even if a stale byte crosses the input fence.
             selected: ApprovalSelection::Reject,
+            profile,
             record: [0; MAX_APPROVAL_RECORD_BYTES],
             record_len: 0,
-            escape: EscapeState::None,
-        }
+            decoder,
+            feed_serial: 0,
+            allow_focus_serial: None,
+            draining_rejected_sequence: false,
+            draining_rejected_paste: false,
+        })
     }
 
-    #[cfg(test)]
-    const fn selected(&self) -> ApprovalSelection {
+    pub(super) const fn selected(&self) -> ApprovalSelection {
         self.selected
     }
 
@@ -140,13 +153,12 @@ impl ApprovalSelector {
         Ok(output)
     }
 
-    pub(super) const fn escape_is_pending(&self) -> bool {
-        !matches!(self.escape, EscapeState::None)
+    pub(super) fn escape_is_pending(&self) -> bool {
+        self.decoder.escape_pending()
     }
 
     pub(super) fn expire_escape(&mut self) -> SelectorUpdate {
-        if self.escape_is_pending() {
-            self.escape = EscapeState::None;
+        if self.decoder.expire_escape().is_some() {
             self.record_len = 0;
             SelectorUpdate::Decide(ApprovalOutcome::Cancelled)
         } else {
@@ -155,12 +167,19 @@ impl ApprovalSelector {
     }
 
     pub(super) fn feed(&mut self, bytes: &[u8], challenge: uuid::Uuid) -> SelectorUpdate {
+        let Some(feed_serial) = self.feed_serial.checked_add(1) else {
+            return SelectorUpdate::Invalid;
+        };
+        self.feed_serial = feed_serial;
         let mut redraw = false;
-        for &byte in bytes {
-            let update = match self.escape {
-                EscapeState::Escape => self.feed_after_escape(byte),
-                EscapeState::ControlSequence => self.feed_control_sequence(byte),
-                EscapeState::None => self.feed_plain(byte, challenge),
+        let mut final_update = None;
+        let mut decoder = std::mem::take(&mut self.decoder);
+        let expected_epoch = decoder.epoch();
+        let _ = decoder.feed(bytes, |decoded| {
+            let update = if decoded.epoch == expected_epoch {
+                self.feed_event(decoded.event, challenge)
+            } else {
+                SelectorUpdate::Invalid
             };
             match update {
                 SelectorUpdate::None => {}
@@ -168,84 +187,129 @@ impl ApprovalSelector {
                 decision @ (SelectorUpdate::Decide(_)
                 | SelectorUpdate::Eof
                 | SelectorUpdate::Invalid) => {
-                    return decision;
+                    final_update = Some(decision);
+                    return ControlFlow::Break(());
                 }
             }
-        }
-        if redraw {
+            ControlFlow::Continue(())
+        });
+        self.decoder = decoder;
+        if let Some(update) = final_update {
+            update
+        } else if redraw {
             SelectorUpdate::Redraw
         } else {
             SelectorUpdate::None
         }
     }
 
-    fn feed_after_escape(&mut self, byte: u8) -> SelectorUpdate {
-        if byte == b'[' || byte == b'O' {
-            self.escape = EscapeState::ControlSequence;
-            SelectorUpdate::None
-        } else {
-            self.escape = EscapeState::None;
-            self.record_len = 0;
-            SelectorUpdate::Decide(ApprovalOutcome::Cancelled)
-        }
-    }
-
-    fn feed_control_sequence(&mut self, byte: u8) -> SelectorUpdate {
-        self.escape = EscapeState::None;
-        if self.record_len != 0 {
-            self.record_len = 0;
-            return SelectorUpdate::Invalid;
-        }
-        match byte {
-            b'A' | b'D' | b'Z' => {
-                self.selected = self.selected.previous();
+    fn feed_event(&mut self, event: InputEvent, challenge: uuid::Uuid) -> SelectorUpdate {
+        match event {
+            InputEvent::Key(Key::Escape) => {
+                self.record_len = 0;
+                SelectorUpdate::Decide(ApprovalOutcome::Cancelled)
+            }
+            InputEvent::Key(Key::Enter) => self.confirm(challenge),
+            InputEvent::Key(Key::Newline) if self.profile == ApprovalInputProfile::LinearRecord => {
+                self.confirm(challenge)
+            }
+            InputEvent::Key(Key::Eof) => SelectorUpdate::Eof,
+            InputEvent::Key(Key::Tab)
+                if self.profile == ApprovalInputProfile::LinearRecord && self.record_len == 0 =>
+            {
+                self.select(self.selected.next());
                 SelectorUpdate::Redraw
             }
-            b'B' | b'C' => {
-                self.selected = self.selected.next();
+            InputEvent::Key(Key::Up | Key::Left) if self.record_len == 0 => {
+                self.select(self.selected.previous());
                 SelectorUpdate::Redraw
             }
-            // Reject bracketed paste, modifier sequences, and every unknown
-            // terminal sequence before any later pasted byte can authorize.
-            _ => SelectorUpdate::Invalid,
-        }
-    }
-
-    fn feed_plain(&mut self, byte: u8, challenge: uuid::Uuid) -> SelectorUpdate {
-        match byte {
-            0x1b => {
-                self.escape = EscapeState::Escape;
-                SelectorUpdate::None
-            }
-            b'\n' | b'\r' => self.confirm(challenge),
-            0x04 => SelectorUpdate::Eof,
-            b'\t' if self.record_len == 0 => {
-                self.selected = self.selected.next();
+            InputEvent::Key(Key::Down | Key::Right) if self.record_len == 0 => {
+                self.select(self.selected.next());
                 SelectorUpdate::Redraw
             }
-            b'h' | b'k' if self.record_len == 0 => {
-                self.selected = self.selected.previous();
+            InputEvent::Key(Key::BackTab)
+                if self.profile == ApprovalInputProfile::LinearRecord && self.record_len == 0 =>
+            {
+                self.select(self.selected.previous());
                 SelectorUpdate::Redraw
             }
-            b'j' | b'l' if self.record_len == 0 => {
-                self.selected = self.selected.next();
+            InputEvent::Key(Key::Char('h' | 'k')) if self.record_len == 0 => {
+                if self.profile == ApprovalInputProfile::EnhancedDirectional {
+                    return SelectorUpdate::Invalid;
+                }
+                self.select(self.selected.previous());
                 SelectorUpdate::Redraw
             }
-            0x08 | 0x7f if self.record_len != 0 => {
+            InputEvent::Key(Key::Char('j' | 'l')) if self.record_len == 0 => {
+                if self.profile == ApprovalInputProfile::EnhancedDirectional {
+                    return SelectorUpdate::Invalid;
+                }
+                self.select(self.selected.next());
+                SelectorUpdate::Redraw
+            }
+            InputEvent::Key(Key::Backspace) if self.record_len != 0 => {
                 self.record_len -= 1;
                 self.update_shortcut_selection()
             }
-            byte if byte.is_ascii_graphic() || byte == b' ' => {
+            InputEvent::Key(Key::Char(character))
+                if character.is_ascii_graphic() || character == ' ' =>
+            {
+                if self.profile == ApprovalInputProfile::EnhancedDirectional {
+                    return SelectorUpdate::Invalid;
+                }
                 if self.record_len == self.record.len() {
                     self.record_len = 0;
                     return SelectorUpdate::Invalid;
                 }
-                self.record[self.record_len] = byte;
+                self.record[self.record_len] = character as u8;
                 self.record_len += 1;
                 self.update_shortcut_selection()
             }
+            // A paste is rejected only after its closing marker. Staying in
+            // the decoder's Paste state prevents a fragmented tail from being
+            // reinterpreted as arrows or Enter after the modal is re-armed.
+            InputEvent::PasteStarted => {
+                self.draining_rejected_paste = true;
+                SelectorUpdate::None
+            }
+            InputEvent::Paste(_) if self.draining_rejected_paste => {
+                self.draining_rejected_paste = false;
+                self.record_len = 0;
+                SelectorUpdate::Invalid
+            }
+            InputEvent::PasteRejected(_) if self.draining_rejected_paste => {
+                self.draining_rejected_paste = false;
+                self.record_len = 0;
+                SelectorUpdate::Invalid
+            }
+            InputEvent::Rejected(InputError::SequenceTooLong) => {
+                if self.draining_rejected_sequence {
+                    self.draining_rejected_sequence = false;
+                    self.record_len = 0;
+                    SelectorUpdate::Invalid
+                } else {
+                    self.draining_rejected_sequence = true;
+                    SelectorUpdate::None
+                }
+            }
+            InputEvent::Rejected(_) if self.draining_rejected_paste => {
+                self.draining_rejected_paste = false;
+                self.record_len = 0;
+                SelectorUpdate::Invalid
+            }
+            InputEvent::Paste(_) | InputEvent::PasteRejected(_) | InputEvent::Rejected(_) => {
+                self.record_len = 0;
+                SelectorUpdate::Invalid
+            }
             _ => SelectorUpdate::Invalid,
         }
+    }
+
+    fn select(&mut self, selected: ApprovalSelection) {
+        self.selected = selected;
+        self.allow_focus_serial =
+            (selected == ApprovalSelection::AllowOnce).then_some(self.feed_serial);
     }
 
     fn update_shortcut_selection(&mut self) -> SelectorUpdate {
@@ -257,7 +321,7 @@ impl ApprovalSelector {
         };
         if let Some(selected) = selected {
             let changed = self.selected != selected;
-            self.selected = selected;
+            self.select(selected);
             if changed {
                 return SelectorUpdate::Redraw;
             }
@@ -266,8 +330,16 @@ impl ApprovalSelector {
     }
 
     fn confirm(&mut self, challenge: uuid::Uuid) -> SelectorUpdate {
-        self.escape = EscapeState::None;
         if self.record_len == 0 {
+            if self.profile == ApprovalInputProfile::EnhancedDirectional
+                && self.selected == ApprovalSelection::AllowOnce
+                && self
+                    .allow_focus_serial
+                    .is_none_or(|serial| serial >= self.feed_serial)
+            {
+                self.select(ApprovalSelection::Reject);
+                return SelectorUpdate::Invalid;
+            }
             return SelectorUpdate::Decide(self.selected.outcome());
         }
         let record = std::str::from_utf8(&self.record[..self.record_len]);
@@ -295,16 +367,20 @@ fn push_selector_line(
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalSelection, ApprovalSelector, SelectorUpdate};
+    use super::{ApprovalInputProfile, ApprovalSelection, ApprovalSelector, SelectorUpdate};
     use crate::session::ApprovalOutcome;
 
     fn challenge() -> uuid::Uuid {
         uuid::Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap()
     }
 
+    fn linear_selector() -> ApprovalSelector {
+        ApprovalSelector::new(ApprovalInputProfile::LinearRecord).unwrap()
+    }
+
     #[test]
     fn reject_is_the_safe_default_and_enter_is_the_only_confirmation() {
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(selector.selected(), ApprovalSelection::Reject);
         assert_eq!(selector.feed(b"y", challenge()), SelectorUpdate::Redraw);
         assert_eq!(selector.selected(), ApprovalSelection::AllowOnce);
@@ -313,7 +389,7 @@ mod tests {
             SelectorUpdate::Decide(ApprovalOutcome::AllowedOnce)
         );
 
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(
             selector.feed(b"\n", challenge()),
             SelectorUpdate::Decide(ApprovalOutcome::Rejected)
@@ -322,7 +398,7 @@ mod tests {
 
     #[test]
     fn fragmented_arrows_tab_and_vim_keys_move_without_authorizing() {
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(selector.feed(b"\x1b", challenge()), SelectorUpdate::None);
         assert!(selector.escape_is_pending());
         assert_eq!(selector.feed(b"[", challenge()), SelectorUpdate::None);
@@ -347,36 +423,49 @@ mod tests {
 
     #[test]
     fn isolated_escape_cancels_and_unknown_sequences_fail_closed() {
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(selector.feed(b"\x1b", challenge()), SelectorUpdate::None);
         assert_eq!(
             selector.expire_escape(),
             SelectorUpdate::Decide(ApprovalOutcome::Cancelled)
         );
 
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(
-            selector.feed(b"\x1b[200~y\n", challenge()),
+            selector.feed(b"\x1b[200~y\n\x1b[201~", challenge()),
             SelectorUpdate::Invalid
         );
         assert_eq!(selector.selected(), ApprovalSelection::Reject);
+
+        let mut selector = linear_selector();
+        assert_eq!(
+            selector.feed(b"\x1b[999~\x1b[C\r", challenge()),
+            SelectorUpdate::Invalid
+        );
+        assert_eq!(selector.selected(), ApprovalSelection::Reject);
+
+        let mut selector = linear_selector();
+        assert_eq!(
+            selector.feed(b"\x1by\r", challenge()),
+            SelectorUpdate::Decide(ApprovalOutcome::Cancelled)
+        );
     }
 
     #[test]
     fn ctrl_d_remains_an_explicit_eof_in_cbreak_mode() {
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(selector.feed(&[0x04], challenge()), SelectorUpdate::Eof);
     }
 
     #[test]
     fn exact_automation_records_remain_bounded_and_correlated() {
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(
             selector.feed(b"allow 00112233-4455-4677-8899-aabbccddeeff\n", challenge(),),
             SelectorUpdate::Decide(ApprovalOutcome::AllowedOnce)
         );
 
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         assert_eq!(
             selector.feed(&[b'x'; 65], challenge()),
             SelectorUpdate::Invalid
@@ -384,8 +473,60 @@ mod tests {
     }
 
     #[test]
+    fn enhanced_directional_mode_requires_a_later_enter_and_drains_paste() {
+        let mut selector =
+            ApprovalSelector::new(ApprovalInputProfile::EnhancedDirectional).unwrap();
+        assert_eq!(selector.feed(b"y\r", challenge()), SelectorUpdate::Invalid);
+        assert_eq!(selector.selected(), ApprovalSelection::Reject);
+
+        let mut selector =
+            ApprovalSelector::new(ApprovalInputProfile::EnhancedDirectional).unwrap();
+        assert_eq!(
+            selector.feed(b"\x1b[A\r", challenge()),
+            SelectorUpdate::Invalid
+        );
+        assert_eq!(selector.selected(), ApprovalSelection::Reject);
+
+        let mut selector =
+            ApprovalSelector::new(ApprovalInputProfile::EnhancedDirectional).unwrap();
+        assert_eq!(
+            selector.feed(b"\x1b[A", challenge()),
+            SelectorUpdate::Redraw
+        );
+        assert_eq!(selector.selected(), ApprovalSelection::AllowOnce);
+        assert_eq!(selector.feed(b"\n", challenge()), SelectorUpdate::Invalid);
+
+        let mut selector =
+            ApprovalSelector::new(ApprovalInputProfile::EnhancedDirectional).unwrap();
+        assert_eq!(
+            selector.feed(b"\x1b[A", challenge()),
+            SelectorUpdate::Redraw
+        );
+        assert_eq!(
+            selector.feed(b"\r", challenge()),
+            SelectorUpdate::Decide(ApprovalOutcome::AllowedOnce)
+        );
+
+        let mut selector =
+            ApprovalSelector::new(ApprovalInputProfile::EnhancedDirectional).unwrap();
+        assert_eq!(
+            selector.feed(b"\x1b[200~", challenge()),
+            SelectorUpdate::None
+        );
+        assert_eq!(
+            selector.feed(b"\x1b[A\r", challenge()),
+            SelectorUpdate::None
+        );
+        assert_eq!(
+            selector.feed(b"\x1b[201~", challenge()),
+            SelectorUpdate::Invalid
+        );
+        assert_eq!(selector.selected(), ApprovalSelection::Reject);
+    }
+
+    #[test]
     fn styled_redraw_is_product_owned_and_plain_output_has_no_escape_bytes() {
-        let mut selector = ApprovalSelector::new();
+        let mut selector = linear_selector();
         let plain = selector.render(false, false, false).unwrap();
         assert!(!plain.contains('\x1b'));
         assert!(plain.contains("[x] Reject"));

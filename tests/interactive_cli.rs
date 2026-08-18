@@ -13,11 +13,11 @@ use rustix::process::Signal;
 
 use support::{
     fake_deepseek::{
-        BacklogThenStalledSseServer, CancelThenSseServer, GatedFirstSseServer, SequenceSseServer,
-        SplitSseServer, StalledSseServer,
+        BacklogThenStalledSseServer, CancelThenSseServer, GatedFirstSseServer,
+        GatedThenStalledSseServer, SequenceSseServer, SplitSseServer, StalledSseServer,
     },
     process_state,
-    pty::{DisabledTerminalMode, JobControlHarness, PtyHarness, TestSessionRoot},
+    pty::{AutoTuiProfile, DisabledTerminalMode, JobControlHarness, PtyHarness, TestSessionRoot},
 };
 
 static WORKSPACE_NUMBER: AtomicUsize = AtomicUsize::new(0);
@@ -41,6 +41,26 @@ fn text_sse(text: &str) -> String {
          data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
          data: [DONE]\n\n"
     )
+}
+
+fn request_json(request: &str) -> serde_json::Value {
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("HTTP request should contain a body");
+    serde_json::from_str(body).expect("HTTP request body should be JSON")
+}
+
+fn last_user_content(request: &str) -> String {
+    let request = request_json(request);
+    request["messages"]
+        .as_array()
+        .expect("request messages should be an array")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .expect("request should contain a user text message")
+        .to_owned()
 }
 
 fn repeated_text_sse(delta_count: usize) -> String {
@@ -265,10 +285,8 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
     dsh.expect(b"\x1b[1;36mdsh-rs\x1b[0m");
     dsh.expect("❯".as_bytes());
     dsh.write(b"show the styled interface\r");
-    dsh.expect(b"\x1b[36m");
-    dsh.expect(b"\x1b[1;36m\xe2\x97\x86 dsh\x1b[0m");
-    dsh.expect(b"styled answer");
-    dsh.expect(b"\x1b[32m\xe2\x9c\x93\x1b[0m Done");
+    dsh.expect(b"\x1b[36mDSH  styled answer");
+    dsh.expect(b"\x1b[32mDone");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
 
@@ -280,6 +298,650 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
             .any(|bytes| bytes == b"assistant |")
     );
     assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn explicit_linear_and_enhanced_tui_modes_reach_their_real_terminal_paths() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color_with_tui_mode(&server.base_url, &workspace.0, "linear");
+
+    dsh.expect(b"dsh > ");
+    assert!(!dsh.terminal_uses_application_mode());
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert!(server.finish().is_empty());
+
+    let server = SequenceSseServer::start(Vec::new());
+    let mut enhanced =
+        PtyHarness::spawn_color_with_tui_mode(&server.base_url, &workspace.0, "enhanced");
+    enhanced.expect(b"Ready");
+    assert!(enhanced.terminal_uses_application_mode());
+    let (status, transcript) = enhanced.exit_cleanly();
+    assert!(status.success());
+    assert!(transcript.contains(&0x1b));
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn auto_tui_profile_is_conservative_for_each_real_cli_override() {
+    struct Case {
+        term: &'static str,
+        environment: Option<(&'static str, &'static str)>,
+        size: (u16, u16),
+        no_color_argument: bool,
+        no_color_environment: bool,
+    }
+
+    for case in [
+        Case {
+            term: "xterm-256color",
+            environment: None,
+            size: (24, 120),
+            no_color_argument: true,
+            no_color_environment: false,
+        },
+        Case {
+            term: "xterm-256color",
+            environment: None,
+            size: (24, 120),
+            no_color_argument: false,
+            no_color_environment: true,
+        },
+        Case {
+            term: "dumb",
+            environment: None,
+            size: (24, 120),
+            no_color_argument: false,
+            no_color_environment: false,
+        },
+        Case {
+            term: "vt100",
+            environment: None,
+            size: (24, 120),
+            no_color_argument: false,
+            no_color_environment: false,
+        },
+        Case {
+            term: "xterm-256color",
+            environment: Some(("ZELLIJ", "0")),
+            size: (24, 120),
+            no_color_argument: false,
+            no_color_environment: false,
+        },
+        Case {
+            term: "xterm-256color",
+            environment: None,
+            size: (12, 43),
+            no_color_argument: false,
+            no_color_environment: false,
+        },
+    ] {
+        let server = SequenceSseServer::start(Vec::new());
+        let workspace = TestWorkspace::new();
+        let mut dsh = PtyHarness::spawn_auto_with_profile(
+            &server.base_url,
+            &workspace.0,
+            AutoTuiProfile {
+                term: case.term,
+                environment: case.environment,
+                size: case.size,
+                no_color_argument: case.no_color_argument,
+                no_color_environment: case.no_color_environment,
+                enhanced: false,
+            },
+        );
+
+        dsh.expect(b"dsh > ");
+        assert!(!dsh.terminal_uses_application_mode());
+        let (status, transcript) = dsh.exit_cleanly();
+        assert!(status.success());
+        assert!(!transcript.contains(&0x1b));
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn enhanced_dock_keeps_cbreak_across_idle_and_restores_it_for_suspend() {
+    let server = SequenceSseServer::start(vec![text_sse("answer after enhanced suspension")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect(b"Ready");
+    dsh.expect("❯".as_bytes());
+    assert!(dsh.terminal_uses_application_mode());
+    assert_ne!(dsh.terminal_state(), dsh.initial_terminal_state());
+
+    dsh.signal(Signal::TSTP);
+    dsh.wait_until_stopped();
+    assert_eq!(dsh.terminal_state(), dsh.initial_terminal_state());
+    dsh.signal(Signal::CONT);
+    dsh.expect_occurrences(b"Ready", 2);
+    assert!(dsh.terminal_uses_application_mode());
+
+    let turn_checkpoint = dsh.checkpoint();
+    dsh.write(b"continue after enhanced suspension\r");
+    dsh.expect(b"answer after enhanced suspension");
+    dsh.expect_after(turn_checkpoint, b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "continue after enhanced suspension"
+    );
+}
+
+#[test]
+fn enhanced_idle_hup_quit_and_term_restore_exact_terminal_state_before_exit() {
+    for (signal, expected) in [(Signal::HUP, 129), (Signal::QUIT, 131), (Signal::TERM, 143)] {
+        let server = SequenceSseServer::start(Vec::new());
+        let workspace = TestWorkspace::new();
+        let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+        dsh.expect(b"Ready");
+        assert!(dsh.terminal_uses_application_mode());
+        dsh.signal(signal);
+        let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+
+        assert_eq!(status.code(), Some(expected));
+        assert!(server.finish().is_empty());
+    }
+}
+
+#[test]
+fn enhanced_active_ctrl_c_and_ctrl_d_cancel_the_request_and_restore_the_terminal() {
+    for (input, exits_after_cancel) in [(vec![0x03], false), (vec![0x04], true)] {
+        let partial =
+            concat!("data: {\"choices\":[{\"delta\":{\"content\":\"enhanced-stall\"}}]}\n\n")
+                .to_owned();
+        let server = StalledSseServer::start(partial);
+        let workspace = TestWorkspace::new();
+        let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+        dsh.expect("❯".as_bytes());
+        dsh.write(b"stall the enhanced turn\r");
+        dsh.expect(b"enhanced-stall");
+        dsh.write(&input);
+        let (status, _) = if exits_after_cancel {
+            dsh.wait_for_exit(Duration::from_secs(5))
+        } else {
+            dsh.expect(b"stopped; skipped");
+            dsh.exit_cleanly()
+        };
+        let (request, closed) = server.finish();
+
+        assert!(status.success());
+        assert!(closed);
+        assert!(request.contains("stall the enhanced turn"));
+    }
+}
+
+#[test]
+fn enhanced_ctrl_c_keeps_the_screen_ledger_usable_for_the_next_turn() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"cancelled-partial\"}}]}\n\n")
+            .to_owned();
+    let server = CancelThenSseServer::start(partial, text_sse("second turn still aligned"));
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"cancel this enhanced turn\r");
+    dsh.expect(b"cancelled-partial");
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"continue after cancellation\r");
+    dsh.expect(b"second turn still aligned");
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let (requests, first_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(first_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(last_user_content(&requests[0]), "cancel this enhanced turn");
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "continue after cancellation"
+    );
+}
+
+#[test]
+fn enhanced_composer_edits_fragmented_unicode_and_distinguishes_ctrl_j_from_enter() {
+    let server = SequenceSseServer::start(vec![text_sse("unicode composer accepted")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    let turn_checkpoint = dsh.checkpoint();
+    dsh.write(b"A");
+    for byte in "👨‍👩‍👧‍👦".as_bytes() {
+        dsh.write(&[*byte]);
+    }
+    dsh.write(b"B\x1b[D\x7f");
+    for byte in "界".as_bytes() {
+        dsh.write(&[*byte]);
+    }
+    dsh.write(&[0x05]);
+    dsh.write(b"\ntail\r");
+    dsh.expect(b"unicode composer accepted");
+    dsh.expect_after(turn_checkpoint, b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "A界B\ntail");
+}
+
+#[test]
+fn enhanced_resize_reanchors_the_full_screen_dock_and_preserves_the_draft() {
+    let server = SequenceSseServer::start(vec![text_sse("resized draft accepted")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"draft survives resize");
+
+    let wide = dsh.checkpoint();
+    dsh.resize(30, 80);
+    dsh.expect_after(wide, b"draft survives resize");
+
+    let compact = dsh.checkpoint();
+    dsh.resize(20, 44);
+    dsh.expect_after(compact, b"draft survives resize");
+
+    let rescue = dsh.checkpoint();
+    dsh.resize(6, 15);
+    dsh.expect_after(rescue, b"^ ves resize");
+    assert!(dsh.terminal_uses_application_mode());
+
+    let restored = dsh.checkpoint();
+    dsh.resize(24, 120);
+    dsh.expect_after(restored, b"draft survives resize");
+    assert!(dsh.terminal_uses_application_mode());
+    assert!(
+        !dsh.snapshot()
+            .windows(b"\x1b[1;21r".len())
+            .any(|window| window == b"\x1b[1;21r"),
+        "enhanced mode must not establish a partial scrolling region"
+    );
+    dsh.write(b"\r");
+    dsh.expect(b"resized draft accepted");
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "draft survives resize");
+}
+
+#[test]
+fn enhanced_resize_below_the_compact_floor_clears_stale_geometry_before_exit() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"private draft stays in the viewport");
+    let resize = dsh.checkpoint();
+    dsh.resize(5, 11);
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        transcript[resize..]
+            .windows(b"\x1b[2J".len())
+            .any(|window| window == b"\x1b[2J")
+    );
+    assert!(
+        transcript[resize..]
+            .windows(b"\x1b[?2004l".len())
+            .any(|window| window == b"\x1b[?2004l")
+    );
+    assert!(server.finish().is_empty());
+}
+
+#[test]
+fn fragmented_bracketed_paste_is_one_draft_and_never_submits_its_enter_bytes() {
+    let server = SequenceSseServer::start(vec![text_sse("atomic paste accepted")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    let turn_checkpoint = dsh.checkpoint();
+    for byte in b"\x1b[200~" {
+        dsh.write(&[*byte]);
+    }
+    dsh.write(b"first\rsecond\x1b[A\nthird");
+    for byte in b"\x1b[201~" {
+        dsh.write(&[*byte]);
+    }
+    dsh.expect(b"third");
+    dsh.expect(b"Paste ready");
+    dsh.write(b"\r");
+    dsh.expect(b"atomic paste accepted");
+    dsh.expect_after(turn_checkpoint, b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "first\nsecond\u{1b}[A\nthird"
+    );
+}
+
+#[test]
+fn a_completed_paste_fence_discards_a_later_read_before_enter_can_submit() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"paste guard answer\"}}]}\n\n")
+            .to_owned();
+    let finish = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_owned();
+    let mut server = GatedFirstSseServer::start(partial, finish, Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"\x1b[200~safe paste\x1b[201~");
+    dsh.expect(b"Paste inserted");
+    dsh.write(b"\rhidden suffix\x1b[201~");
+    server.assert_no_first_request(Duration::from_millis(250));
+
+    dsh.expect(b"Paste ready");
+    dsh.write(b"\r");
+    dsh.expect(b"paste guard answer");
+    server.release();
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "safe paste");
+}
+
+#[test]
+fn a_rejected_oversized_paste_fence_cannot_submit_the_existing_draft() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"rejected paste answer\"}}]}\n\n")
+            .to_owned();
+    let finish = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_owned();
+    let mut server = GatedFirstSseServer::start(partial, finish, Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"safe draft");
+    let mut paste = Vec::from(b"\x1b[200~".as_slice());
+    paste.extend(std::iter::repeat_n(b'x', 64 * 1_024 + 1));
+    paste.extend_from_slice(b"\x1b[201~");
+    dsh.write(&paste);
+    dsh.expect(b"CLI_INPUT_PASTE_TOO_LARGE");
+    dsh.write(b"\r");
+    server.assert_no_first_request(Duration::from_millis(250));
+
+    dsh.expect(b"Paste ready");
+    dsh.write(b"\r");
+    dsh.expect(b"rejected paste answer");
+    server.release();
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "safe draft");
+}
+
+#[test]
+fn rejected_escape_sequence_discards_the_same_read_enter_without_losing_the_draft() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"invalid guard answer\"}}]}\n\n")
+            .to_owned();
+    let finish = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_owned();
+    let mut server = GatedFirstSseServer::start(partial, finish, Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"safe draft");
+    dsh.write(b"\x1b[999~\r");
+    dsh.expect(b"CLI_INPUT_UNKNOWN_SEQUENCE");
+    server.assert_no_first_request(Duration::from_millis(200));
+
+    dsh.write(b"\r");
+    dsh.expect(b"invalid guard answer");
+    server.release();
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "safe draft");
+}
+
+#[test]
+fn input_typed_during_a_turn_is_queued_and_admitted_only_after_settlement() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"busy-partial\"}}]}\n\n").to_owned();
+    let mut server = GatedFirstSseServer::start(
+        partial,
+        text_sse(" first-turn-finished"),
+        vec![text_sse("queued-turn-finished")],
+    );
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    let journey_checkpoint = dsh.checkpoint();
+    dsh.write(b"start the gated turn\r");
+    dsh.expect(b"busy-partial");
+    let queue_checkpoint = dsh.checkpoint();
+    dsh.write(b"run this only after settlement\r");
+    dsh.expect_after(queue_checkpoint, b"next-turn prompt(s) queued");
+    server.release();
+    dsh.expect(b"first-turn-finished");
+    dsh.expect(b"1 item");
+    dsh.expect(b"queued-turn-finished");
+    dsh.expect_after(journey_checkpoint, b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(last_user_content(&requests[0]), "start the gated turn");
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "run this only after settlement"
+    );
+    assert!(!requests[0].contains("run this only after settlement"));
+}
+
+#[test]
+fn active_turn_paste_fence_requires_a_fresh_enter_before_queueing() {
+    let first =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"active paste busy\"}}]}\n\n")
+            .to_owned();
+    let finish = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_owned();
+    let mut server = GatedThenStalledSseServer::start(first, finish);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start active paste fence\r");
+    dsh.expect(b"active paste busy");
+    dsh.write(b"\x1b[200~queued only after fresh enter\x1b[201~");
+    dsh.expect(b"Paste inserted");
+    let fence = dsh.checkpoint();
+    dsh.write(b"\r");
+    std::thread::sleep(Duration::from_millis(250));
+    let snapshot = dsh.snapshot();
+    assert!(
+        !snapshot[fence..]
+            .windows(b"next-turn prompt(s) queued".len())
+            .any(|bytes| bytes == b"next-turn prompt(s) queued")
+    );
+
+    dsh.expect(b"Paste ready");
+    dsh.write(b"\r");
+    dsh.expect(b"next-turn prompt(s) queued");
+    server.release();
+    server.wait_until_second_request();
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    let (status, _) = dsh.exit_cleanly();
+    let (requests, second_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(second_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "queued only after fresh enter"
+    );
+}
+
+#[test]
+fn an_in_flight_queue_front_cannot_be_recalled_or_replaced_by_the_next_draft() {
+    let first = concat!("data: {\"choices\":[{\"delta\":{\"content\":\"first turn busy\"}}]}\n\n")
+        .to_owned();
+    let finish = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_owned();
+    let mut server = GatedThenStalledSseServer::start(first, finish);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start the gated turn\r");
+    dsh.expect(b"first turn busy");
+    dsh.write(b"reserved prompt A\r");
+    dsh.expect(b"next-turn prompt(s) queued");
+    server.release();
+    server.wait_until_second_request();
+
+    dsh.write(b"draft C");
+    dsh.expect(b"draft C");
+    let history = dsh.checkpoint();
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(history, b"start the gated turn");
+    let recovery = dsh.checkpoint();
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    dsh.write(b"\x1b[B");
+    dsh.write(b"\x1b[B");
+    dsh.expect_after(recovery, b"draft C");
+    dsh.write(&[0x15]);
+    dsh.write(b"/exit\r");
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let (requests, second_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(second_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(last_user_content(&requests[0]), "start the gated turn");
+    assert_eq!(last_user_content(&requests[1]), "reserved prompt A");
+    assert!(!requests[1].contains("draft C"));
+}
+
+#[test]
+fn a_reserved_auto_turn_is_settled_before_suspend_and_returns_as_history() {
+    let first = concat!("data: {\"choices\":[{\"delta\":{\"content\":\"first turn busy\"}}]}\n\n")
+        .to_owned();
+    let finish = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_owned();
+    let mut server = GatedThenStalledSseServer::start(first, finish);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start before queue suspension\r");
+    dsh.expect(b"first turn busy");
+    dsh.write(b"queued prompt survives suspension\r");
+    dsh.expect(b"next-turn prompt(s) queued");
+    server.release();
+    server.wait_until_second_request();
+
+    dsh.signal(Signal::TSTP);
+    dsh.wait_until_stopped();
+    assert_eq!(dsh.terminal_state(), dsh.initial_terminal_state());
+    let resumed = dsh.checkpoint();
+    dsh.signal(Signal::CONT);
+    dsh.expect_after(resumed, b"Ready");
+    assert!(dsh.terminal_uses_application_mode());
+
+    let history = dsh.checkpoint();
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(history, b"queued prompt survives suspension");
+    dsh.write(&[0x15]);
+    dsh.write(b"/exit\r");
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let (requests, second_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(second_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "queued prompt survives suspension"
+    );
+}
+
+#[test]
+fn enhanced_resize_during_a_partial_stream_reanchors_without_cancelling_the_turn() {
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"busy-partial\"}}]}\n\n").to_owned();
+    let mut server =
+        GatedFirstSseServer::start(partial, text_sse(" continuation-after-resize"), Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"resize the active stream\r");
+    dsh.expect(b"busy-partial");
+    let resize = dsh.checkpoint();
+    dsh.resize(30, 80);
+    dsh.expect_after(resize, b"Working | type the next prompt while dsh runs");
+    server.release();
+    dsh.expect(b"continuation-after-resize");
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "resize the active stream");
 }
 
 #[test]
@@ -301,13 +963,19 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"show the styled approval selector\r");
     dsh.approval_ready();
-    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Reject \x1b[0m");
+    dsh.expect(b"> Reject");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    let selection = dsh.checkpoint();
     dsh.write(b"\x1b[A");
-    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Allow once \x1b[0m");
+    dsh.expect_after(selection, b"> Allow once");
+    dsh.expect_after(selection, b"Arrow keys move | Enter confirms | Esc stops");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    let compact = dsh.checkpoint();
+    dsh.resize(6, 15);
+    dsh.expect_after(compact, b"> Allow once");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
     dsh.write(b"\r");
-    dsh.expect(b"\x1b[32m\xe2\x9c\x93\x1b[0m Allowed once");
+    dsh.expect(b"Allowed once");
     dsh.expect(b"styled patch finished");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
@@ -315,6 +983,61 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     assert!(transcript.contains(&0x1b));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn enhanced_approval_rejects_printable_same_read_and_pasted_authority() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-enhanced-approval",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("enhanced approval finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"exercise enhanced approval safety\r");
+    dsh.approval_ready();
+
+    dsh.write(b"y\r");
+    dsh.approval_ready_occurrence(2);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    dsh.write(b"\x1b[A\r");
+    dsh.approval_ready_occurrence(3);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    dsh.write(b"\x1b[200~\x1b[A\r\x1b[201~");
+    dsh.approval_ready_occurrence(4);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    let newline_selection = dsh.checkpoint();
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(newline_selection, b"> Allow once");
+    dsh.write(b"\n");
+    dsh.approval_ready_occurrence(6);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    let selection = dsh.checkpoint();
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(selection, b"> Allow once");
+    dsh.expect_after(selection, b"Arrow keys move | Enter confirms | Esc stops");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"\r");
+    dsh.expect(b"Allowed once");
+    dsh.expect(b"enhanced approval finished");
+    dsh.expect(b"Done");
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     assert_eq!(server.finish().len(), 2);
 }
 
@@ -493,7 +1216,7 @@ fn a_non_reading_terminal_hits_one_output_deadline_and_exits_without_recursive_d
     dsh.pause_reading();
     let started = std::time::Instant::now();
     dsh.write(b"fill the terminal output queue\r");
-    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(7));
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(8));
     let elapsed = started.elapsed();
     let (request, closed) = server.finish();
 
@@ -507,11 +1230,92 @@ fn a_non_reading_terminal_hits_one_output_deadline_and_exits_without_recursive_d
         elapsed >= Duration::from_millis(4_500),
         "elapsed={elapsed:?}"
     );
-    assert!(elapsed < Duration::from_secs(7), "elapsed={elapsed:?}");
+    assert!(elapsed < Duration::from_secs(8), "elapsed={elapsed:?}");
     assert!(
         !transcript.windows(5).any(|bytes| bytes == b"CLI_"),
         "the final error must not write recursively to the blocked terminal"
     );
+}
+
+#[test]
+fn enhanced_output_deadline_restores_cbreak_and_cancels_the_provider_once() {
+    let large_delta = "x".repeat(128 * 1_024);
+    let partial =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{large_delta}\"}}}}]}}\n\n");
+    let server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect(b"Ready");
+    assert!(dsh.terminal_uses_application_mode());
+    dsh.pause_reading();
+    let started = Instant::now();
+    dsh.write(b"block the enhanced screen writer\r");
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(8));
+    let elapsed = started.elapsed();
+    let (request, closed) = server.finish();
+
+    assert_eq!(status.code(), Some(1));
+    assert!(closed);
+    assert!(request.contains("block the enhanced screen writer"));
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "elapsed={elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(8), "elapsed={elapsed:?}");
+    assert!(!transcript.windows(5).any(|bytes| bytes == b"CLI_"));
+}
+
+#[test]
+fn enhanced_partial_screen_write_preserves_the_terminating_signal_identity() {
+    let large_delta = "x".repeat(128 * 1_024);
+    let partial =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{large_delta}\"}}}}]}}\n\n");
+    let server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect(b"Ready");
+    dsh.pause_reading();
+    dsh.write(b"interrupt a partial enhanced frame\r");
+    std::thread::sleep(Duration::from_millis(150));
+    dsh.signal(Signal::TERM);
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let (request, closed) = server.finish();
+
+    assert_eq!(status.code(), Some(143));
+    assert!(closed);
+    assert!(request.contains("interrupt a partial enhanced frame"));
+}
+
+#[test]
+fn enhanced_partial_screen_write_restores_termios_before_suspending() {
+    let large_delta = "x".repeat(128 * 1_024);
+    let partial =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{large_delta}\"}}}}]}}\n\n");
+    let server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect(b"Ready");
+    dsh.pause_reading();
+    dsh.write(b"suspend a partial enhanced frame\r");
+    std::thread::sleep(Duration::from_millis(150));
+    dsh.signal(Signal::TSTP);
+    dsh.wait_until_stopped();
+    assert_eq!(dsh.terminal_state(), dsh.initial_terminal_state());
+
+    dsh.resume_reading();
+    let resumed = dsh.checkpoint();
+    dsh.signal(Signal::CONT);
+    dsh.expect_after(resumed, b"Ready");
+    assert!(dsh.terminal_uses_application_mode());
+    let (status, _) = dsh.exit_cleanly();
+    let (request, closed) = server.finish();
+
+    assert!(status.success());
+    assert!(closed);
+    assert!(request.contains("suspend a partial enhanced frame"));
 }
 
 #[test]
@@ -923,7 +1727,7 @@ fn approval_and_suspend_resume_leave_the_real_terminal_state_unchanged() {
 }
 
 #[test]
-fn zero_width_terminal_uses_the_compact_selector_instead_of_failing() {
+fn transient_zero_width_keeps_the_last_safe_approval_geometry() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let server = SequenceSseServer::start(vec![
         tool_sse(
@@ -942,11 +1746,13 @@ fn zero_width_terminal_uses_the_compact_selector_instead_of_failing() {
     dsh.resize(24, 0);
     dsh.write(b"exercise a zero width terminal\r");
     dsh.approval_ready();
-    dsh.expect(b"arrows \xc2\xb7 Enter confirm \xc2\xb7 Esc cancel");
+    dsh.expect(b"Reject is the safe default");
+    let allow = dsh.checkpoint();
     dsh.write(b"\x1b[A");
-    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Allow once \x1b[0m");
+    dsh.expect_after(allow, b"> Allow once");
+    let reject = dsh.checkpoint();
     dsh.write(b"\x1b[B");
-    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Reject \x1b[0m");
+    dsh.expect_after(reject, b"> Reject");
     assert!(
         !dsh.snapshot()
             .windows(b"\x1b[5A".len())

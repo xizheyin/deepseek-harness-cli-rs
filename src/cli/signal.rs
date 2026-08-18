@@ -17,12 +17,19 @@ pub(super) enum UiSignal {
     Suspend,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InteractiveSignal {
+    Stop(UiSignal),
+    Resize,
+}
+
 pub(super) struct SignalStreams {
     quit: Signal,
     terminate: Signal,
     hangup: Signal,
     suspend: Signal,
     interrupt: Signal,
+    resize: Signal,
 }
 
 impl SignalStreams {
@@ -35,11 +42,25 @@ impl SignalStreams {
             hangup: signal(SignalKind::hangup())?,
             suspend: signal(SignalKind::from_raw(libc::SIGTSTP))?,
             interrupt: signal(SignalKind::interrupt())?,
+            resize: signal(SignalKind::window_change())?,
         })
     }
 
     pub(super) async fn next(&mut self) -> UiSignal {
         poll_fn(|context| self.poll_next(context)).await
+    }
+
+    pub(super) async fn next_interactive(&mut self) -> InteractiveSignal {
+        poll_fn(|context| {
+            if let Poll::Ready(signal) = self.poll_next(context) {
+                return Poll::Ready(InteractiveSignal::Stop(signal));
+            }
+            if matches!(self.resize.poll_recv(context), Poll::Ready(Some(()))) {
+                return Poll::Ready(InteractiveSignal::Resize);
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     pub(super) fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<UiSignal> {

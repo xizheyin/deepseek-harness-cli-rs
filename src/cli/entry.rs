@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{session::SessionStore, tools::PluginConfig, workspace_authority::WorkspaceAuthority};
 
 use super::{
-    args::{CliOptions, ListSessionsOptions, ParseAction, ParseError, parse_args_os},
+    args::{CliOptions, ListSessionsOptions, ParseAction, ParseError, TuiMode, parse_args_os},
     assembly::{AgentAssembly, AssemblyError, assemble_session, prepare_new_session},
     interactive::{self, InteractiveError},
     render::VisibleRenderer,
@@ -37,7 +37,8 @@ const HELP: &str = concat!(
     "  -m, --model <MODEL>          DeepSeek model (new: deepseek-v4-flash; resume: stored model)\n",
     "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
     "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
-    "      --no-color               Disable color and dynamic terminal styling\n",
+    "      --tui <MODE>             Terminal UI: auto (default), enhanced, or linear\n",
+    "      --no-color               Disable color and force the linear terminal UI\n",
     "      --list-sessions          List persisted session headers\n",
     "      --resume <SESSION_ID>    Resume one persisted session\n",
     "  -h, --help                   Print help\n",
@@ -101,6 +102,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         plugin_config,
         resume,
         no_color,
+        tui,
     } = options;
     let plugin_config = plugin_config
         .map(|path| {
@@ -110,6 +112,14 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         })
         .transpose()?;
     let color = color_enabled(no_color);
+    let presentation = interactive_presentation(
+        tui,
+        color,
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var_os("TMUX").is_some(),
+        std::env::var_os("STY").is_some(),
+        std::env::var_os("ZELLIJ").is_some(),
+    );
     let runtime = build_runtime()?;
     let mut signals = runtime
         .block_on(async { SignalStreams::install() })
@@ -261,7 +271,12 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             .block_on(script_driver::run_one_turn(agent, prompt, &mut signals))
             .map_err(EntryError::script),
         (LaunchSurface::Interactive(terminal), AgentAssembly::Interactive(assembly)) => runtime
-            .block_on(interactive::run(assembly, terminal, &mut signals, color))
+            .block_on(interactive::run(
+                assembly,
+                terminal,
+                &mut signals,
+                presentation,
+            ))
             .map_err(EntryError::interactive),
         (surface, assembly) => {
             let mut agent = match assembly {
@@ -306,6 +321,31 @@ const fn color_enabled_from(
     dumb_terminal: bool,
 ) -> bool {
     !no_color && !no_color_environment && !dumb_terminal
+}
+
+fn interactive_presentation(
+    requested: TuiMode,
+    color: bool,
+    term: Option<&str>,
+    inside_tmux: bool,
+    inside_screen: bool,
+    inside_zellij: bool,
+) -> interactive::InteractivePresentation {
+    if !color || requested == TuiMode::Linear {
+        return interactive::InteractivePresentation::Linear;
+    }
+    if requested == TuiMode::Enhanced {
+        return interactive::InteractivePresentation::Enhanced;
+    }
+    if inside_tmux
+        || inside_screen
+        || inside_zellij
+        || term.is_none_or(|term| !term.starts_with("xterm"))
+    {
+        interactive::InteractivePresentation::Linear
+    } else {
+        interactive::InteractivePresentation::Auto
+    }
 }
 
 enum LaunchSurface {
@@ -537,10 +577,12 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        EntryError, HELP, ResumeSignalAction, color_enabled_from, resume_signal_action, run,
+        EntryError, HELP, ResumeSignalAction, color_enabled_from, interactive_presentation,
+        resume_signal_action, run,
     };
     use crate::cli::{
-        interactive::InteractiveError,
+        args::TuiMode,
+        interactive::{InteractiveError, InteractivePresentation},
         signal::{DriverMode, UiSignal},
     };
 
@@ -551,6 +593,9 @@ mod tests {
         assert!(HELP.contains("--list-sessions"));
         assert!(HELP.contains("--resume <SESSION_ID>"));
         assert!(HELP.contains("--plugin-config <PATH>"));
+        assert!(HELP.contains("--tui <MODE>"));
+        assert!(HELP.contains("auto (default), enhanced, or linear"));
+        assert!(HELP.contains("force the linear terminal UI"));
         assert!(HELP.contains("resume: stored model"));
         assert!(HELP.contains("resume: optional identity check"));
         assert_eq!(run([OsString::from("--version")]).unwrap(), 0);
@@ -562,6 +607,70 @@ mod tests {
         assert!(!color_enabled_from(true, false, false));
         assert!(!color_enabled_from(false, true, false));
         assert!(!color_enabled_from(false, false, true));
+    }
+
+    #[test]
+    fn tui_auto_avoids_known_multiplexers_and_keeps_an_explicit_escape_hatch() {
+        assert_eq!(
+            interactive_presentation(
+                TuiMode::Auto,
+                true,
+                Some("xterm-256color"),
+                false,
+                false,
+                false,
+            ),
+            InteractivePresentation::Auto
+        );
+        for (term, tmux, screen, zellij) in [
+            (Some("screen-256color"), false, false, false),
+            (Some("tmux-256color"), false, false, false),
+            (Some("xterm-256color"), true, false, false),
+            (Some("xterm-256color"), false, true, false),
+            (Some("xterm-256color"), false, false, true),
+            (Some("vt100"), false, false, false),
+            (Some("linux"), false, false, false),
+            (Some("unknown-terminal"), false, false, false),
+            (None, false, false, false),
+        ] {
+            assert_eq!(
+                interactive_presentation(TuiMode::Auto, true, term, tmux, screen, zellij),
+                InteractivePresentation::Linear
+            );
+        }
+        assert_eq!(
+            interactive_presentation(
+                TuiMode::Enhanced,
+                true,
+                Some("screen-256color"),
+                true,
+                false,
+                false,
+            ),
+            InteractivePresentation::Enhanced
+        );
+        assert_eq!(
+            interactive_presentation(
+                TuiMode::Enhanced,
+                false,
+                Some("xterm-256color"),
+                false,
+                false,
+                false,
+            ),
+            InteractivePresentation::Linear
+        );
+        assert_eq!(
+            interactive_presentation(
+                TuiMode::Linear,
+                true,
+                Some("xterm-256color"),
+                false,
+                false,
+                false,
+            ),
+            InteractivePresentation::Linear
+        );
     }
 
     #[test]

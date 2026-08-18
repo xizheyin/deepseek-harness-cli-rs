@@ -14,7 +14,10 @@ use rustix::{
 use thiserror::Error;
 use tokio::io::{Interest, unix::AsyncFd};
 
+use crate::tui::inline_screen::POISON_TEARDOWN_BYTES;
+
 pub(super) const TERMINAL_READ_BYTES: usize = 8 * 1024;
+pub(super) const ENHANCED_VISUAL_RESET_BYTES: &[u8] = b"\x1b[r\x1b[?6l\x1b[?2004l\x1b[?25h\x1b[0m";
 #[cfg(any(target_os = "macos", test))]
 const MIN_MACOS_CANONICAL_BYTES: i64 = 1_001;
 #[cfg(any(target_os = "linux", test))]
@@ -104,9 +107,19 @@ pub(super) struct AsyncTerminal {
     output: AsyncFd<OwnedFd>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TerminalSize {
+    pub(super) rows: u16,
+    pub(super) columns: u16,
+}
+
 impl AsyncTerminal {
     pub(super) fn revalidate(&self) -> Result<(), TerminalError> {
         validate_descriptors(self.input.get_ref().as_fd(), self.output.get_ref().as_fd())
+    }
+
+    pub(super) fn revalidate_identity(&self) -> Result<(), TerminalError> {
+        validate_terminal_identity(self.input.get_ref().as_fd(), self.output.get_ref().as_fd())
     }
 
     pub(super) fn flush_input(&self) -> Result<(), TerminalError> {
@@ -117,10 +130,42 @@ impl AsyncTerminal {
     /// report zero or reject this optional ioctl, so callers must fall back to
     /// the compact layout rather than failing an approval.
     pub(super) fn columns(&self) -> Option<u16> {
-        tcgetwinsize(self.output.get_ref())
-            .ok()
-            .map(|size| size.ws_col)
-            .filter(|columns| *columns != 0)
+        self.size().map(|size| size.columns)
+    }
+
+    pub(super) fn size(&self) -> Option<TerminalSize> {
+        tcgetwinsize(self.output.get_ref()).ok().and_then(|size| {
+            (size.ws_col != 0 && size.ws_row != 0).then_some(TerminalSize {
+                rows: size.ws_row,
+                columns: size.ws_col,
+            })
+        })
+    }
+
+    pub(super) fn into_application_session(self) -> Result<TerminalSession, TerminalError> {
+        self.revalidate()?;
+        let original = tcgetattr(self.input.get_ref()).map_err(|_| TerminalError::Unsupported)?;
+        let disabled = platform::path_value(self.input.get_ref().as_fd(), libc::_PC_VDISABLE)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or(TerminalError::Unsupported)?;
+        let application = application_termios(&original, disabled);
+        self.flush_input()?;
+        tcsetattr(self.input.get_ref(), OptionalActions::Now, &application)
+            .map_err(|_| TerminalError::Unsupported)?;
+        // Construct the restoration owner immediately after the mode changes.
+        // Any validation error below is therefore covered by both explicit
+        // finish and the Drop backstop.
+        let mut session = TerminalSession {
+            terminal: self,
+            original: Some(original),
+            application,
+            state: TerminalSessionState::Application,
+        };
+        if session.revalidate_application().is_err() {
+            let _ = session.finish();
+            return Err(TerminalError::Unsupported);
+        }
+        Ok(session)
     }
 
     pub(super) fn enter_approval_mode(&self) -> Result<ApprovalTerminalMode<'_>, TerminalError> {
@@ -188,6 +233,137 @@ impl AsyncTerminal {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalSessionState {
+    Application,
+    CanonicalForSuspend,
+    Restored,
+}
+
+/// Owns the enhanced UI's long-lived terminal mode. Explicit restoration is
+/// the normal path; Drop is only a panic/unwind backstop.
+pub(super) struct TerminalSession {
+    terminal: AsyncTerminal,
+    original: Option<Termios>,
+    application: Termios,
+    state: TerminalSessionState,
+}
+
+impl TerminalSession {
+    pub(super) const fn output_terminal(&self) -> &AsyncTerminal {
+        &self.terminal
+    }
+
+    pub(super) fn application_terminal(&self) -> Result<&AsyncTerminal, TerminalError> {
+        (self.state == TerminalSessionState::Application)
+            .then_some(&self.terminal)
+            .ok_or(TerminalError::Unsupported)
+    }
+
+    pub(super) fn restored_terminal(&self) -> Result<&AsyncTerminal, TerminalError> {
+        (self.state == TerminalSessionState::Restored)
+            .then_some(&self.terminal)
+            .ok_or(TerminalError::Unsupported)
+    }
+
+    pub(super) fn size(&self) -> Option<TerminalSize> {
+        self.terminal.size()
+    }
+
+    pub(super) fn is_foreground(&self) -> Result<bool, TerminalError> {
+        self.terminal.is_foreground()
+    }
+
+    pub(super) fn revalidate_application(&self) -> Result<(), TerminalError> {
+        if self.state != TerminalSessionState::Application {
+            return Err(TerminalError::Unsupported);
+        }
+        self.terminal.revalidate_identity()?;
+        let current =
+            tcgetattr(self.terminal.input.get_ref()).map_err(|_| TerminalError::Unsupported)?;
+        validate_application_termios(&current, &self.application)
+    }
+
+    pub(super) async fn read_once(
+        &self,
+        scratch: &mut [u8; TERMINAL_READ_BYTES],
+    ) -> io::Result<usize> {
+        self.terminal.read_once(scratch).await
+    }
+
+    pub(super) fn restore_for_suspend(&mut self) -> Result<(), TerminalError> {
+        if self.state != TerminalSessionState::Application {
+            return Err(TerminalError::Unsupported);
+        }
+        self.restore_original()?;
+        self.terminal.flush_input()?;
+        self.terminal.revalidate()?;
+        self.state = TerminalSessionState::CanonicalForSuspend;
+        Ok(())
+    }
+
+    pub(super) fn reenter_after_resume(&mut self) -> Result<(), TerminalError> {
+        if self.state != TerminalSessionState::CanonicalForSuspend {
+            return Err(TerminalError::Unsupported);
+        }
+        self.terminal.revalidate()?;
+        self.terminal.flush_input()?;
+        tcsetattr(
+            self.terminal.input.get_ref(),
+            OptionalActions::Now,
+            &self.application,
+        )
+        .map_err(|_| TerminalError::Unsupported)?;
+        self.state = TerminalSessionState::Application;
+        self.revalidate_application()
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), TerminalError> {
+        if self.state != TerminalSessionState::Restored {
+            self.restore_original()?;
+            self.terminal.flush_input()?;
+            self.terminal.revalidate()?;
+            self.state = TerminalSessionState::Restored;
+        }
+        self.original = None;
+        Ok(())
+    }
+
+    fn restore_original(&mut self) -> Result<(), TerminalError> {
+        let original = self.original.as_ref().ok_or(TerminalError::Unsupported)?;
+        tcsetattr(
+            self.terminal.input.get_ref(),
+            OptionalActions::Now,
+            original,
+        )
+        .map_err(|_| TerminalError::Unsupported)
+    }
+
+    pub(super) fn best_effort_visual_reset(&self) {
+        // The terminal output descriptor is nonblocking. This fixed-size write
+        // never waits and is only a backstop for a partially written frame;
+        // normal control flow already sends the same reset through the bounded
+        // asynchronous writer.
+        let _ = rustix::io::write(self.terminal.output.get_ref(), POISON_TEARDOWN_BYTES);
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if self.state == TerminalSessionState::Restored {
+            return;
+        }
+        if let Some(original) = self.original.as_ref() {
+            self.best_effort_visual_reset();
+            let _ = tcsetattr(
+                self.terminal.input.get_ref(),
+                OptionalActions::Now,
+                original,
+            );
+        }
+    }
+}
+
 /// Owns the one temporary terminal-mode change used by the approval selector.
 /// Normal control flow calls `restore`; Drop is only a panic/unwind backstop.
 pub(super) struct ApprovalTerminalMode<'a> {
@@ -237,6 +413,53 @@ fn selector_termios(original: &Termios) -> Termios {
     selector
 }
 
+fn application_termios(original: &Termios, disabled: u8) -> Termios {
+    let mut application = original.clone();
+    application
+        .local_modes
+        .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHONL);
+    application.local_modes.insert(LocalModes::ISIG);
+    application
+        .input_modes
+        .remove(InputModes::ICRNL | InputModes::IXON | InputModes::IXOFF);
+    application.special_codes[SpecialCodeIndex::VMIN] = 1;
+    application.special_codes[SpecialCodeIndex::VTIME] = 0;
+    application.special_codes[SpecialCodeIndex::VDISCARD] = disabled;
+    application
+}
+
+fn validate_application_termios(
+    current: &Termios,
+    expected: &Termios,
+) -> Result<(), TerminalError> {
+    let modes_match = current.input_modes == expected.input_modes
+        && current.output_modes == expected.output_modes
+        && current.control_modes == expected.control_modes
+        && current.local_modes == expected.local_modes;
+    #[cfg(target_os = "linux")]
+    let discipline_matches = current.line_discipline == expected.line_discipline;
+    #[cfg(target_os = "macos")]
+    let discipline_matches = true;
+    let controls_match = [
+        SpecialCodeIndex::VINTR,
+        SpecialCodeIndex::VEOF,
+        SpecialCodeIndex::VMIN,
+        SpecialCodeIndex::VTIME,
+        SpecialCodeIndex::VSUSP,
+        SpecialCodeIndex::VQUIT,
+        SpecialCodeIndex::VDISCARD,
+        SpecialCodeIndex::VEOL,
+        SpecialCodeIndex::VEOL2,
+    ]
+    .iter()
+    .all(|index| current.special_codes[*index] == expected.special_codes[*index]);
+    if modes_match && discipline_matches && controls_match {
+        Ok(())
+    } else {
+        Err(TerminalError::Unsupported)
+    }
+}
+
 fn normalize_read(result: io::Result<usize>) -> io::Result<usize> {
     #[cfg(target_os = "linux")]
     if result.as_ref().err().and_then(io::Error::raw_os_error) == Some(libc::EIO) {
@@ -246,6 +469,14 @@ fn normalize_read(result: io::Result<usize>) -> io::Result<usize> {
 }
 
 fn validate_descriptors(
+    terminal_input: BorrowedFd<'_>,
+    terminal_output: BorrowedFd<'_>,
+) -> Result<(), TerminalError> {
+    validate_terminal_identity(terminal_input, terminal_output)?;
+    validate_canonical_termios(terminal_input)
+}
+
+fn validate_terminal_identity(
     terminal_input: BorrowedFd<'_>,
     terminal_output: BorrowedFd<'_>,
 ) -> Result<(), TerminalError> {
@@ -273,6 +504,10 @@ fn validate_descriptors(
         }
     }
 
+    Ok(())
+}
+
+fn validate_canonical_termios(terminal_input: BorrowedFd<'_>) -> Result<(), TerminalError> {
     let termios = tcgetattr(terminal_input).map_err(|_| TerminalError::Unsupported)?;
     let disabled = platform::path_value(terminal_input, libc::_PC_VDISABLE)
         .and_then(|value| u8::try_from(value).ok())
@@ -491,11 +726,12 @@ mod tests {
     };
 
     use pty_process::blocking;
+    use rustix::termios::{InputModes, LocalModes, OutputModes, SpecialCodeIndex, tcgetattr};
     use tokio::io::{Interest, unix::AsyncFd};
 
     use super::{
-        AsyncTerminal, CanonicalEvidence, TerminalError, TerminalFacts, platform,
-        validate_same_terminal_device,
+        AsyncTerminal, CanonicalEvidence, TerminalError, TerminalFacts, application_termios,
+        platform, validate_application_termios, validate_same_terminal_device,
     };
 
     fn rejected(facts: TerminalFacts) {
@@ -608,6 +844,99 @@ mod tests {
             mutate(&mut facts);
             rejected(facts);
         }
+    }
+
+    #[test]
+    fn application_mode_changes_only_owned_input_and_local_modes() {
+        let (_master, slave) = blocking::open().expect("PTY should open");
+        let original = tcgetattr(&slave).expect("PTY termios should be readable");
+        let disabled = original.special_codes[SpecialCodeIndex::VEOL];
+        let application = application_termios(&original, disabled);
+
+        assert!(!application.local_modes.contains(LocalModes::ICANON));
+        assert!(!application.local_modes.contains(LocalModes::ECHO));
+        assert!(!application.local_modes.contains(LocalModes::ECHONL));
+        assert!(application.local_modes.contains(LocalModes::ISIG));
+        assert!(!application.input_modes.contains(InputModes::ICRNL));
+        assert!(!application.input_modes.contains(InputModes::IXON));
+        assert!(!application.input_modes.contains(InputModes::IXOFF));
+        assert_eq!(application.output_modes, original.output_modes);
+        assert_eq!(application.control_modes, original.control_modes);
+        assert_eq!(
+            application.local_modes.contains(LocalModes::IEXTEN),
+            original.local_modes.contains(LocalModes::IEXTEN)
+        );
+        for index in [
+            SpecialCodeIndex::VINTR,
+            SpecialCodeIndex::VSUSP,
+            SpecialCodeIndex::VQUIT,
+        ] {
+            assert_eq!(
+                application.special_codes[index],
+                original.special_codes[index]
+            );
+        }
+        assert_eq!(application.special_codes[SpecialCodeIndex::VMIN], 1);
+        assert_eq!(application.special_codes[SpecialCodeIndex::VTIME], 0);
+        assert_eq!(
+            application.special_codes[SpecialCodeIndex::VDISCARD],
+            disabled
+        );
+        assert!(validate_application_termios(&application, &application).is_ok());
+
+        let disabled = application.special_codes[SpecialCodeIndex::VEOL];
+        assert!(
+            TerminalFacts::from_termios(&application, disabled, CanonicalEvidence::Macos(1_001),)
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn application_contract_rejects_each_owned_mode_drift() {
+        let (_master, slave) = blocking::open().expect("PTY should open");
+        let original = tcgetattr(&slave).expect("PTY termios should be readable");
+        let disabled = original.special_codes[SpecialCodeIndex::VEOL];
+        let expected = application_termios(&original, disabled);
+
+        let mut echo = expected.clone();
+        echo.local_modes.insert(LocalModes::ECHO);
+        assert_eq!(
+            validate_application_termios(&echo, &expected),
+            Err(TerminalError::Unsupported)
+        );
+
+        let mut cr_mapping = expected.clone();
+        cr_mapping.input_modes.insert(InputModes::ICRNL);
+        assert_eq!(
+            validate_application_termios(&cr_mapping, &expected),
+            Err(TerminalError::Unsupported)
+        );
+
+        let mut signals = expected.clone();
+        signals.local_modes.remove(LocalModes::ISIG);
+        assert_eq!(
+            validate_application_termios(&signals, &expected),
+            Err(TerminalError::Unsupported)
+        );
+
+        let mut output = expected.clone();
+        if output.output_modes.contains(OutputModes::OPOST) {
+            output.output_modes.remove(OutputModes::OPOST);
+        } else {
+            output.output_modes.insert(OutputModes::OPOST);
+        }
+        assert_eq!(
+            validate_application_termios(&output, &expected),
+            Err(TerminalError::Unsupported)
+        );
+
+        let mut vmin = expected.clone();
+        vmin.special_codes[SpecialCodeIndex::VMIN] = 2;
+        assert_eq!(
+            validate_application_termios(&vmin, &expected),
+            Err(TerminalError::Unsupported)
+        );
     }
 
     #[test]

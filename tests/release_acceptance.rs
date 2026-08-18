@@ -208,10 +208,10 @@ fn installed_dsh_renders_the_real_readme_scene() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"Review src/message.txt and prepare the release update\r");
     dsh.expect(b"Tool finished");
-    dsh.approval_ready();
+    dsh.approval_ready_for_call(b"call-readme-patch");
+    let selection = dsh.checkpoint();
     dsh.write(b"\x1b[A");
-    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Allow once \x1b[0m");
-    dsh.expect_occurrences(b"Esc cancel", 2);
+    dsh.expect_after(selection, b"> Allow once");
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
         "release needle: old\n"
@@ -221,7 +221,7 @@ fn installed_dsh_renders_the_real_readme_scene() {
     dsh.expect(b"Allowed once");
     dsh.expect_occurrences(b"Tool finished", 2);
     dsh.expect(b"Updated the release needle and kept the project checkable.");
-    dsh.expect_occurrences(b"\x1b[1;36m\xe2\x9d\xaf\x1b[0m ", 2);
+    dsh.expect_occurrences("❯".as_bytes(), 2);
     capture_snapshot("overview.ansi", &dsh.snapshot());
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
@@ -303,14 +303,18 @@ fn installed_dsh_completes_one_safe_resumable_compacting_journey() {
         first.expect(tool);
         first.expect(b"Tool finished");
     }
-    first.approval_ready();
+    first.approval_ready_for_call(b"call-patch");
+    let patch_selection = first.checkpoint();
     first.write(b"\x1b[A");
-    first.expect(b"\x1b[1;30;43m \xe2\x80\xba Allow once \x1b[0m");
+    first.expect_after(patch_selection, b"> Allow once");
     first.write(b"\r");
     first.expect(b"Allowed once");
     first.expect(b"Tool finished");
-    first.approval_ready_occurrence(2);
-    first.write(b"\x1b[A\r");
+    first.approval_ready_for_call(b"call-test");
+    let shell_selection = first.checkpoint();
+    first.write(b"\x1b[A");
+    first.expect_after(shell_selection, b"> Allow once");
+    first.write(b"\r");
     first.expect_occurrences(b"Allowed once", 2);
     first.expect_occurrences(b"Tool finished", 5);
     first.expect(b"OLD_PREFIX_SENTINEL");

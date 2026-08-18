@@ -13,6 +13,14 @@ pub(super) const MAX_MODEL_BYTES: usize = 256;
 pub(super) const MAX_SESSION_ID_BYTES: usize = 44;
 pub(super) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum TuiMode {
+    #[default]
+    Auto,
+    Enhanced,
+    Linear,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ParseAction {
     Help,
@@ -35,6 +43,7 @@ pub(super) struct CliOptions {
     pub(super) plugin_config: Option<String>,
     pub(super) resume: Option<SessionId>,
     pub(super) no_color: bool,
+    pub(super) tui: TuiMode,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -67,6 +76,8 @@ pub(super) enum ParseError {
     ValueTooLarge { option: &'static str },
     #[error("--resume requires one canonical lower-case session UUID v4")]
     InvalidSessionId,
+    #[error("--tui accepts only auto, enhanced, or linear")]
+    InvalidTuiMode,
 }
 
 pub(super) fn parse_args_os(
@@ -93,6 +104,7 @@ pub(super) fn parse_args_os(
     let mut workspace_seen = false;
     let mut plugin_config_seen = false;
     let mut resume_seen = false;
+    let mut tui_seen = false;
     let mut no_color_seen = false;
     let mut list_sessions_seen = false;
     let mut index = 0_usize;
@@ -123,6 +135,7 @@ pub(super) fn parse_args_os(
             ("--workspace", "--workspace"),
             ("--plugin-config", "--plugin-config"),
             ("--resume", "--resume"),
+            ("--tui", "--tui"),
         ]
         .into_iter()
         .find_map(|(prefix, option)| {
@@ -141,6 +154,7 @@ pub(super) fn parse_args_os(
                 &mut workspace_seen,
                 &mut plugin_config_seen,
                 &mut resume_seen,
+                &mut tui_seen,
             )?;
             index += 1;
             continue;
@@ -152,6 +166,7 @@ pub(super) fn parse_args_os(
             "--workspace" | "-w" => Some("--workspace"),
             "--plugin-config" => Some("--plugin-config"),
             "--resume" => Some("--resume"),
+            "--tui" => Some("--tui"),
             _ => None,
         };
         if let Some(option) = option {
@@ -167,6 +182,7 @@ pub(super) fn parse_args_os(
                 &mut workspace_seen,
                 &mut plugin_config_seen,
                 &mut resume_seen,
+                &mut tui_seen,
             )?;
             index += 2;
             continue;
@@ -181,7 +197,7 @@ pub(super) fn parse_args_os(
         return Err(ParseError::PositionalArgument);
     }
     if list_sessions_seen {
-        if prompt_seen || model_seen || plugin_config_seen || resume_seen {
+        if prompt_seen || model_seen || plugin_config_seen || resume_seen || tui_seen {
             return Err(ParseError::InvalidListSessionsOptions);
         }
         return Ok(ParseAction::ListSessions(ListSessionsOptions {
@@ -231,6 +247,7 @@ fn set_value(
     workspace_seen: &mut bool,
     plugin_config_seen: &mut bool,
     resume_seen: &mut bool,
+    tui_seen: &mut bool,
 ) -> Result<(), ParseError> {
     let (seen, maximum) = match option {
         "--prompt" => (&mut *prompt_seen, MAX_PROMPT_BYTES),
@@ -238,6 +255,7 @@ fn set_value(
         "--workspace" => (&mut *workspace_seen, MAX_WORKSPACE_BYTES),
         "--plugin-config" => (&mut *plugin_config_seen, MAX_PLUGIN_CONFIG_BYTES),
         "--resume" => (&mut *resume_seen, MAX_SESSION_ID_BYTES),
+        "--tui" => (&mut *tui_seen, 8),
         _ => return Err(ParseError::UnknownOption),
     };
     mark_once(seen, option)?;
@@ -253,6 +271,14 @@ fn set_value(
         "--workspace" => options.workspace = Some(value.to_owned()),
         "--plugin-config" => options.plugin_config = Some(value.to_owned()),
         "--resume" => options.resume = Some(parse_session_id(value)?),
+        "--tui" => {
+            options.tui = match value {
+                "auto" => TuiMode::Auto,
+                "enhanced" => TuiMode::Enhanced,
+                "linear" => TuiMode::Linear,
+                _ => return Err(ParseError::InvalidTuiMode),
+            }
+        }
         _ => return Err(ParseError::UnknownOption),
     }
     Ok(())
@@ -282,7 +308,7 @@ mod tests {
     use super::{
         MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES, MAX_PLUGIN_CONFIG_BYTES,
         MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError,
-        admit_args_os, parse_args_os,
+        TuiMode, admit_args_os, parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -323,6 +349,8 @@ mod tests {
             "/tmp/work",
             "--plugin-config",
             "/tmp/plugins.json",
+            "--tui",
+            "enhanced",
             "--no-color",
         ]))
         .unwrap();
@@ -331,6 +359,7 @@ mod tests {
             "--model=model-a",
             "--workspace=/tmp/work",
             "--plugin-config=/tmp/plugins.json",
+            "--tui=enhanced",
             "--no-color",
         ]))
         .unwrap();
@@ -342,6 +371,7 @@ mod tests {
         assert_eq!(options.model.as_deref(), Some("model-a"));
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
         assert_eq!(options.plugin_config.as_deref(), Some("/tmp/plugins.json"));
+        assert_eq!(options.tui, TuiMode::Enhanced);
         assert!(options.no_color);
     }
 
@@ -376,6 +406,7 @@ mod tests {
                 "--resume=session-550e8400-e29b-41d4-a716-446655440001",
             ][..],
             &["--no-color", "--no-color"][..],
+            &["--tui", "auto", "--tui=linear"][..],
         ] {
             assert!(matches!(
                 parse_args_os(os(values)),
@@ -392,6 +423,7 @@ mod tests {
             "--workspace",
             "--plugin-config",
             "--resume",
+            "--tui",
             "-p",
             "-m",
             "-w",
@@ -436,6 +468,7 @@ mod tests {
             &["--workspace="][..],
             &["--plugin-config="][..],
             &["--resume="][..],
+            &["--tui="][..],
         ] {
             assert!(matches!(
                 parse_args_os(os(values)),
@@ -519,6 +552,7 @@ mod tests {
         assert_eq!(options.plugin_config, None);
         assert_eq!(options.resume, None);
         assert!(!options.no_color);
+        assert_eq!(options.tui, TuiMode::Auto);
     }
 
     #[test]
@@ -539,6 +573,7 @@ mod tests {
             &["--list-sessions", "--prompt", "hello"][..],
             &["--list-sessions", "--model", "deepseek-chat"][..],
             &["--list-sessions", "--plugin-config", "/tmp/plugins.json"][..],
+            &["--list-sessions", "--tui", "linear"][..],
             &[
                 "--list-sessions",
                 "--resume",
@@ -547,6 +582,26 @@ mod tests {
             &["--list-sessions", "--list-sessions"][..],
         ] {
             assert!(parse_args_os(os(values)).is_err());
+        }
+    }
+
+    #[test]
+    fn tui_mode_has_a_closed_value_surface() {
+        for (value, expected) in [
+            ("auto", TuiMode::Auto),
+            ("enhanced", TuiMode::Enhanced),
+            ("linear", TuiMode::Linear),
+        ] {
+            let ParseAction::Run(options) = parse_args_os(os(&["--tui", value])).unwrap() else {
+                panic!("expected run options");
+            };
+            assert_eq!(options.tui, expected);
+        }
+        for value in ["", "full", "AUTO", "linear ", "screen"] {
+            assert!(matches!(
+                parse_args_os(os(&["--tui", value])),
+                Err(ParseError::EmptyValue { option: "--tui" }) | Err(ParseError::InvalidTuiMode)
+            ));
         }
     }
 

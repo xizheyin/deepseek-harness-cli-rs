@@ -163,6 +163,13 @@ fn last_tool_content(request: &str) -> String {
         .to_owned()
 }
 
+fn approve_once(dsh: &mut PtyHarness) {
+    let selection = dsh.checkpoint();
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(selection, b"> Allow once");
+    dsh.write(b"\r");
+}
+
 fn only_session_id(root: &Path) -> String {
     let mut sessions = fs::read_dir(root)
         .expect("session root should exist")
@@ -204,10 +211,10 @@ fn installed_dsh_runs_both_real_example_plugins_through_approval_and_session_res
     dsh.expect("❯".as_bytes());
     dsh.write(b"use both configured example plugins\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b[A\r");
+    approve_once(&mut dsh);
     dsh.expect(b"Tool finished");
-    dsh.approval_ready_occurrence(2);
-    dsh.write(b"\x1b[A\r");
+    dsh.approval_ready_for_call(b"call-json-format");
+    approve_once(&mut dsh);
     dsh.expect_occurrences(b"Tool finished", 2);
     dsh.expect(b"both example plugins completed");
     dsh.expect_occurrences("❯".as_bytes(), 2);
@@ -249,7 +256,7 @@ fn wrong_id_fault_plugin_never_becomes_a_success_and_is_reaped_on_exit() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"run the configured fault probe\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b[A\r");
+    approve_once(&mut dsh);
     dsh.expect(b"Tool failed");
     dsh.expect(b"fault result handled without replay");
     dsh.expect_occurrences("❯".as_bytes(), 2);
@@ -288,7 +295,7 @@ fn crash_after_dispatch_is_recorded_once_and_never_replayed_after_resume() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"run the crashing plugin once\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b[A\r");
+    approve_once(&mut dsh);
     dsh.expect(b"Tool failed");
     dsh.expect(b"plugin crash was recorded");
     dsh.expect_occurrences("❯".as_bytes(), 2);
@@ -359,7 +366,7 @@ fn matching_result_settles_the_current_call_before_extra_output_poisons_future_c
         dsh.expect("❯".as_bytes());
         dsh.write(b"run the configured extra-output probe\r");
         dsh.approval_ready();
-        dsh.write(b"\x1b[A\r");
+        approve_once(&mut dsh);
         dsh.expect(b"Tool finished");
         dsh.expect(b"Tool failed");
         dsh.expect(b"the matching plugin result stayed authoritative");
@@ -372,8 +379,8 @@ fn matching_result_settles_the_current_call_before_extra_output_poisons_future_c
             "{mode}: {transcript}"
         );
         assert_eq!(
-            transcript.matches("Approval required").count(),
-            2,
+            transcript.matches("  call  ").count(),
+            1,
             "the known-dead plugin must not ask for a second approval: {mode}: {transcript}"
         );
 
@@ -402,7 +409,7 @@ fn cancellation_is_latched_even_when_the_fault_plugin_returns_a_matching_result(
     dsh.expect("❯".as_bytes());
     dsh.write(b"start the cancellable fault probe\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b[A\r");
+    approve_once(&mut dsh);
     dsh.expect(b"Allowed once");
     dsh.write(&[0x03]);
     dsh.expect_occurrences("❯".as_bytes(), 2);
@@ -434,7 +441,7 @@ fn matching_value_that_breaks_the_declared_output_schema_is_a_definite_error() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"run the invalid-output probe\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b[A\r");
+    approve_once(&mut dsh);
     dsh.expect(b"Tool failed");
     dsh.expect(b"invalid plugin output was handled");
     dsh.expect_occurrences("❯".as_bytes(), 2);
@@ -467,7 +474,7 @@ fn ignored_plugin_cancellation_is_force_cleaned_before_the_prompt_returns() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"start the uncooperative fault probe\r");
     dsh.approval_ready();
-    dsh.write(b"\x1b[A\r");
+    approve_once(&mut dsh);
     dsh.expect(b"Allowed once");
     let marker_deadline = Instant::now() + Duration::from_secs(3);
     while !child_marker.exists() {
@@ -518,7 +525,7 @@ fn protocol_stdout_and_stderr_limits_fail_closed_without_hanging_the_cli() {
         dsh.expect("❯".as_bytes());
         dsh.write(b"run the bounded output fault\r");
         dsh.approval_ready();
-        dsh.write(b"\x1b[A\r");
+        approve_once(&mut dsh);
         dsh.expect(b"Tool failed");
         dsh.expect(b"bounded plugin fault handled");
         dsh.expect_occurrences("❯".as_bytes(), 2);

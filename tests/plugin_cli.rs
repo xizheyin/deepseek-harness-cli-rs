@@ -181,7 +181,14 @@ fn configured_plugin_is_model_visible_but_dispatches_only_after_terminal_approva
         !workspace.0.join("plugin-calls.log").exists(),
         "the plugin must not receive a call before approval"
     );
-    dsh.write(b"\x1b[A\r");
+    let selected = dsh.checkpoint();
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(selected, b"> Allow once");
+    assert!(
+        !workspace.0.join("plugin-calls.log").exists(),
+        "selection alone must not dispatch the plugin"
+    );
+    dsh.write(b"\r");
     dsh.expect(b"Allowed once");
     dsh.expect(b"Tool finished");
     dsh.expect(b"plugin round complete");

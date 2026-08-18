@@ -1,34 +1,9 @@
 use std::fmt::Write as _;
 
+use crate::tui::visible::VisibleChar;
+
 pub(super) const VISIBLE_SCRATCH_BYTES: usize = 8 * 1024;
 const MAX_VISIBLE_ESCAPE_BYTES: usize = 10;
-
-// Unicode 16.0 General_Category=Cf, frozen because Rust 1.85 ships that table.
-// Keeping the data here makes the terminal-safety boundary reviewable without
-// adding a large Unicode classification dependency.
-const UNICODE_16_FORMAT_RANGES: &[(u32, u32)] = &[
-    (0x00AD, 0x00AD),
-    (0x0600, 0x0605),
-    (0x061C, 0x061C),
-    (0x06DD, 0x06DD),
-    (0x070F, 0x070F),
-    (0x0890, 0x0891),
-    (0x08E2, 0x08E2),
-    (0x180E, 0x180E),
-    (0x200B, 0x200F),
-    (0x202A, 0x202E),
-    (0x2060, 0x2064),
-    (0x2066, 0x206F),
-    (0xFEFF, 0xFEFF),
-    (0xFFF9, 0xFFFB),
-    (0x110BD, 0x110BD),
-    (0x110CD, 0x110CD),
-    (0x13430, 0x1343F),
-    (0x1BCA0, 0x1BCA3),
-    (0x1D173, 0x1D17A),
-    (0xE0001, 0xE0001),
-    (0xE0020, 0xE007F),
-];
 
 /// Converts untrusted text into bytes that a terminal cannot interpret as
 /// cursor movement, clipboard access, or bidi formatting.
@@ -83,22 +58,20 @@ impl VisibleRenderer {
                 self.at_line_start = false;
             }
 
-            match character {
-                '\n' if !escape_line_feed => {
+            match VisibleChar::classify(character, escape_line_feed) {
+                VisibleChar::LineFeed => {
                     self.append_piece("\n", &mut emit)?;
                     self.at_line_start = true;
                 }
-                '\n' => self.append_piece("\\n", &mut emit)?,
-                '\t' => self.append_piece("\\t", &mut emit)?,
-                '\r' => self.append_piece("\\r", &mut emit)?,
-                character if must_escape(character) => {
+                VisibleChar::ShortEscape(escape) => self.append_piece(escape, &mut emit)?,
+                VisibleChar::UnicodeEscape(value) => {
                     self.ensure_room(MAX_VISIBLE_ESCAPE_BYTES, &mut emit)?;
                     // Writing to String is infallible. Capacity was reserved
                     // before this bounded (at most ten-byte) escape.
-                    write!(&mut self.scratch, "\\u{{{:x}}}", u32::from(character))
+                    write!(&mut self.scratch, "\\u{{{value:x}}}")
                         .expect("writing to a String cannot fail");
                 }
-                character => {
+                VisibleChar::Printable(character) => {
                     let mut encoded = [0_u8; 4];
                     self.append_piece(character.encode_utf8(&mut encoded), &mut emit)?;
                 }
@@ -179,29 +152,6 @@ impl VisibleRenderer {
     }
 }
 
-fn must_escape(character: char) -> bool {
-    let value = u32::from(character);
-    UNICODE_16_FORMAT_RANGES
-        .iter()
-        .any(|(start, end)| (*start..=*end).contains(&value))
-        || matches!(
-            value,
-            0x0000..=0x001F
-                | 0x007F..=0x009F
-                | 0x034F
-                | 0x115F..=0x1160
-                | 0x17B4..=0x17B5
-                | 0x180B..=0x180F
-                | 0x2028..=0x2029
-                | 0x2065
-                | 0x3164
-                | 0xFE00..=0xFE0F
-                | 0xFFA0
-                | 0x13440..=0x13455
-                | 0xE0100..=0xE01EF
-        )
-}
-
 #[cfg(test)]
 fn render_for_test(input: &str, prefix: Option<&'static str>) -> String {
     let mut rendered = String::new();
@@ -216,18 +166,7 @@ fn render_for_test(input: &str, prefix: Option<&'static str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{UNICODE_16_FORMAT_RANGES, VISIBLE_SCRATCH_BYTES, must_escape, render_for_test};
-
-    #[test]
-    fn sanitizer_table_is_frozen_to_rust_1_85_unicode_16() {
-        assert_eq!(char::UNICODE_VERSION, (16, 0, 0));
-        for &(start, end) in UNICODE_16_FORMAT_RANGES {
-            for value in start..=end {
-                let character = char::from_u32(value).expect("the frozen range contains scalars");
-                assert!(must_escape(character), "U+{value:04X} was not escaped");
-            }
-        }
-    }
+    use super::{VISIBLE_SCRATCH_BYTES, render_for_test};
 
     #[test]
     fn visible_renderer_preserves_printable_unicode_and_line_feeds() {

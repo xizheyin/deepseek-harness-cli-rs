@@ -3,7 +3,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Condvar, Mutex,
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -41,7 +41,16 @@ pub struct CancelThenSseServer {
 pub struct GatedFirstSseServer {
     pub base_url: String,
     release: Option<SyncSender<()>>,
+    first_request_ready: Receiver<()>,
     worker: Option<thread::JoinHandle<Vec<String>>>,
+    _terminal_permit: TerminalTestPermit,
+}
+
+pub struct GatedThenStalledSseServer {
+    pub base_url: String,
+    release: Option<SyncSender<()>>,
+    second_request_ready: Receiver<()>,
+    worker: Option<thread::JoinHandle<(Vec<String>, bool)>>,
     _terminal_permit: TerminalTestPermit,
 }
 
@@ -311,6 +320,7 @@ impl GatedFirstSseServer {
                 .expect("loopback listener should have an address")
         );
         let (release, wait_for_release) = sync_channel(0);
+        let (first_ready, first_request_ready) = sync_channel(1);
         let worker = thread::spawn(move || {
             let (mut stream, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)
                 .expect("dsh should make the gated request");
@@ -323,6 +333,9 @@ impl GatedFirstSseServer {
             let mut requests = vec![
                 String::from_utf8(read_http_request(&mut stream)).expect("request should be UTF-8"),
             ];
+            first_ready
+                .send(())
+                .expect("gated request observer should remain available");
             let body_bytes = first
                 .len()
                 .checked_add(second.len())
@@ -363,6 +376,7 @@ impl GatedFirstSseServer {
         Self {
             base_url,
             release: Some(release),
+            first_request_ready,
             worker: Some(worker),
             _terminal_permit: terminal_permit,
         }
@@ -376,7 +390,117 @@ impl GatedFirstSseServer {
             .expect("server should still be waiting");
     }
 
+    pub fn assert_no_first_request(&self, timeout: Duration) {
+        match self.first_request_ready.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) => panic!("dsh dispatched a request before the explicit test action"),
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("gated request observer disconnected before its deadline")
+            }
+        }
+    }
+
     pub fn finish(mut self) -> Vec<String> {
+        drop(self.release.take());
+        self.worker
+            .take()
+            .expect("server worker should exist")
+            .join()
+            .expect("server worker should join")
+    }
+}
+
+impl GatedThenStalledSseServer {
+    pub fn start(first: String, second: String) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("loopback listener should become nonblocking");
+        let base_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("loopback listener should have an address")
+        );
+        let (release, wait_for_release) = sync_channel(0);
+        let (ready_sender, second_request_ready) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = accept_with_deadline(&listener, INITIAL_ACCEPT_TIMEOUT)
+                .expect("dsh should make the gated request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("request read should be bounded");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("response write should be bounded");
+            let first_request =
+                String::from_utf8(read_http_request(&mut stream)).expect("request should be UTF-8");
+            let body_bytes = first
+                .len()
+                .checked_add(second.len())
+                .expect("test response length should fit");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {body_bytes}\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .and_then(|()| stream.write_all(first.as_bytes()))
+                .and_then(|()| stream.flush())
+                .expect("gated SSE prefix should write");
+            wait_for_release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the test should release the first response");
+            stream
+                .write_all(second.as_bytes())
+                .and_then(|()| stream.flush())
+                .expect("gated SSE suffix should write");
+
+            let (mut stalled, _) = accept_with_deadline(&listener, FOLLOWUP_ACCEPT_TIMEOUT)
+                .expect("the queued prompt should become the second request");
+            stalled
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("request read should be bounded");
+            stalled
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("response write should be bounded");
+            let second_request = String::from_utf8(read_http_request(&mut stalled))
+                .expect("request should be UTF-8");
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+            stalled
+                .write_all(headers.as_bytes())
+                .and_then(|()| stalled.flush())
+                .expect("stalled response headers should write");
+            ready_sender
+                .send(())
+                .expect("the queue test should still be waiting");
+            let closed = wait_for_client_close(stalled);
+            (vec![first_request, second_request], closed)
+        });
+        Self {
+            base_url,
+            release: Some(release),
+            second_request_ready,
+            worker: Some(worker),
+            _terminal_permit: terminal_permit,
+        }
+    }
+
+    pub fn release(&mut self) {
+        self.release
+            .take()
+            .expect("release sender should exist")
+            .send(())
+            .expect("server should still be waiting");
+    }
+
+    pub fn wait_until_second_request(&self) {
+        self.second_request_ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reserved queue front should become the second request");
+    }
+
+    pub fn finish(mut self) -> (Vec<String>, bool) {
         drop(self.release.take());
         self.worker
             .take()

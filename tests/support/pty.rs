@@ -88,7 +88,7 @@ pub struct PtyHarness {
     reader: Option<thread::JoinHandle<()>>,
     transcript: Arc<(Mutex<TranscriptState>, Condvar)>,
     reader_control: ReaderControl,
-    color: bool,
+    enhanced: bool,
     initial_terminal_state: String,
     _session_root: TestSessionRoot,
 }
@@ -103,6 +103,15 @@ pub enum DisabledTerminalMode {
     EchoControls,
     OutputPostprocess,
     OutputNewlineMapping,
+}
+
+pub struct AutoTuiProfile<'a> {
+    pub term: &'a str,
+    pub environment: Option<(&'a str, &'a str)>,
+    pub size: (u16, u16),
+    pub no_color_argument: bool,
+    pub no_color_environment: bool,
+    pub enhanced: bool,
 }
 
 pub struct JobControlHarness {
@@ -120,16 +129,24 @@ pub struct JobControlHarness {
 
 struct PtyLaunch {
     color: bool,
+    enhanced: bool,
     binary: PathBuf,
     extra_args: Vec<std::ffi::OsString>,
+    extra_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    initial_rows: u16,
+    initial_columns: u16,
 }
 
 impl PtyLaunch {
     fn cargo(color: bool) -> Self {
         Self {
             color,
+            enhanced: color,
             binary: cargo_test_binary(),
             extra_args: Vec::new(),
+            extra_environment: Vec::new(),
+            initial_rows: 24,
+            initial_columns: 120,
         }
     }
 
@@ -137,8 +154,12 @@ impl PtyLaunch {
     fn cargo_with_plugin(color: bool, config: &Path) -> Self {
         Self {
             color,
+            enhanced: color,
             binary: cargo_test_binary(),
             extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
+            extra_environment: Vec::new(),
+            initial_rows: 24,
+            initial_columns: 120,
         }
     }
 
@@ -146,6 +167,7 @@ impl PtyLaunch {
     fn cargo_script_with_plugin(config: &Path, prompt: &str) -> Self {
         Self {
             color: false,
+            enhanced: false,
             binary: cargo_test_binary(),
             extra_args: vec![
                 "--plugin-config".into(),
@@ -153,6 +175,9 @@ impl PtyLaunch {
                 "--prompt".into(),
                 prompt.into(),
             ],
+            extra_environment: Vec::new(),
+            initial_rows: 24,
+            initial_columns: 120,
         }
     }
 
@@ -160,8 +185,12 @@ impl PtyLaunch {
     fn installed(color: bool) -> Self {
         Self {
             color,
+            enhanced: color,
             binary: dsh_binary(),
             extra_args: Vec::new(),
+            extra_environment: Vec::new(),
+            initial_rows: 24,
+            initial_columns: 120,
         }
     }
 
@@ -169,8 +198,12 @@ impl PtyLaunch {
     fn installed_with_plugin(color: bool, config: &Path) -> Self {
         Self {
             color,
+            enhanced: color,
             binary: dsh_binary(),
             extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
+            extra_environment: Vec::new(),
+            initial_rows: 24,
+            initial_columns: 120,
         }
     }
 }
@@ -234,6 +267,45 @@ impl PtyHarness {
             None,
             PtyLaunch::cargo(true),
         )
+    }
+
+    pub fn spawn_color_with_tui_mode(base_url: &str, workspace: &Path, mode: &str) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch.enhanced = matches!(mode, "auto" | "enhanced");
+        launch.extra_args = vec!["--tui".into(), mode.into()];
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, launch)
+    }
+
+    pub fn spawn_auto_with_profile(
+        base_url: &str,
+        workspace: &Path,
+        profile: AutoTuiProfile<'_>,
+    ) -> Self {
+        let AutoTuiProfile {
+            term,
+            environment,
+            size,
+            no_color_argument,
+            no_color_environment,
+            enhanced,
+        } = profile;
+        let mut launch = PtyLaunch::cargo(true);
+        launch.enhanced = enhanced;
+        launch.initial_rows = size.0;
+        launch.initial_columns = size.1;
+        launch.extra_environment.push(("TERM".into(), term.into()));
+        if let Some((name, value)) = environment {
+            launch.extra_environment.push((name.into(), value.into()));
+        }
+        if no_color_environment {
+            launch
+                .extra_environment
+                .push(("NO_COLOR".into(), "1".into()));
+        }
+        if no_color_argument {
+            launch.extra_args.push("--no-color".into());
+        }
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, launch)
     }
 
     #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
@@ -434,8 +506,12 @@ impl PtyHarness {
     ) -> Self {
         let PtyLaunch {
             color,
+            enhanced,
             binary,
             extra_args,
+            extra_environment,
+            initial_rows,
+            initial_columns,
         } = launch;
         let (master, slave) = open_test_pty();
         let mut termios =
@@ -510,7 +586,7 @@ impl PtyHarness {
                 .expect("initialized PTY terminal settings should be readable")
         );
         master
-            .resize(Size::new(24, 120))
+            .resize(Size::new(initial_rows, initial_columns))
             .expect("PTY should resize");
         let reader_fd = rustix::io::dup(&master).expect("PTY master should duplicate");
         let transcript = Arc::new((
@@ -568,6 +644,10 @@ impl PtyHarness {
         } else {
             command.env("TERM", "dumb").env("NO_COLOR", "1")
         };
+        let mut command = command;
+        for (name, value) in extra_environment {
+            command = command.env(name, value);
+        }
         let child = command.spawn(slave).expect("dsh should spawn on the PTY");
         Self {
             master: Some(master),
@@ -575,7 +655,7 @@ impl PtyHarness {
             reader: Some(reader),
             transcript,
             reader_control,
-            color,
+            enhanced,
             initial_terminal_state,
             _session_root: session_root,
         }
@@ -687,6 +767,37 @@ impl PtyHarness {
         format!("{state:?}")
     }
 
+    pub fn initial_terminal_state(&self) -> &str {
+        &self.initial_terminal_state
+    }
+
+    pub fn terminal_uses_application_mode(&self) -> bool {
+        let state =
+            rustix::termios::tcgetattr(self.master.as_ref().expect("PTY master should exist"))
+                .expect("PTY terminal state should be readable");
+        !state
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON)
+            && !state
+                .local_modes
+                .contains(rustix::termios::LocalModes::ECHO)
+            && !state
+                .local_modes
+                .contains(rustix::termios::LocalModes::ECHONL)
+            && state
+                .local_modes
+                .contains(rustix::termios::LocalModes::ISIG)
+            && !state
+                .input_modes
+                .contains(rustix::termios::InputModes::ICRNL)
+            && !state
+                .input_modes
+                .contains(rustix::termios::InputModes::IXON)
+            && !state
+                .input_modes
+                .contains(rustix::termios::InputModes::IXOFF)
+    }
+
     pub fn expect(&mut self, marker: &[u8]) {
         self.expect_occurrences(marker, 1);
     }
@@ -748,18 +859,49 @@ impl PtyHarness {
             .clone()
     }
 
+    pub fn checkpoint(&self) -> usize {
+        self.transcript
+            .0
+            .lock()
+            .expect("transcript mutex should lock")
+            .bytes
+            .len()
+    }
+
+    pub fn expect_after(&mut self, offset: usize, marker: &[u8]) {
+        expect_transcript_after(&self.transcript, self.child.as_mut(), offset, marker);
+    }
+
     pub fn approval_ready(&mut self) {
         self.approval_ready_occurrence(1);
     }
 
     pub fn approval_ready_occurrence(&mut self, expected: usize) {
-        let title = if self.color {
+        let title = if self.enhanced {
             b"Approval required".as_slice()
         } else {
             b"[approval required]".as_slice()
         };
         self.expect_occurrences(title, expected);
         self.expect_occurrences(b"Enter confirm", expected);
+        wait_for_selector_mode(self.master.as_ref().expect("PTY master should exist"));
+    }
+
+    #[allow(dead_code)] // Used by the separately compiled plugin-example binary.
+    pub fn approval_ready_for_call(&mut self, call_id: &[u8]) {
+        self.expect(call_id);
+        let snapshot = self.snapshot();
+        let offset = snapshot
+            .windows(call_id.len())
+            .rposition(|window| window == call_id)
+            .map(|start| start + call_id.len())
+            .expect("the awaited approval call ID should be in the transcript");
+        let marker = if self.enhanced {
+            b"Arrow keys move | Enter confirms | Esc stops".as_slice()
+        } else {
+            b"[approval required]".as_slice()
+        };
+        self.expect_after(offset, marker);
         wait_for_selector_mode(self.master.as_ref().expect("PTY master should exist"));
     }
 

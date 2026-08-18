@@ -6,7 +6,11 @@ use crate::session::{
     ApprovalOutcome, CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap,
     UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiTurnEndReason,
 };
-use crate::tui::projector::UiProjector;
+use crate::tui::{
+    presentation::{PresentationError, PresentedChunk, PresentedChunkBuilder, TextStyle},
+    projector::UiProjector,
+    visible::render_visible_owned,
+};
 
 use super::{
     render::VisibleRenderer,
@@ -106,6 +110,16 @@ impl LiveFrame {
 
     pub(super) fn notice(value: &'static str) -> Result<Self, LiveRenderError> {
         Self::trusted(value)
+    }
+
+    pub(super) fn human_message(text: String) -> Result<Self, LiveRenderError> {
+        let mut parts = try_parts(2)?;
+        parts.push(LivePart::Untrusted {
+            role: UiRole::User,
+            text,
+        });
+        parts.push(LivePart::TrustedInline("\n\n"));
+        Ok(Self { parts })
     }
 
     pub(super) fn stopped(skipped: usize) -> Result<Self, LiveRenderError> {
@@ -268,6 +282,269 @@ pub(super) struct InteractivePresenter {
     theme: UiTheme,
 }
 
+#[derive(Clone)]
+pub(super) struct EnhancedPresenter {
+    at_line_start: bool,
+    active_role: Option<UiRole>,
+}
+
+pub(super) struct PreparedPresentation {
+    chunk: PresentedChunk,
+    next: EnhancedPresenter,
+}
+
+impl fmt::Debug for PreparedPresentation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedPresentation")
+            .field("chunk", &self.chunk)
+            .finish()
+    }
+}
+
+impl PreparedPresentation {
+    pub(super) const fn chunk(&self) -> &PresentedChunk {
+        &self.chunk
+    }
+
+    pub(super) fn force_next_line_boundary(&mut self) {
+        self.next.force_line_boundary();
+    }
+}
+
+impl EnhancedPresenter {
+    pub(super) fn new() -> Self {
+        Self {
+            at_line_start: true,
+            active_role: None,
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        frame: LiveFrame,
+    ) -> Result<PreparedPresentation, LiveRenderError> {
+        let mut next = self.clone();
+        let chunk = next.present_mut(frame)?;
+        Ok(PreparedPresentation { chunk, next })
+    }
+
+    pub(super) fn commit(&mut self, prepared: PreparedPresentation) {
+        *self = prepared.next;
+    }
+
+    pub(super) fn force_line_boundary(&mut self) {
+        self.at_line_start = true;
+        self.active_role = None;
+    }
+
+    fn present_mut(&mut self, frame: LiveFrame) -> Result<PresentedChunk, LiveRenderError> {
+        let mut builder = PresentedChunk::builder();
+        for part in frame.parts {
+            match part {
+                LivePart::TrustedLine(text) => {
+                    self.ensure_line_start(&mut builder)?;
+                    let (style, text) = enhanced_trusted_line(text);
+                    self.push_text_with_lines(&mut builder, style, text)?;
+                    self.active_role = None;
+                }
+                LivePart::TrustedOwned(text) => {
+                    self.ensure_line_start(&mut builder)?;
+                    let text = strip_product_terminal_controls(&text)?;
+                    self.push_text_with_lines(&mut builder, TextStyle::Warning, &text)?;
+                    self.active_role = None;
+                }
+                LivePart::TrustedInline(text) => {
+                    if !self.at_line_start {
+                        self.push_text_with_lines(&mut builder, TextStyle::Plain, text)?;
+                    }
+                    if text.ends_with('\n') {
+                        self.active_role = None;
+                    }
+                }
+                LivePart::Untrusted { role, text } => {
+                    let text = render_visible_owned(&text, false).map_err(|_| LiveRenderError)?;
+                    self.push_role_fragment(&mut builder, role, &text)?;
+                }
+            }
+        }
+        Ok(builder.finish())
+    }
+
+    fn ensure_line_start(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+    ) -> Result<(), LiveRenderError> {
+        if !self.at_line_start {
+            builder.push_line_feed().map_err(map_presentation_error)?;
+            self.at_line_start = true;
+        }
+        Ok(())
+    }
+
+    fn push_role_fragment(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+        role: UiRole,
+        text: &str,
+    ) -> Result<(), LiveRenderError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self.active_role != Some(role) && !self.at_line_start {
+            self.ensure_line_start(builder)?;
+        }
+        let style = style_for_role(role);
+        for segment in text.split_inclusive('\n') {
+            let (content, line_feed) = segment
+                .strip_suffix('\n')
+                .map_or((segment, false), |content| (content, true));
+            if self.at_line_start {
+                builder
+                    .push_text(style, prefix_for_role(role))
+                    .map_err(map_presentation_error)?;
+                self.at_line_start = false;
+            }
+            builder
+                .push_text(style, content)
+                .map_err(map_presentation_error)?;
+            if line_feed {
+                builder.push_line_feed().map_err(map_presentation_error)?;
+                self.at_line_start = true;
+            }
+        }
+        self.active_role = Some(role);
+        Ok(())
+    }
+
+    fn push_text_with_lines(
+        &mut self,
+        builder: &mut PresentedChunkBuilder,
+        style: TextStyle,
+        text: &str,
+    ) -> Result<(), LiveRenderError> {
+        for segment in text.split_inclusive('\n') {
+            let (content, line_feed) = segment
+                .strip_suffix('\n')
+                .map_or((segment, false), |content| (content, true));
+            builder
+                .push_text(style, content)
+                .map_err(map_presentation_error)?;
+            if !content.is_empty() {
+                self.at_line_start = false;
+            }
+            if line_feed {
+                builder.push_line_feed().map_err(map_presentation_error)?;
+                self.at_line_start = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn map_presentation_error(_: PresentationError) -> LiveRenderError {
+    LiveRenderError
+}
+
+fn style_for_role(role: UiRole) -> TextStyle {
+    match role {
+        UiRole::User => TextStyle::User,
+        UiRole::Assistant => TextStyle::Assistant,
+        UiRole::Reasoning | UiRole::Arguments | UiRole::Call => TextStyle::Muted,
+        UiRole::Tool | UiRole::Dsh => TextStyle::Accent,
+        UiRole::Reason | UiRole::Preview => TextStyle::Warning,
+        UiRole::Error => TextStyle::Error,
+    }
+}
+
+fn prefix_for_role(role: UiRole) -> &'static str {
+    match role {
+        UiRole::User => "YOU  ",
+        UiRole::Assistant => "DSH  ",
+        UiRole::Reasoning => "Thinking  ",
+        UiRole::Tool => "Tool  ",
+        UiRole::Arguments => "  args  ",
+        UiRole::Call => "  call  ",
+        UiRole::Reason => "  why  ",
+        UiRole::Preview => "  | ",
+        UiRole::Dsh => "dsh-rs  ",
+        UiRole::Error => "Error  ",
+    }
+}
+
+fn enhanced_trusted_line(text: &'static str) -> (TextStyle, &'static str) {
+    match text {
+        "[working; press Ctrl+C to stop]\n" => (TextStyle::Accent, "Working · Ctrl+C to stop\n"),
+        "[tool requested]\n" => (TextStyle::Accent, "Tool requested\n"),
+        "[tool result: success]\n" => (TextStyle::Success, "Tool finished\n"),
+        "[tool result: error]\n" => (TextStyle::Error, "Tool failed\n"),
+        "[approval requested]\n" => (TextStyle::Warning, "Approval required\n"),
+        "[approval answer not recognized]\n" => {
+            (TextStyle::Warning, "Choose an approval action again\n")
+        }
+        "[approval: allowed once]\n" => (TextStyle::Success, "Allowed once\n"),
+        "[approval: rejected]\n" => (TextStyle::Warning, "Rejected\n"),
+        "[approval: cancelled]\n" => (TextStyle::Warning, "Cancelled\n"),
+        "[approval: unavailable]\n" => (TextStyle::Error, "Approval unavailable\n"),
+        "[model retry scheduled]\n" => (TextStyle::Warning, "Model retry scheduled\n"),
+        "[model retry started]\n" => (TextStyle::Warning, "Retrying model request\n"),
+        "[done]\n" => (TextStyle::Success, "Done\n"),
+        "[stopped]\n" => (TextStyle::Warning, "Stopped\n"),
+        "[blocked]\n" => (TextStyle::Warning, "Blocked\n"),
+        "[maximum tokens reached]\n" => (TextStyle::Warning, "Maximum tokens reached\n"),
+        "[interrupted]\n" => (TextStyle::Warning, "Interrupted\n"),
+        "[turn error]\n" => (TextStyle::Error, "Turn failed\n"),
+        "[turn ended]\n" => (TextStyle::Warning, "Turn ended\n"),
+        _ => (TextStyle::Plain, text),
+    }
+}
+
+fn strip_product_terminal_controls(text: &str) -> Result<String, LiveRenderError> {
+    let bytes = text.as_bytes();
+    let mut output = String::new();
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| LiveRenderError)?;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\x1b' => {
+                if bytes.get(index + 1) != Some(&b'[') {
+                    return Err(LiveRenderError);
+                }
+                index += 2;
+                let mut found_final = false;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    index += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        found_final = true;
+                        break;
+                    }
+                }
+                if !found_final {
+                    return Err(LiveRenderError);
+                }
+            }
+            b'\r' => index += 1,
+            b'\n' => {
+                output.push('\n');
+                index += 1;
+            }
+            byte if byte < 0x20 || byte == 0x7f => return Err(LiveRenderError),
+            _ => {
+                let rest = &text[index..];
+                let character = rest.chars().next().ok_or(LiveRenderError)?;
+                output.push(character);
+                index = index
+                    .checked_add(character.len_utf8())
+                    .ok_or(LiveRenderError)?;
+            }
+        }
+    }
+    Ok(output)
+}
+
 impl InteractivePresenter {
     #[cfg(test)]
     pub(super) fn new() -> Self {
@@ -371,6 +648,11 @@ impl InteractivePresenter {
     pub(super) fn discard_partly_written_frame(&mut self) {
         self.active_role = None;
         self.visible.force_line_boundary_on_next_output();
+    }
+
+    pub(super) fn observe_external_line_start(&mut self) {
+        self.active_role = None;
+        self.visible.force_line_start(true);
     }
 }
 
@@ -986,11 +1268,12 @@ mod tests {
         UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiOpaquePayload,
         UiToolFailure, UiTurnEndReason, UnixMillis,
     };
-    use crate::tui::projector::UiProjector;
+    use crate::tui::{presentation::PresentedItem, projector::UiProjector};
 
+    use super::super::theme::UiRole;
     use super::{
-        AttemptState, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame, LiveRenderer,
-        MAX_ATTEMPT_BLOCKS, MAX_ATTEMPT_TEXT_BYTES,
+        AttemptState, EnhancedPresenter, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame,
+        LivePart, LiveRenderer, MAX_ATTEMPT_BLOCKS, MAX_ATTEMPT_TEXT_BYTES,
     };
 
     fn event(seq: u64, kind: CommittedUiKind) -> CommittedUiEvent {
@@ -1003,6 +1286,37 @@ mod tests {
 
     fn identity(value: &str) -> UiIdentity {
         UiIdentity::from_text_for_test(value)
+    }
+
+    fn presented_text(presentation: &super::PreparedPresentation) -> String {
+        let mut text = String::new();
+        for item in presentation.chunk().items() {
+            match item {
+                PresentedItem::Text { text: value, .. } => text.push_str(value),
+                PresentedItem::LineFeed => text.push('\n'),
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn enhanced_presentation_state_changes_only_after_commit() {
+        let mut presenter = EnhancedPresenter::new();
+        let frame = || LiveFrame {
+            parts: vec![LivePart::Untrusted {
+                role: UiRole::Assistant,
+                text: "partial".to_owned(),
+            }],
+        };
+        let abandoned = presenter.prepare(frame()).unwrap();
+        assert_eq!(presented_text(&abandoned), "DSH  partial");
+
+        let retry = presenter.prepare(frame()).unwrap();
+        assert_eq!(presented_text(&retry), "DSH  partial");
+        presenter.commit(retry);
+
+        let continuation = presenter.prepare(frame()).unwrap();
+        assert_eq!(presented_text(&continuation), "partial");
     }
 
     fn render(
