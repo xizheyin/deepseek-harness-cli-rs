@@ -8,6 +8,7 @@ pub(super) const MAX_ARGV_ENTRIES: usize = 16;
 pub(super) const MAX_ARGV_AGGREGATE_BYTES: usize = 1024 * 1024 + 8 * 1024;
 pub(super) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_WORKSPACE_BYTES: usize = 4_096;
+pub(super) const MAX_PLUGIN_CONFIG_BYTES: usize = 4_096;
 pub(super) const MAX_MODEL_BYTES: usize = 256;
 pub(super) const MAX_SESSION_ID_BYTES: usize = 44;
 pub(super) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -31,6 +32,7 @@ pub(super) struct CliOptions {
     pub(super) prompt: Option<String>,
     pub(super) model: Option<String>,
     pub(super) workspace: Option<String>,
+    pub(super) plugin_config: Option<String>,
     pub(super) resume: Option<SessionId>,
     pub(super) no_color: bool,
 }
@@ -89,6 +91,7 @@ pub(super) fn parse_args_os(
     let mut prompt_seen = false;
     let mut model_seen = false;
     let mut workspace_seen = false;
+    let mut plugin_config_seen = false;
     let mut resume_seen = false;
     let mut no_color_seen = false;
     let mut list_sessions_seen = false;
@@ -118,6 +121,7 @@ pub(super) fn parse_args_os(
             ("--prompt", "--prompt"),
             ("--model", "--model"),
             ("--workspace", "--workspace"),
+            ("--plugin-config", "--plugin-config"),
             ("--resume", "--resume"),
         ]
         .into_iter()
@@ -135,6 +139,7 @@ pub(super) fn parse_args_os(
                 &mut prompt_seen,
                 &mut model_seen,
                 &mut workspace_seen,
+                &mut plugin_config_seen,
                 &mut resume_seen,
             )?;
             index += 1;
@@ -145,6 +150,7 @@ pub(super) fn parse_args_os(
             "--prompt" | "-p" => Some("--prompt"),
             "--model" | "-m" => Some("--model"),
             "--workspace" | "-w" => Some("--workspace"),
+            "--plugin-config" => Some("--plugin-config"),
             "--resume" => Some("--resume"),
             _ => None,
         };
@@ -159,6 +165,7 @@ pub(super) fn parse_args_os(
                 &mut prompt_seen,
                 &mut model_seen,
                 &mut workspace_seen,
+                &mut plugin_config_seen,
                 &mut resume_seen,
             )?;
             index += 2;
@@ -174,7 +181,7 @@ pub(super) fn parse_args_os(
         return Err(ParseError::PositionalArgument);
     }
     if list_sessions_seen {
-        if prompt_seen || model_seen || resume_seen {
+        if prompt_seen || model_seen || plugin_config_seen || resume_seen {
             return Err(ParseError::InvalidListSessionsOptions);
         }
         return Ok(ParseAction::ListSessions(ListSessionsOptions {
@@ -214,6 +221,7 @@ fn mark_once(seen: &mut bool, option: &'static str) -> Result<(), ParseError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_value(
     options: &mut CliOptions,
     option: &'static str,
@@ -221,12 +229,14 @@ fn set_value(
     prompt_seen: &mut bool,
     model_seen: &mut bool,
     workspace_seen: &mut bool,
+    plugin_config_seen: &mut bool,
     resume_seen: &mut bool,
 ) -> Result<(), ParseError> {
     let (seen, maximum) = match option {
         "--prompt" => (&mut *prompt_seen, MAX_PROMPT_BYTES),
         "--model" => (&mut *model_seen, MAX_MODEL_BYTES),
         "--workspace" => (&mut *workspace_seen, MAX_WORKSPACE_BYTES),
+        "--plugin-config" => (&mut *plugin_config_seen, MAX_PLUGIN_CONFIG_BYTES),
         "--resume" => (&mut *resume_seen, MAX_SESSION_ID_BYTES),
         _ => return Err(ParseError::UnknownOption),
     };
@@ -241,6 +251,7 @@ fn set_value(
         "--prompt" => options.prompt = Some(value.to_owned()),
         "--model" => options.model = Some(value.to_owned()),
         "--workspace" => options.workspace = Some(value.to_owned()),
+        "--plugin-config" => options.plugin_config = Some(value.to_owned()),
         "--resume" => options.resume = Some(parse_session_id(value)?),
         _ => return Err(ParseError::UnknownOption),
     }
@@ -269,9 +280,9 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     use super::{
-        MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES, MAX_PROMPT_BYTES,
-        MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError, admit_args_os,
-        parse_args_os,
+        MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES, MAX_PLUGIN_CONFIG_BYTES,
+        MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError,
+        admit_args_os, parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -310,6 +321,8 @@ mod tests {
             "model-a",
             "--workspace",
             "/tmp/work",
+            "--plugin-config",
+            "/tmp/plugins.json",
             "--no-color",
         ]))
         .unwrap();
@@ -317,6 +330,7 @@ mod tests {
             "--prompt=hello",
             "--model=model-a",
             "--workspace=/tmp/work",
+            "--plugin-config=/tmp/plugins.json",
             "--no-color",
         ]))
         .unwrap();
@@ -327,6 +341,7 @@ mod tests {
         assert_eq!(options.prompt.as_deref(), Some("hello"));
         assert_eq!(options.model.as_deref(), Some("model-a"));
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
+        assert_eq!(options.plugin_config.as_deref(), Some("/tmp/plugins.json"));
         assert!(options.no_color);
     }
 
@@ -354,6 +369,7 @@ mod tests {
             &["-p", "one", "--prompt=two"][..],
             &["-m", "one", "--model=two"][..],
             &["-w", "/one", "--workspace=/two"][..],
+            &["--plugin-config", "/one", "--plugin-config=/two"][..],
             &[
                 "--resume",
                 "session-550e8400-e29b-41d4-a716-446655440000",
@@ -374,6 +390,7 @@ mod tests {
             "--prompt",
             "--model",
             "--workspace",
+            "--plugin-config",
             "--resume",
             "-p",
             "-m",
@@ -417,6 +434,7 @@ mod tests {
             &["--prompt", " \t\n"][..],
             &["--model="][..],
             &["--workspace="][..],
+            &["--plugin-config="][..],
             &["--resume="][..],
         ] {
             assert!(matches!(
@@ -432,6 +450,7 @@ mod tests {
             ("--prompt", MAX_PROMPT_BYTES),
             ("--model", MAX_MODEL_BYTES),
             ("--workspace", MAX_WORKSPACE_BYTES),
+            ("--plugin-config", MAX_PLUGIN_CONFIG_BYTES),
         ] {
             assert!(parse_args_os(os(&[option, &"x".repeat(maximum)])).is_ok());
             assert!(matches!(
@@ -497,6 +516,7 @@ mod tests {
         assert_eq!(options.prompt, None);
         assert_eq!(options.model, None);
         assert_eq!(options.workspace, None);
+        assert_eq!(options.plugin_config, None);
         assert_eq!(options.resume, None);
         assert!(!options.no_color);
     }
@@ -518,6 +538,7 @@ mod tests {
         for values in [
             &["--list-sessions", "--prompt", "hello"][..],
             &["--list-sessions", "--model", "deepseek-chat"][..],
+            &["--list-sessions", "--plugin-config", "/tmp/plugins.json"][..],
             &[
                 "--list-sessions",
                 "--resume",

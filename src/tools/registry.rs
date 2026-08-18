@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent::{
         ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
-        ToolExecutorError,
+        ToolExecutorError, ToolShutdownFuture,
     },
     model::{ContentBlock, JsonValue, ToolSchema},
     workspace_authority::WorkspaceAuthority,
@@ -22,6 +22,8 @@ use super::{
 
 #[cfg(unix)]
 use super::patch;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::plugin::{PluginConfig, PluginHost, approval_required_result, prepare_action};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::process::ProcessRunner;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -141,6 +143,7 @@ pub struct LocalToolRegistry {
     schemas: Arc<[ToolSchema]>,
     environment: ShellEnvironment,
     runner: Arc<ProcessRunner>,
+    plugins: Option<Arc<PluginHost>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -152,6 +155,13 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("schema_count", &self.schemas.len())
             .field("environment", &self.environment)
             .field("process_runner", &self.runner)
+            .field(
+                "plugin_count",
+                &self
+                    .plugins
+                    .as_ref()
+                    .map_or(0, |plugins| plugins.schemas().len()),
+            )
             .finish()
     }
 }
@@ -185,7 +195,37 @@ impl LocalToolRegistry {
             schemas: schemas.into(),
             environment,
             runner,
+            plugins: None,
         })
+    }
+
+    pub(crate) async fn from_authority_with_plugins(
+        authority: WorkspaceAuthority,
+        config: PluginConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self, ToolRegistryBuildError> {
+        let mut registry = Self::from_authority(authority)?;
+        let plugins = Arc::new(
+            PluginHost::start(config, &registry.schemas, cancellation)
+                .await
+                .map_err(|error| match error {
+                    super::plugin::PluginHostError::Startup { plugin_id } => {
+                        ToolRegistryBuildError::PluginStartup { plugin_id }
+                    }
+                    super::plugin::PluginHostError::ToolCollision
+                    | super::plugin::PluginHostError::TooManyTools
+                    | super::plugin::PluginHostError::Shutdown => ToolRegistryBuildError::Plugin,
+                })?,
+        );
+        let mut schemas = registry.schemas.to_vec();
+        if schemas.try_reserve_exact(plugins.schemas().len()).is_err() {
+            let _ = plugins.shutdown().await;
+            return Err(ToolRegistryBuildError::UnsupportedProcessObserver);
+        }
+        schemas.extend_from_slice(plugins.schemas());
+        registry.schemas = schemas.into();
+        registry.plugins = Some(plugins);
+        Ok(registry)
     }
 
     #[must_use]
@@ -204,6 +244,15 @@ impl ToolExecutor for LocalToolRegistry {
     fn claim_profile(&self, tool_name: &str) -> ToolClaimProfile {
         if tool_name == "bash" {
             ToolClaimProfile::shell_action()
+        } else if let Some(plugin_id) = self
+            .plugins
+            .as_ref()
+            .and_then(|plugins| plugins.plugin_id(tool_name))
+        {
+            match ToolClaimProfile::plugin_action(plugin_id.to_owned()) {
+                Ok(profile) => profile,
+                Err(_) => ToolClaimProfile::standard(),
+            }
         } else {
             ToolClaimProfile::standard()
         }
@@ -216,6 +265,14 @@ impl ToolExecutor for LocalToolRegistry {
     ) -> ToolExecutionFuture<'_> {
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
+        }
+        if let Some(plugin_id) = self
+            .plugins
+            .as_ref()
+            .and_then(|plugins| plugins.plugin_id(request.name()))
+        {
+            let result = approval_required_result(plugin_id);
+            return Box::pin(async move { result });
         }
         if request.name() == "apply_patch" {
             return Box::pin(async {
@@ -251,6 +308,7 @@ impl ToolExecutor for LocalToolRegistry {
         let workspace = Arc::clone(&self.workspace);
         let environment = self.environment.entries();
         let runner = Arc::clone(&self.runner);
+        let plugins = self.plugins.clone();
         Box::pin(async move {
             if request.name() == "apply_patch" {
                 return patch::prepare(
@@ -269,6 +327,9 @@ impl ToolExecutor for LocalToolRegistry {
                     }),
                 );
             }
+            if let Some(plugins) = plugins.filter(|plugins| plugins.contains(request.name())) {
+                return prepare_action(request, plugins);
+            }
             let outcome = dispatch(
                 workspace.as_ref(),
                 request.name(),
@@ -281,6 +342,19 @@ impl ToolExecutor for LocalToolRegistry {
                 Err(error) => error.into_execution_result(),
             }?;
             Ok(ToolPreparation::Complete(result))
+        })
+    }
+
+    fn shutdown(&self) -> ToolShutdownFuture<'_> {
+        let plugins = self.plugins.clone();
+        Box::pin(async move {
+            let Some(plugins) = plugins else {
+                return Ok(());
+            };
+            plugins
+                .shutdown()
+                .await
+                .map_err(|_| ToolExecutorError::new("plugin host shutdown failed"))
         })
     }
 }

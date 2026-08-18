@@ -19,20 +19,25 @@ pub type ToolExecutionFuture<'a> =
 pub type ToolPreparationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ToolPreparation, ToolExecutorError>> + Send + 'a>>;
 
+/// Future that settles every executor-owned worker or subprocess.
+pub type ToolShutdownFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ToolExecutorError>> + Send + 'a>>;
+
 /// Bounded planning fact sampled before the Agent reserves durable tool events.
 ///
 /// External executors can request the ordinary profile. The crate-controlled
 /// action profile has no public constructor because it enables a stronger,
 /// non-detachable cleanup contract.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ToolClaimProfile {
     kind: ToolClaimKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ToolClaimKind {
     Standard,
     ShellAction,
+    PluginAction(String),
 }
 
 impl std::fmt::Debug for ToolClaimProfile {
@@ -42,6 +47,7 @@ impl std::fmt::Debug for ToolClaimProfile {
             .field(&match self.kind {
                 ToolClaimKind::Standard => "standard",
                 ToolClaimKind::ShellAction => "crate-controlled-action",
+                ToolClaimKind::PluginAction(_) => "crate-controlled-plugin-action",
             })
             .finish()
     }
@@ -62,9 +68,43 @@ impl ToolClaimProfile {
         }
     }
 
+    pub(crate) fn plugin_action(plugin_id: String) -> Result<Self, ToolExecutorError> {
+        let ActionContract::Plugin { plugin_id } = ActionContract::plugin(plugin_id)? else {
+            return Err(ToolExecutorError::new(
+                "plugin claim contract could not be validated",
+            ));
+        };
+        Ok(Self {
+            kind: ToolClaimKind::PluginAction(plugin_id),
+        })
+    }
+
     #[must_use]
-    pub(crate) fn is_shell_action(self) -> bool {
+    pub(crate) fn is_shell_action(&self) -> bool {
         self.kind == ToolClaimKind::ShellAction
+    }
+
+    #[must_use]
+    pub(crate) fn is_plugin_action(&self) -> bool {
+        matches!(self.kind, ToolClaimKind::PluginAction(_))
+    }
+
+    #[must_use]
+    pub(crate) fn is_owned_action(&self) -> bool {
+        matches!(
+            self.kind,
+            ToolClaimKind::ShellAction | ToolClaimKind::PluginAction(_)
+        )
+    }
+
+    pub(crate) fn action_contract(&self) -> Option<ActionContract> {
+        match &self.kind {
+            ToolClaimKind::Standard => None,
+            ToolClaimKind::ShellAction => Some(ActionContract::Shell),
+            ToolClaimKind::PluginAction(plugin_id) => Some(ActionContract::Plugin {
+                plugin_id: plugin_id.clone(),
+            }),
+        }
     }
 }
 
@@ -221,9 +261,42 @@ pub(crate) type ToolActionDeclineFn = Box<
 pub(crate) type ToolActionRunFn =
     Box<dyn FnOnce(ToolActionControl) -> ToolActionFuture + Send + 'static>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ActionContract {
+    Shell,
+    Plugin { plugin_id: String },
+}
+
+impl ActionContract {
+    fn plugin(plugin_id: String) -> Result<Self, ToolExecutorError> {
+        let mut bytes = plugin_id.bytes();
+        if !matches!(bytes.next(), Some(b'a'..=b'z'))
+            || plugin_id.len() > 32
+            || !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(ToolExecutorError::new("plugin action ID is invalid"));
+        }
+        Ok(Self::Plugin { plugin_id })
+    }
+
+    pub(crate) fn matches_profile(&self, profile: &ToolClaimProfile) -> bool {
+        match (self, &profile.kind) {
+            (Self::Shell, ToolClaimKind::ShellAction) => true,
+            (
+                Self::Plugin {
+                    plugin_id: expected,
+                },
+                ToolClaimKind::PluginAction(actual),
+            ) => expected == actual,
+            _ => false,
+        }
+    }
+}
+
 /// Sealed carrier for the action's side-effect-free setup stage.
 pub struct PreparedToolActionSetup {
     dispatch: ToolDispatchBinding,
+    contract: ActionContract,
     resolve: ToolActionSetupFn,
 }
 
@@ -242,7 +315,28 @@ impl PreparedToolActionSetup {
         dispatch: ToolDispatchBinding,
         resolve: ToolActionSetupFn,
     ) -> Result<Self, ToolExecutorError> {
-        Ok(Self { dispatch, resolve })
+        Ok(Self {
+            dispatch,
+            contract: ActionContract::Shell,
+            resolve,
+        })
+    }
+
+    pub(crate) fn new_plugin(
+        dispatch: ToolDispatchBinding,
+        plugin_id: String,
+        resolve: ToolActionSetupFn,
+    ) -> Result<Self, ToolExecutorError> {
+        Ok(Self {
+            dispatch,
+            contract: ActionContract::plugin(plugin_id)?,
+            resolve,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn contract(&self) -> &ActionContract {
+        &self.contract
     }
 
     #[must_use]
@@ -270,6 +364,7 @@ pub(crate) enum ToolActionSetupOutcome {
 /// Sealed, fully owned, single-use foreground action.
 pub struct PreparedToolAction {
     dispatch: ToolDispatchBinding,
+    contract: ActionContract,
     prompt: ApprovalPrompt,
     maximum_result_event_bytes: usize,
     decline: ToolActionDeclineFn,
@@ -309,11 +404,30 @@ impl PreparedToolAction {
         }
         Ok(Self {
             dispatch,
+            contract: ActionContract::Shell,
             prompt,
             maximum_result_event_bytes,
             decline,
             run,
         })
+    }
+
+    pub(crate) fn new_plugin(
+        dispatch: ToolDispatchBinding,
+        plugin_id: String,
+        prompt: ApprovalPrompt,
+        maximum_result_event_bytes: usize,
+        decline: ToolActionDeclineFn,
+        run: ToolActionRunFn,
+    ) -> Result<Self, ToolExecutorError> {
+        let mut action = Self::new(dispatch, prompt, maximum_result_event_bytes, decline, run)?;
+        action.contract = ActionContract::plugin(plugin_id)?;
+        Ok(action)
+    }
+
+    #[must_use]
+    pub(crate) fn contract(&self) -> &ActionContract {
+        &self.contract
     }
 
     #[must_use]
@@ -335,8 +449,9 @@ impl PreparedToolAction {
         self,
         reason: ActionDeclineReason,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        let contract = self.contract.clone();
         let result = (self.decline)(reason)?;
-        validate_action_result(&result, false, true)?;
+        validate_action_result(&result, &contract, false, true)?;
         Ok(result)
     }
 
@@ -365,18 +480,21 @@ pub(crate) enum ToolActionOutcome {
 
 pub(crate) fn validate_action_not_started_result(
     result: &ToolExecutionResult,
+    contract: &ActionContract,
 ) -> Result<(), ToolExecutorError> {
-    validate_action_result(result, false, true)
+    validate_action_result(result, contract, false, true)
 }
 
 pub(crate) fn validate_action_started_result(
     result: &ToolExecutionResult,
+    contract: &ActionContract,
 ) -> Result<(), ToolExecutorError> {
-    validate_action_result(result, true, false)
+    validate_action_result(result, contract, true, false)
 }
 
 fn validate_action_result(
     result: &ToolExecutionResult,
+    contract: &ActionContract,
     expected_started: bool,
     require_error: bool,
 ) -> Result<(), ToolExecutorError> {
@@ -389,19 +507,19 @@ fn validate_action_result(
             "a not-started action result must be an error",
         ));
     }
-    if fields.get("started").and_then(serde_json::Value::as_bool) != Some(expected_started) {
-        return Err(ToolExecutorError::new(
-            "an action result has inconsistent started metadata",
-        ));
-    }
     if fields.contains_key("committed") {
         return Err(ToolExecutorError::new(
             "an action result must not use file-mutation committed metadata",
         ));
     }
-    if fields.get("kind").and_then(serde_json::Value::as_str) != Some("foreground") {
+    if let ActionContract::Plugin { plugin_id } = contract {
+        return validate_plugin_action_result(result, fields, plugin_id, expected_started);
+    }
+    if fields.get("started").and_then(serde_json::Value::as_bool) != Some(expected_started)
+        || fields.get("kind").and_then(serde_json::Value::as_str) != Some("foreground")
+    {
         return Err(ToolExecutorError::new(
-            "an action result must identify the foreground result kind",
+            "a shell action result has inconsistent contract metadata",
         ));
     }
     let exit_code = fields.get("exitCode");
@@ -455,6 +573,51 @@ fn validate_action_result(
         return Err(ToolExecutorError::new(
             "a started action result is missing complete lifecycle metadata",
         ));
+    }
+    Ok(())
+}
+
+fn validate_plugin_action_result(
+    result: &ToolExecutionResult,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    plugin_id: &str,
+    expected_dispatched: bool,
+) -> Result<(), ToolExecutorError> {
+    const KEYS: [&str; 5] = ["kind", "pluginId", "dispatched", "peerSettled", "quiescent"];
+    if fields.len() != KEYS.len()
+        || KEYS.iter().any(|key| !fields.contains_key(*key))
+        || fields.get("kind").and_then(serde_json::Value::as_str) != Some("plugin")
+        || fields.get("pluginId").and_then(serde_json::Value::as_str) != Some(plugin_id)
+        || fields
+            .get("dispatched")
+            .and_then(serde_json::Value::as_bool)
+            != Some(expected_dispatched)
+        || fields
+            .get("peerSettled")
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        || fields.get("quiescent").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return Err(ToolExecutorError::new(
+            "a plugin action result has inconsistent contract metadata",
+        ));
+    }
+    let peer_settled = fields.get("peerSettled") == Some(&serde_json::Value::Bool(true));
+    if !expected_dispatched && peer_settled {
+        return Err(ToolExecutorError::new(
+            "a non-dispatched plugin action cannot have a matching peer result",
+        ));
+    }
+    if expected_dispatched && !peer_settled {
+        let is_unknown = result.is_error()
+            && result
+                .error()
+                .is_some_and(|failure| failure.code == crate::session::TOOL_OUTCOME_UNKNOWN);
+        if !is_unknown {
+            return Err(ToolExecutorError::new(
+                "a dispatched plugin action without a peer result must report an unknown outcome",
+            ));
+        }
     }
     Ok(())
 }
@@ -882,6 +1045,15 @@ pub trait ToolExecutor: Send + Sync {
         let execution = self.execute(request, cancellation);
         Box::pin(async move { execution.await.map(ToolPreparation::Complete) })
     }
+
+    /// Stop and join every executor-owned background resource.
+    ///
+    /// Ordinary in-process tools own no persistent resources, so their
+    /// default is already settled. Executors that own subprocesses must make
+    /// this operation idempotent and cancellation-safe.
+    fn shutdown(&self) -> ToolShutdownFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Default executor for a loop that exposes no executable tools.
@@ -895,5 +1067,113 @@ impl ToolExecutor for NoTools {
         _cancellation: CancellationToken,
     ) -> ToolExecutionFuture<'_> {
         Box::pin(async { Err(ToolExecutorError::new("no tool executor is configured")) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        model::{ContentBlock, JsonValue},
+        session::{TOOL_OUTCOME_UNKNOWN, ToolFailure},
+    };
+
+    use super::{
+        ActionContract, ToolExecutionResult, validate_action_not_started_result,
+        validate_action_started_result,
+    };
+
+    fn plugin_result(
+        dispatched: bool,
+        peer_settled: bool,
+        quiescent: bool,
+        code: Option<&str>,
+        extra: bool,
+    ) -> ToolExecutionResult {
+        let mut meta = serde_json::json!({
+            "kind":"plugin",
+            "pluginId":"text-tools",
+            "dispatched":dispatched,
+            "peerSettled":peer_settled,
+            "quiescent":quiescent,
+        });
+        if extra {
+            meta.as_object_mut()
+                .unwrap()
+                .insert("internalId".to_owned(), 7_u64.into());
+        }
+        let error = code.map(|code| ToolFailure {
+            name: "PluginError".to_owned(),
+            code: code.to_owned(),
+        });
+        ToolExecutionResult::new(
+            vec![ContentBlock::text(if error.is_some() { "error" } else { "ok" }).unwrap()],
+            error.is_some(),
+            error,
+            Some(JsonValue::new(meta).unwrap()),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plugin_action_metadata_is_closed_and_matches_dispatch_truth() {
+        let contract = ActionContract::Plugin {
+            plugin_id: "text-tools".to_owned(),
+        };
+        assert!(
+            validate_action_not_started_result(
+                &plugin_result(false, false, true, Some("PLUGIN_POLICY_DENIED"), false),
+                &contract,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_action_started_result(
+                &plugin_result(true, true, true, None, false),
+                &contract,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_action_started_result(
+                &plugin_result(true, false, true, Some(TOOL_OUTCOME_UNKNOWN), false),
+                &contract,
+            )
+            .is_ok()
+        );
+
+        for invalid in [
+            plugin_result(false, false, true, Some("PLUGIN_POLICY_DENIED"), true),
+            plugin_result(false, false, false, Some("PLUGIN_POLICY_DENIED"), false),
+            plugin_result(false, true, true, Some("PLUGIN_POLICY_DENIED"), false),
+        ] {
+            assert!(validate_action_not_started_result(&invalid, &contract).is_err());
+        }
+        for invalid in [
+            plugin_result(true, false, true, None, false),
+            plugin_result(true, false, true, Some("PLUGIN_TIMEOUT"), false),
+            plugin_result(true, true, false, Some("PLUGIN_TIMEOUT"), false),
+        ] {
+            assert!(validate_action_started_result(&invalid, &contract).is_err());
+        }
+    }
+
+    #[test]
+    fn plugin_claim_contract_rejects_shell_and_cross_plugin_carriers() {
+        let claim = super::ToolClaimProfile::plugin_action("plugin-a".to_owned()).unwrap();
+        assert!(
+            ActionContract::Plugin {
+                plugin_id: "plugin-a".to_owned()
+            }
+            .matches_profile(&claim)
+        );
+        assert!(
+            !ActionContract::Plugin {
+                plugin_id: "plugin-b".to_owned()
+            }
+            .matches_profile(&claim)
+        );
+        assert!(!ActionContract::Shell.matches_profile(&claim));
+        assert!(super::ToolClaimProfile::plugin_action("INVALID".to_owned()).is_err());
     }
 }

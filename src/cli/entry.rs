@@ -6,8 +6,9 @@ use std::{
 };
 
 use tokio::runtime::{Builder, Runtime};
+use tokio_util::sync::CancellationToken;
 
-use crate::{session::SessionStore, workspace_authority::WorkspaceAuthority};
+use crate::{session::SessionStore, tools::PluginConfig, workspace_authority::WorkspaceAuthority};
 
 use super::{
     args::{CliOptions, ListSessionsOptions, ParseAction, ParseError, parse_args_os},
@@ -24,21 +25,24 @@ use super::{
     terminal::{AsyncTerminal, OpenTerminal, TerminalError},
 };
 
-const HELP: &str = "dsh - terminal coding agent for DeepSeek\n\
-\n\
-Usage: dsh [OPTIONS]\n\
-       dsh --resume <SESSION_ID> [OPTIONS]\n\
-       dsh --list-sessions [-w <PATH>] [--no-color]\n\
-\n\
-Options:\n\
-  -p, --prompt <TEXT>      Run one prompt and exit\n\
-  -m, --model <MODEL>      DeepSeek model (new: deepseek-v4-flash; resume: stored model)\n\
-  -w, --workspace <PATH>   Workspace (new: current; resume: optional identity check)\n\
-      --no-color           Disable color and dynamic terminal styling\n\
-      --list-sessions      List persisted session headers\n\
-      --resume <SESSION_ID> Resume one persisted session\n\
-  -h, --help               Print help\n\
-  -V, --version            Print version\n";
+const HELP: &str = concat!(
+    "dsh - terminal coding agent for DeepSeek\n",
+    "\n",
+    "Usage: dsh [OPTIONS]\n",
+    "       dsh --resume <SESSION_ID> [OPTIONS]\n",
+    "       dsh --list-sessions [-w <PATH>] [--no-color]\n",
+    "\n",
+    "Options:\n",
+    "  -p, --prompt <TEXT>          Run one prompt and exit\n",
+    "  -m, --model <MODEL>          DeepSeek model (new: deepseek-v4-flash; resume: stored model)\n",
+    "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
+    "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
+    "      --no-color               Disable color and dynamic terminal styling\n",
+    "      --list-sessions          List persisted session headers\n",
+    "      --resume <SESSION_ID>    Resume one persisted session\n",
+    "  -h, --help                   Print help\n",
+    "  -V, --version                Print version\n",
+);
 
 /// Runs the real `dsh` product entry while keeping `main.rs` assembly-free.
 pub fn entry() -> ExitCode {
@@ -94,9 +98,17 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         prompt,
         model,
         workspace,
+        plugin_config,
         resume,
         no_color,
     } = options;
+    let plugin_config = plugin_config
+        .map(|path| {
+            let startup_directory = std::env::current_dir().map_err(|_| EntryError::workspace())?;
+            PluginConfig::load(&startup_directory, std::path::Path::new(&path))
+                .map_err(EntryError::plugin_config)
+        })
+        .transpose()?;
     let color = color_enabled(no_color);
     let runtime = build_runtime()?;
     let mut signals = runtime
@@ -188,7 +200,21 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         }
     };
 
-    let assembly = match assemble_session(prepared, model, interactive) {
+    let startup_cancellation = CancellationToken::new();
+    let (assembly, startup_signal) =
+        runtime.block_on(shutdown::cancellable_future_with_signal_streams(
+            assemble_session(
+                prepared,
+                model,
+                interactive,
+                plugin_config,
+                startup_cancellation.clone(),
+            ),
+            &startup_cancellation,
+            mode,
+            &mut signals,
+        ));
+    let assembly = match assembly {
         Ok(assembly) => assembly,
         Err(failure) => {
             let (error, mut session) = failure.into_parts();
@@ -196,7 +222,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 &mut session,
                 mode,
                 &mut signals,
-                None,
+                startup_signal,
             ));
             drop(session);
             if let Some(signal) = signal {
@@ -208,6 +234,27 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             return Err(EntryError::assembly(error));
         }
     };
+
+    if let Some(startup_signal) = startup_signal {
+        let mut agent = match assembly {
+            AgentAssembly::Script(agent) => agent,
+            AgentAssembly::Interactive(assembly) => assembly.agent,
+        };
+        let (cleanup, signal) = runtime.block_on(shutdown::agent_with_signals(
+            &mut agent,
+            mode,
+            &mut signals,
+            Some(startup_signal),
+        ));
+        let signal = signal.unwrap_or(startup_signal);
+        if let Err(error) = cleanup {
+            if let Some(error) = error.session_error() {
+                return Err(EntryError::storage(storage_failure::from_shutdown(error)));
+            }
+            return Err(EntryError::agent());
+        }
+        return Ok(exit_after_startup_signal(signal, mode, &mut signals));
+    }
 
     match (surface, assembly) {
         (LaunchSurface::Script(prompt), AgentAssembly::Script(agent)) => runtime
@@ -235,7 +282,10 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 ));
             }
             if let Err(error) = cleanup {
-                return Err(EntryError::storage(storage_failure::from_shutdown(&error)));
+                if let Some(error) = error.session_error() {
+                    return Err(EntryError::storage(storage_failure::from_shutdown(error)));
+                }
+                return Err(EntryError::agent());
             }
             Err(EntryError::agent())
         }
@@ -407,7 +457,22 @@ impl EntryError {
             AssemblyError::Provider => Self::stable("CLI_PROVIDER_UNAVAILABLE", 1),
             AssemblyError::Entropy => Self::stable("CLI_ENTROPY_UNAVAILABLE", 1),
             AssemblyError::Agent => Self::agent(),
+            AssemblyError::Plugin { plugin_id } => Self {
+                code: "CLI_PLUGIN_UNAVAILABLE",
+                exit: 1,
+                detail: plugin_id.map(|id| format!("plugin {id} could not be started safely")),
+                emit_diagnostic: true,
+            },
             AssemblyError::Store(error) => Self::storage(error),
+        }
+    }
+
+    fn plugin_config(error: crate::tools::PluginConfigError) -> Self {
+        Self {
+            code: "CLI_PLUGIN_CONFIG_INVALID",
+            exit: 1,
+            detail: Some(error.to_string()),
+            emit_diagnostic: true,
         }
     }
 
@@ -430,6 +495,7 @@ impl EntryError {
 
     fn script(error: ScriptDriverError) -> Self {
         match error {
+            ScriptDriverError::Agent => Self::agent(),
             ScriptDriverError::Storage(error) => Self::storage(error),
             ScriptDriverError::Output => {
                 let mut failure = Self::output();
@@ -484,6 +550,7 @@ mod tests {
         assert!(HELP.contains("--prompt"));
         assert!(HELP.contains("--list-sessions"));
         assert!(HELP.contains("--resume <SESSION_ID>"));
+        assert!(HELP.contains("--plugin-config <PATH>"));
         assert!(HELP.contains("resume: stored model"));
         assert!(HELP.contains("resume: optional identity check"));
         assert_eq!(run([OsString::from("--version")]).unwrap(), 0);

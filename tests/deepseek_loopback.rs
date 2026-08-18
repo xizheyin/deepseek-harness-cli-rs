@@ -209,7 +209,7 @@ async fn real_reqwest_transport_streams_from_loopback_without_environment_creden
     assert!(lower.contains("authorization: bearer test-key-for-loopback-only\r\n"));
     assert!(lower.contains("accept: text/event-stream\r\n"));
     assert!(lower.contains("x-deepseek-harness-session-id: offline-loopback-session\r\n"));
-    assert!(lower.contains("user-agent: deepseek-harness-cli/"));
+    assert!(lower.contains("user-agent: dsh-rs/"));
     assert!(captured.contains(r#""model":"deepseek-chat""#));
     assert!(captured.contains(r#""content":"say hello""#));
 }

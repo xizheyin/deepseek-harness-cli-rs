@@ -63,6 +63,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 交互控制 | 多轮对话、实时状态、审批、Ctrl+C 取消当前回合，以及干净的 EOF/暂停处理 |
 | 脚本模式 | `--prompt` 或管道输入；不会停下来等待审批，并安全拒绝写文件或 Shell 请求 |
 | 长会话 | 有上限的本地 JSONL、会话列表与恢复，以及一次有界的自动上下文摘要 |
+| 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
 
 ## 使用方式
 
@@ -95,7 +96,7 @@ dsh --workspace . --prompt '概括这个项目的目录结构'
 printf '读取 README.md 并概括当前限制\n' | dsh --workspace .
 ```
 
-脚本模式不会等待人工审批，因此文件写入和 Shell 调用会被拒绝。成功完成时，stdout
+脚本模式不会等待人工审批，因此文件写入、Shell 和插件调用会被拒绝。成功完成时，stdout
 只输出最终提交的 assistant 文本，适合接入普通 Shell 流水线。
 
 ### 查看帮助
@@ -105,11 +106,12 @@ dsh --help
 ```
 
 主要参数包括 `--workspace`、`--model`、`--prompt`、`--list-sessions`、
-`--resume` 和 `--no-color`。
+`--resume`、`--plugin-config` 和 `--no-color`。
 
 ### 配置
 
-`dsh` 当前使用少量环境变量，没有配置文件或 profile 系统：
+`dsh` 当前使用少量环境变量，没有自动发现的项目配置或 profile 系统。唯一可选的
+配置文件是显式传入的本地工具插件清单：
 
 | 变量 | 用途 |
 | --- | --- |
@@ -123,6 +125,23 @@ dsh --help
 的 `$XDG_STATE_HOME/dsh/sessions`；未设置 `XDG_STATE_HOME` 时使用
 `~/.local/state/dsh/sessions`。自定义 endpoint 不跟随重定向，也不使用系统代理。
 更多示例见 [配置说明](docs/configuration.md)。
+
+### 本地工具插件（实验性）
+
+Phase 10 提供一个小而封闭的子进程工具接口。先构建仓库自带的两个无副作用示例，
+再按照 [配置说明](docs/configuration.md#local-subprocess-tool-plugins) 创建私有 JSON：
+
+```console
+cargo +1.85.0 build --locked --examples
+dsh --workspace . --plugin-config /absolute/path/to/plugins.json
+```
+
+插件是当前用户主动配置并运行的本地原生程序，**不是沙箱**。传入配置即允许它在
+启动时运行并声明工具参数说明（schema）；交互模式下每次真正调用仍会弹出确认，
+脚本模式则直接拒绝。
+配置和可执行文件路径不会写入 Session，恢复时也不会自动继承，必须再次显式传
+`--plugin-config`。首版只支持工具，不支持 Hook、Provider/Session 替换、MCP、npm、
+热重载或通用 RPC。
 
 ## 会话与长对话
 
@@ -162,6 +181,7 @@ dsh --resume session-550e8400-e29b-41d4-a716-446655440000 \
 | 文件访问 | 文件工具只接受启动工作区内经过规范化和权限检查的路径，并拒绝已知的路径逃逸和危险链接 |
 | 修改与执行 | 文件修改和 Shell 默认要求交互式审批；脚本模式直接拒绝这些副作用 |
 | Shell | 获批的 Bash 是当前用户权限下的原生程序，**不是沙箱**，可以离开工作区、访问网络或修改其他文件 |
+| 插件 | 显式配置的插件在启动时作为当前用户运行；环境最小化、协议和进程组有界，但审批不是系统隔离 |
 | 秘密 | `DEEPSEEK_API_KEY` 不会被有意写入日志或终端输出；用户主动放入提示词、参数或命令的秘密仍然可见 |
 | 资源 | 输入、流、工具输出、事件和会话有明确上限；常规 Shell 超时或取消会尝试终止同组进程 |
 | 恢复 | 未知结果的旧工具调用不会自动重跑；损坏或不支持的历史不会被当作正常会话继续 |
@@ -177,16 +197,17 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | --- | --- |
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
-| Phase 10 | 进行中：受限的本地子进程工具插件；尚不是当前可用功能 |
+| Phase 10 | 进行中：真实 CLI 路径、两个示例和故障矩阵已可用；等待完整双平台发布门禁后验收 |
 
-当前候选已通过本地 macOS arm64 验收，以及 GitHub-hosted `macos-14` arm64 和
-`ubuntu-24.04` x86_64 的完整仓库检查与安装版旅程。Windows 和其他平台尚未实现或
-声明支持。
+Phase 9 候选已通过本地 macOS arm64 验收，以及 GitHub-hosted `macos-14` arm64 和
+`ubuntu-24.04` x86_64 的完整仓库检查与安装版旅程。Phase 10 候选仍需在同一双平台
+矩阵重跑新增插件门禁；Windows 和其他平台尚未实现或声明支持。
 
 ### 已知限制
 
 - 当前只支持从源码安装，包没有发布到 crates.io，也没有预编译下载或 Homebrew formula；
 - Provider 只有 DeepSeek；不支持 MCP、Hooks、Skills、子智能体或后台任务；
+- 插件只支持显式本地工具子进程，不兼容 Cordis/npm，也不提供沙箱或热重载；
 - `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
 - 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
@@ -204,12 +225,14 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 ```console
 ./scripts/verify.sh
 ./scripts/accept-phase9.sh
+./scripts/accept-phase10.sh
 ```
 
 第一条执行格式、全部目标/feature 编译、测试、Clippy（warnings denied）和空白检查；
 第二条安装 release 二进制到临时目录，再用真实 PTY 和离线 loopback Provider 跑完整
-发布旅程。安装阶段在本机尚未缓存依赖时可能访问 Cargo registry，但 Agent 场景不会
-调用真实 DeepSeek。两条命令也会在发布 CI 中运行。贡献前请阅读
+v0.1 发布旅程；第三条用同一安装方式运行两个真实插件示例和故障/取消/恢复矩阵。
+安装阶段在本机尚未缓存依赖时可能访问 Cargo registry，但 Agent 场景不会调用真实
+DeepSeek。三条命令也会在发布 CI 中运行。贡献前请阅读
 [Contributing guide](CONTRIBUTING.md)。
 
 ## 上游关系
@@ -229,6 +252,8 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 - [发布检查表](docs/releasing.md)
 - [Phase 8 验收记录](docs/validation/phase-8.md)
 - [Phase 9 验收记录](docs/validation/phase-9.md)
+- [Phase 10 插件设计](docs/design/subprocess-tool-plugins.md)
+- [Phase 10 验收进度](docs/validation/phase-10.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 

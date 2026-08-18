@@ -270,7 +270,7 @@ async fn run_with_executor(
         .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
         .await
         .unwrap();
-    (agent.into_session(), provider)
+    (agent.shutdown_into_session().await.unwrap(), provider)
 }
 
 async fn run_shell(
@@ -326,7 +326,7 @@ async fn run_named_tool(
         .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
         .await
         .unwrap();
-    agent.into_session()
+    agent.shutdown_into_session().await.unwrap()
 }
 
 fn phase6_oracle() -> Value {

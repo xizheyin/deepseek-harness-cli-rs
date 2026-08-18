@@ -264,13 +264,19 @@ pub(super) async fn run(
         }
     }
     match (result, shutdown) {
-        (Err(InteractiveError::Agent), Err(error)) => Err(InteractiveError::Storage(
-            storage_failure::from_shutdown(&error),
-        )),
+        (Err(InteractiveError::Agent), Err(error)) => match error.session_error() {
+            Some(error) => Err(InteractiveError::Storage(storage_failure::from_shutdown(
+                error,
+            ))),
+            None => Err(InteractiveError::Agent),
+        },
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(InteractiveError::Storage(storage_failure::from_shutdown(
-            &error,
-        ))),
+        (Ok(_), Err(error)) => match error.session_error() {
+            Some(error) => Err(InteractiveError::Storage(storage_failure::from_shutdown(
+                error,
+            ))),
+            None => Err(InteractiveError::Agent),
+        },
         (Ok(InteractiveExit::Ordinary(exit)), Ok(())) => Ok(exit),
         (Ok(InteractiveExit::Signal(_)), Ok(())) => Err(InteractiveError::Agent),
     }

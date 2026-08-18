@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use crate::{
     agent::{
-        AgentLoop, AgentLoopConfig, FileChangePolicy, NoApprovalProvider, ShellPolicy, ToolExecutor,
+        AgentLoop, AgentLoopConfig, FileChangePolicy, NoApprovalProvider, PluginPolicy,
+        ShellPolicy, ToolExecutor,
     },
     entropy::EntropySource,
     model::LlmCallConfig,
@@ -13,9 +14,10 @@ use crate::{
         deepseek::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekProvider},
     },
     session::{CommittedUiReceiver, Session, SessionStore, StoreError, SystemClock},
-    tools::LocalToolRegistry,
+    tools::{LocalToolRegistry, PluginConfig},
     workspace_authority::WorkspaceAuthority,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
     approval::{ApprovalChallengePool, ApprovalEnvelopeReceiver, TerminalApprovalProvider},
@@ -71,7 +73,7 @@ impl AssemblyFailure {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum AssemblyError {
     #[error("CLI_WORKSPACE_UNAVAILABLE")]
     Workspace,
@@ -81,6 +83,8 @@ pub(super) enum AssemblyError {
     Entropy,
     #[error("CLI_AGENT_UNAVAILABLE")]
     Agent,
+    #[error("CLI_PLUGIN_UNAVAILABLE")]
+    Plugin { plugin_id: Option<String> },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -102,10 +106,12 @@ pub(super) fn prepare_new_session(workspace: &Path) -> Result<AssemblySession, A
     })
 }
 
-pub(super) fn assemble_session(
+pub(super) async fn assemble_session(
     prepared: AssemblySession,
     requested_model: Option<String>,
     interactive: bool,
+    plugin_config: Option<PluginConfig>,
+    cancellation: CancellationToken,
 ) -> Result<AgentAssembly, AssemblyFailure> {
     let AssemblySession {
         mut session,
@@ -141,20 +147,6 @@ pub(super) fn assemble_session(
         None
     };
 
-    let registry = match LocalToolRegistry::from_authority(authority) {
-        Ok(registry) => Arc::new(registry),
-        Err(error) => {
-            let error = match error {
-                crate::tools::ToolRegistryBuildError::InvalidWorkspace { .. } => {
-                    AssemblyError::Workspace
-                }
-                _ => AssemblyError::Agent,
-            };
-            return Err(AssemblyFailure::new(error, session));
-        }
-    };
-    let schemas = registry.schemas().to_vec();
-
     let provider_config = match DeepSeekConfig::from_process_environment() {
         Ok(config) => config,
         Err(_) => return Err(AssemblyFailure::new(AssemblyError::Provider, session)),
@@ -164,14 +156,46 @@ pub(super) fn assemble_session(
         Err(_) => return Err(AssemblyFailure::new(AssemblyError::Provider, session)),
     };
 
+    let registry = match plugin_config {
+        Some(plugin_config) => {
+            LocalToolRegistry::from_authority_with_plugins(authority, plugin_config, cancellation)
+                .await
+        }
+        None => LocalToolRegistry::from_authority(authority),
+    };
+    let registry = match registry {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => {
+            let error = match error {
+                crate::tools::ToolRegistryBuildError::InvalidWorkspace { .. } => {
+                    AssemblyError::Workspace
+                }
+                crate::tools::ToolRegistryBuildError::PluginStartup { plugin_id } => {
+                    AssemblyError::Plugin {
+                        plugin_id: Some(plugin_id),
+                    }
+                }
+                crate::tools::ToolRegistryBuildError::Plugin => {
+                    AssemblyError::Plugin { plugin_id: None }
+                }
+                _ => AssemblyError::Agent,
+            };
+            return Err(AssemblyFailure::new(error, session));
+        }
+    };
+    let schemas = registry.schemas().to_vec();
+
     let config = match AgentLoopConfig::new(call)
         .with_system(SYSTEM_PROMPT)
         .and_then(|config| config.with_tools(schemas))
     {
         Ok(config) => config,
-        Err(_) => return Err(AssemblyFailure::new(AssemblyError::Agent, session)),
+        Err(_) => {
+            let _ = registry.shutdown().await;
+            return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+        }
     };
-    let tools: Arc<dyn ToolExecutor> = registry;
+    let tools: Arc<dyn ToolExecutor> = registry.clone();
     let provider: Arc<dyn ModelProvider> = provider;
 
     if interactive {
@@ -182,10 +206,12 @@ pub(super) fn assemble_session(
         let config = config
             .with_approval_provider(Arc::new(approval))
             .with_file_change_policy(FileChangePolicy::Ask)
-            .with_shell_policy(ShellPolicy::Ask);
+            .with_shell_policy(ShellPolicy::Ask)
+            .with_plugin_policy(PluginPolicy::Ask);
         let agent = match AgentLoop::new_preserving_session(session, provider, tools, config) {
             Ok(agent) => agent,
             Err((_error, session)) => {
+                let _ = registry.shutdown().await;
                 return Err(AssemblyFailure::new(AssemblyError::Agent, session));
             }
         };
@@ -201,10 +227,15 @@ pub(super) fn assemble_session(
         let config = config
             .with_approval_provider(Arc::new(NoApprovalProvider))
             .with_file_change_policy(FileChangePolicy::Deny)
-            .with_shell_policy(ShellPolicy::Deny);
-        AgentLoop::new_preserving_session(session, provider, tools, config)
-            .map(AgentAssembly::Script)
-            .map_err(|(_error, session)| AssemblyFailure::new(AssemblyError::Agent, session))
+            .with_shell_policy(ShellPolicy::Deny)
+            .with_plugin_policy(PluginPolicy::Deny);
+        match AgentLoop::new_preserving_session(session, provider, tools, config) {
+            Ok(agent) => Ok(AgentAssembly::Script(agent)),
+            Err((_error, session)) => {
+                let _ = registry.shutdown().await;
+                Err(AssemblyFailure::new(AssemblyError::Agent, session))
+            }
+        }
     }
 }
 

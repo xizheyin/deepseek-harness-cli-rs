@@ -3,7 +3,11 @@
 use std::{
     ffi::OsString,
     io,
-    os::{fd::OwnedFd, unix::process::CommandExt},
+    os::{
+        fd::OwnedFd,
+        unix::{ffi::OsStrExt as _, process::CommandExt},
+    },
+    path::Path,
     process::{Child, Command, Stdio},
 };
 
@@ -26,6 +30,42 @@ pub(super) fn shell(
     // SAFETY: The closure runs after fork and before exec. It performs only
     // `setsid` and `fchdir`, both async-signal-safe syscalls, and converts the
     // returned errno without allocating, locking, formatting, or logging.
+    unsafe {
+        process.pre_exec(move || {
+            rustix::process::setsid().map_err(io::Error::from)?;
+            rustix::process::fchdir(&workdir).map_err(io::Error::from)
+        });
+    }
+    process.spawn()
+}
+
+pub(super) fn plugin(
+    program: &Path,
+    arguments: &[String],
+    workdir: OwnedFd,
+    environment: &[(OsString, OsString)],
+) -> io::Result<Child> {
+    if program.as_os_str().as_bytes().contains(&0)
+        || arguments
+            .iter()
+            .any(|argument| argument.as_bytes().contains(&0))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plugin command contains NUL",
+        ));
+    }
+    let mut process = Command::new(program);
+    process
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .envs(environment.iter().map(|(name, value)| (name, value)));
+
+    // SAFETY: Like the shell launcher above, this closure runs after fork and
+    // before exec and performs only async-signal-safe syscalls.
     unsafe {
         process.pre_exec(move || {
             rustix::process::setsid().map_err(io::Error::from)?;

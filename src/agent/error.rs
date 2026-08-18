@@ -2,8 +2,12 @@ use thiserror::Error;
 
 use crate::{
     model::ModelError,
-    session::{AppendError, BarrierError, EventValidationError, StoreError},
+    session::{
+        AppendError, BarrierError, EventValidationError, Session, SessionIoError, StoreError,
+    },
 };
+
+use super::ToolExecutorError;
 
 /// Invalid Agent construction or configured resource ceiling.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -38,6 +42,69 @@ pub enum AgentRuntimeError {
     EmptyId { kind: &'static str },
     #[error("agent runtime jitter sample must be finite and between zero and one")]
     InvalidSample,
+}
+
+/// Failure observed while the Agent settles tools and then its Session.
+#[derive(Debug, Error)]
+pub enum AgentShutdownError {
+    #[error("agent tool shutdown failed")]
+    Tools(#[source] ToolExecutorError),
+    #[error("agent session shutdown failed")]
+    Session(#[source] SessionIoError),
+    #[error("agent tool and session shutdown both failed")]
+    Both {
+        tools: ToolExecutorError,
+        session: SessionIoError,
+    },
+}
+
+impl AgentShutdownError {
+    #[must_use]
+    pub fn session_error(&self) -> Option<&SessionIoError> {
+        match self {
+            Self::Tools(_) => None,
+            Self::Session(error) | Self::Both { session: error, .. } => Some(error),
+        }
+    }
+}
+
+/// Tool cleanup failed while returning an otherwise active Session.
+pub struct AgentReleaseError {
+    source: ToolExecutorError,
+    session: Session,
+}
+
+impl AgentReleaseError {
+    pub(super) fn new(source: ToolExecutorError, session: Session) -> Self {
+        Self { source, session }
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ToolExecutorError, Session) {
+        (self.source, self.session)
+    }
+}
+
+impl std::fmt::Debug for AgentReleaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentReleaseError")
+            .field("source", &self.source)
+            .field("session", &"<active>")
+            .finish()
+    }
+}
+
+impl std::fmt::Display for AgentReleaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("agent tool shutdown failed before the Session was released")
+    }
+}
+
+impl std::error::Error for AgentReleaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Infrastructure failure for which a balanced durable result cannot be promised.

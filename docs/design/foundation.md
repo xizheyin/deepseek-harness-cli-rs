@@ -5,17 +5,17 @@ Phase 0 establishes a reproducible project without pretending that an agent alre
 ## Public identity
 
 - Project brand: `dsh-rs`
-- Cargo package: `deepseek-harness-cli` (retained for repository continuity)
+- Cargo package: `dsh-rs`
 - Executable: `dsh`
 - Pre-release version: `0.1.0-alpha.0`
 - License: MIT
 - Repository: <https://github.com/xizheyin/deepseek-harness-rs>
 
-The Phase 9 identity review keeps three deliberately separate names: users see
-the `dsh-rs` community-project brand, install and run the short `dsh` command,
-while Cargo keeps the original private package identifier
-`deepseek-harness-cli`. Renaming the package would add lockfile and downstream
-churn without changing the installed command, so it is not part of v0.1. The
+The Phase 9 candidate still used the original private Cargo identifier. During
+the explicitly approved Phase 10 extension, the maintainer chose to align that
+identifier with the public `dsh-rs` project brand. The installed command remains
+the short `dsh`, and the Rust library target keeps the internal
+`deepseek_harness_cli` name so existing in-repository imports do not churn. The
 project remains independent and does not imply affiliation with DeepSeek or
 Anthropic. The upstream MIT source license is not a trademark grant; the names
 must change if the owner objects or likely user confusion remains.

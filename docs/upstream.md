@@ -1187,7 +1187,7 @@ Phase 10 was researched against the same pinned commit before implementation.
 The fixed upstream does not define an NDJSON subprocess-tool ABI. It installs
 profile dependencies and loads in-process Cordis bundle patches; tool producers
 register a `ToolDefinition` in `ToolRuntime`. The following paths establish that
-boundary and the narrower call/approval/result semantics Rust will preserve:
+boundary and the narrower call/approval/result semantics Rust preserves:
 
 - `docs/architecture.md`, `docs/subsystems/tools.md`,
   `docs/tool-execution-pipeline.md`, and `docs/cookbook/adding-a-tool.md`:
@@ -1210,13 +1210,15 @@ boundary and the narrower call/approval/result semantics Rust will preserve:
   and cleanup facts available to the official runtime, but not a tool-plugin
   transport.
 
-Rust Phase 10 therefore plans the subprocess configuration, protocol, and
-lifecycle as an intentional product difference; the compatibility row remains
-`planned` until production and comparison tests exist. The comparison scope is
-only the observable shared order: assistant call -> committed Session
+Rust Phase 10 implements the subprocess configuration, protocol, and lifecycle
+as an intentional product difference. The comparison scope is only the
+observable shared order: assistant call -> committed Session
 `tool/call` -> optional approval -> execution -> normalized `tool/result`.
-Rust's earlier plugin-argument validation is a documented difference. The
-complete design, limits, user impact, and planned tests are in
+The installed CLI test compares that ordered Session subset with the committed
+Phase 5 upstream approval oracle. Protocol/config/process behavior is covered by
+Rust-specific tests because upstream has no equivalent wire ABI. Rust's earlier
+plugin-argument validation is a documented difference. The complete design,
+limits, user impact, and tests are in
 `docs/design/subprocess-tool-plugins.md`.
 
 The focused fixed-checkout research gate was run without changing the upstream

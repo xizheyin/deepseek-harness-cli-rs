@@ -8,14 +8,14 @@ use std::{
 
 use deepseek_harness_cli::{
     agent::{
-        AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentRuntime,
+        AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentRuntime, AgentShutdownError,
         MAX_AGENT_ATTEMPTS_PER_TURN, MAX_AGENT_FIXED_REQUEST_BYTES,
         MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST, MAX_AGENT_REPORTED_OUTPUT_TOKENS,
         MAX_AGENT_RETRIES_PER_STEP, MAX_AGENT_STEPS_PER_TURN, MAX_AGENT_TOOL_ARGUMENT_BYTES,
         MAX_AGENT_TOOL_CALLS_PER_STEP, MAX_AGENT_TOOL_CALLS_PER_TURN, MAX_AGENT_TOOL_DURATION,
         MAX_AGENT_TOOL_RESULT_BYTES, MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES,
         MAX_AGENT_TURN_DURATION, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
-        ToolExecutor, ToolExecutorError, TurnProposal,
+        ToolExecutor, ToolExecutorError, ToolShutdownFuture, TurnProposal,
     },
     model::{
         ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, LlmCallConfig,
@@ -43,6 +43,63 @@ fn fake_preflight(
 ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
     let prepared = prepare(draft.config().clone())?;
     draft.finish(prepared, 1)
+}
+
+#[tokio::test]
+async fn tool_shutdown_failure_is_reported_and_an_active_session_can_be_recovered() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(FailingShutdownTools {
+        calls: Arc::clone(&calls),
+    });
+    let mut agent = AgentLoop::with_runtime(
+        session("tool-shutdown-failure"),
+        Arc::new(FakeProvider::new(Vec::new())),
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+    assert!(matches!(
+        agent.shutdown().await,
+        Err(AgentShutdownError::Tools(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let agent = AgentLoop::with_runtime(
+        session("tool-release-failure"),
+        Arc::new(FakeProvider::new(Vec::new())),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+    let error = match agent.shutdown_into_session().await {
+        Ok(_) => panic!("failing tools must not release the Session as a success"),
+        Err(error) => error,
+    };
+    let (_tools, mut recovered) = error.into_parts();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    recovered.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_shutdown_factory_and_future_panics_return_the_still_owned_session() {
+    for kind in [ShutdownPanic::Factory, ShutdownPanic::Future] {
+        let agent = AgentLoop::with_runtime(
+            session("tool-shutdown-panic"),
+            Arc::new(FakeProvider::new(Vec::new())),
+            Arc::new(PanickingShutdownTools(kind)),
+            Arc::new(FixedRuntime::default()),
+            config(),
+        )
+        .unwrap();
+        let error = match agent.shutdown_into_session().await {
+            Ok(_) => panic!("panicking tool shutdown must not report success"),
+            Err(error) => error,
+        };
+        let (_tools, mut recovered) = error.into_parts();
+        recovered.shutdown().await.unwrap();
+    }
 }
 
 #[derive(Default)]
@@ -289,6 +346,52 @@ struct IgnoresCancelTools {
 struct NotifyingReadyTools {
     calls: AtomicUsize,
     entered: Arc<Notify>,
+}
+
+struct FailingShutdownTools {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownPanic {
+    Factory,
+    Future,
+}
+
+struct PanickingShutdownTools(ShutdownPanic);
+
+impl ToolExecutor for FailingShutdownTools {
+    fn execute(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancel: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        Box::pin(async { Err(ToolExecutorError::new("not used")) })
+    }
+
+    fn shutdown(&self) -> ToolShutdownFuture<'_> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ToolExecutorError::new("shutdown failed")) })
+    }
+}
+
+impl ToolExecutor for PanickingShutdownTools {
+    fn execute(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancel: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        Box::pin(async { Err(ToolExecutorError::new("not used")) })
+    }
+
+    fn shutdown(&self) -> ToolShutdownFuture<'_> {
+        match self.0 {
+            ShutdownPanic::Factory => panic!("injected shutdown factory panic"),
+            ShutdownPanic::Future => Box::pin(async {
+                panic!("injected shutdown future panic");
+            }),
+        }
+    }
 }
 
 impl ToolExecutor for PendingTools {
@@ -1216,7 +1319,7 @@ async fn request_headers_are_suppressed_when_stable_and_marked_on_resume_or_chan
     );
 
     let mut reconstructed = AgentLoop::with_runtime(
-        original.into_session(),
+        original.shutdown_into_session().await.unwrap(),
         provider,
         tools,
         Arc::new(FixedRuntime::default()),
@@ -2649,7 +2752,7 @@ async fn executor_failure_is_closed_without_persisting_extension_details() {
     ));
     assert_eq!(provider.requests().len(), 1);
     let json = agent.session().to_json().unwrap();
-    let recovered = agent.into_session();
+    let recovered = agent.shutdown_into_session().await.unwrap();
     assert!(matches!(
         AgentLoop::with_runtime(
             recovered,
@@ -2720,7 +2823,7 @@ async fn unresolved_guard_uses_only_model_calls_and_canonical_tool_results() {
         )
         .await
         .unwrap();
-    let mut unresolved = unresolved_agent.into_session();
+    let mut unresolved = unresolved_agent.shutdown_into_session().await.unwrap();
     let spoofed = Message::tool_result(
         "spoofed-result",
         "call-1",

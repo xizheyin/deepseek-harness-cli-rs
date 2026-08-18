@@ -29,6 +29,12 @@ pub enum ToolRegistryBuildError {
     EnvironmentTooLarge,
     #[error("the host cannot provide the required foreground-process observer")]
     UnsupportedProcessObserver,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error("configured plugin {plugin_id} could not be started safely")]
+    PluginStartup { plugin_id: String },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error("configured plugin tools could not be started safely")]
+    Plugin,
 }
 
 #[derive(Debug)]

@@ -1,6 +1,7 @@
 # Phase 10 bounded subprocess tool-plugin design
 
-This document fixes the Phase 10 contract before production implementation.
+This document fixes the Phase 10 contract and records the production
+implementation boundary.
 The feature is a deliberately small way to add local tools to `dsh`: the user
 explicitly names a configuration file, each configured plugin is one owned
 child process, and the host exchanges bounded one-line JSON messages over that
@@ -63,7 +64,7 @@ Rust preserves: the assistant declares a call, the Session records `tool/call`,
 optional policy/approval runs, the body runs, the canonical result is normalized,
 and one correlated `tool/result` is recorded.
 
-The subprocess transport is therefore a planned intentional difference, not a
+The subprocess transport is therefore an intentional difference, not a
 claim of Cordis compatibility:
 
 1. Rust uses an explicit local JSON file rather than an npm profile and bundle
@@ -96,8 +97,9 @@ dsh --resume SESSION_ID --plugin-config /absolute/path/to/plugins.json
 ```
 
 No config means no plugin process, schema, or plugin-related discovery.
-`--list-sessions` does not start plugins. The option is rejected on unsupported
-platforms and is not persisted into the Session. A resumed CLI must name the
+`--list-sessions` does not start plugins. Phase 10 builds are supported only on
+the declared macOS and Ubuntu/Linux targets, and the option is not persisted
+into the Session. A resumed CLI must name the
 configuration again; the reconstructed request header can then record the
 resulting tool-schema change without storing an executable path in JSONL.
 
@@ -123,24 +125,27 @@ Rules:
 - the path supplied to `--plugin-config` is resolved once from the startup
   directory, then opened with `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`; admission
   and reads use `fstat` on that same descriptor;
-- the config descriptor names a regular file owned by the effective user and
-  not writable by group or other users;
+- the config descriptor names a regular file owned by the effective user, with
+  no group/other permission bits; on macOS any extended ACL `ALLOW` entry is
+  rejected (deny-only ACLs remain acceptable);
 - `version` is exactly `1`; `plugins` contains at most eight entries;
 - plugin IDs match `[a-z][a-z0-9-]{0,31}` and are unique;
 - `program` is an absolute, canonical, regular executable owned by the effective
   user or root, is not group/other writable, and has neither setuid nor setgid
   bits; a final symlink is rejected and identity is rechecked before spawn;
 - `args` contains at most 16 strings and at most 32 KiB encoded UTF-8 in total;
-- no config entry supplies a working directory, environment variable, secret,
-  approval bypass, timeout override, or Session capability.
+- no config entry has a dedicated working-directory, environment, secret,
+  approval-bypass, timeout, or Session-capability field. `args` is ordinary
+  process argv and must not contain secrets because same-account process
+  inspection may expose it.
 
 The child starts in the executable's parent directory. The host clears the
 ambient environment and sets only `PATH=/usr/bin:/bin`, `LANG=C`, `LC_ALL=C`,
 `DSH_PLUGIN_PROTOCOL=1`, and `DSH_PLUGIN_ID=<id>`. In
 particular it does not forward `DEEPSEEK_API_KEY`, proxy variables, `HOME`, the
 workspace path, Session IDs, agent sockets, loader variables, or arbitrary
-`DSH_*` values. Plugin arguments and results may still contain model-provided or
-user-visible data and therefore remain part of the normal tool/session boundary.
+`DSH_*` values. Model-requested plugin tool arguments and results remain part of
+the normal model/Session boundary.
 
 Validation happens before the first Provider request. If any entry, executable,
 spawn, or handshake fails, the whole plugin assembly fails; already started
@@ -152,8 +157,10 @@ a subset of a requested configuration.
 Every protocol record is exactly one UTF-8 JSON object followed by LF. The
 maximum encoded record, including LF, is 128 KiB. Blank lines, a BOM, invalid
 UTF-8, trailing bytes, unknown fields, duplicate JSON keys, and unsupported
-message types are protocol faults. Standard output carries protocol only;
-standard error carries bounded diagnostics only.
+message types are protocol faults. The strict decoder additionally caps one
+record at 64 container levels and 65,536 parsed JSON nodes; the narrower schema
+and runtime-value limits below are then applied to retained fields. Standard
+output carries protocol only; standard error carries bounded diagnostics only.
 
 The host speaks first:
 
@@ -269,17 +276,19 @@ examples:
 
 - `type`: `string`, `number`, `integer`, `boolean`, `null`, `array`, or `object`;
 - scalar `enum` values whose JSON type matches the node;
-- `items` for arrays;
-- `properties`, `required`, and explicit `additionalProperties: false` for
-  objects;
-- optional bounded `description` annotations.
+- one required `items` schema for arrays;
+- required `properties` and `required` collections plus explicit
+  `additionalProperties: false` for objects;
+- optional control-free `description` annotations of at most 1,024 UTF-8 bytes.
 
 Parameter roots must be closed objects. Output roots may use any supported
 type. The output declaration is host-only and is not added to the model-facing
 `ToolSchema`. Unsupported keywords and ambiguous unions are rejected rather
 than ignored. A schema is limited to 16 container levels, 512 nodes, 256
-properties, 64 required names, and 32 KiB of compact JSON. The validator also
-bounds each runtime value to 64 KiB compact JSON and 16 container levels.
+properties, 64 required names, 64 scalar enum entries, and 32 KiB of compact
+JSON. Properties, required names, and enum entries are counted across the whole
+schema rather than independently per nested object. The validator also bounds
+each runtime value to 64 KiB compact JSON and 16 container levels.
 
 Arguments are validated in the host before approval. A mismatch produces the
 ordinary correlated invalid-arguments result and sends no `call` record. A
@@ -343,7 +352,7 @@ use the sealed owned Action path; direct registry execution always returns
 `APPROVAL_REQUIRED` without sending a protocol message.
 
 The crate-sealed claim, setup, and action each carry the same
-`ActionContract::{Shell, PluginCall { plugin_id }}` value. The Agent verifies
+`ActionContract::{Shell, Plugin { plugin_id }}` value. The Agent verifies
 that contract at every transition, selects `ShellPolicy` or `PluginPolicy` from
 it, and invokes the matching result validator; tool-name string checks cannot
 select the privileged path.
@@ -367,10 +376,14 @@ instead of accepting plugin metadata as proof.
 
 ## Ownership, cancellation, and shutdown
 
-Each plugin has one actor task. The actor owns its child, stdin, stdout parser,
-stderr collector, monotonically increasing call ID, and a capacity-two call
-queue. Cancellation and shutdown use a separate one-bit watch/token path that
-preempts that queue; they cannot wait behind calls. A call deadline begins
+Each plugin has one managed `std::thread` actor, with at most eight actors from
+one config. The thread owns its child, stdin, stdout parser, stderr collector,
+monotonically increasing call ID, and a capacity-two synchronous call queue.
+Tokio-facing tool futures only perform bounded enqueue and await an owned
+one-shot response. Cancellation and shutdown use a separate atomic flag plus
+thread-unpark path that preempts the queue; they cannot wait behind calls. The
+thread performs at most one bounded read/write operation per pipe in a loop and
+parks for at most 10 ms when there is no progress. A call deadline begins
 before enqueue and covers queueing, protocol write, and result wait. Queue-full
 admission fails as `PLUGIN_BUSY` before dispatch, and shutdown settles every
 queued waiter. No detached task owns a process. The registry/PluginHost owns
@@ -447,10 +460,11 @@ Canonical assembly is intentionally ordered:
    starting a process or Session;
 2. open the workspace and prepare a new Session, or fully validate and lock a
    resumed Session before any plugin process starts;
-3. inside the Tokio runtime, start every plugin, complete bounded handshakes,
+3. construct the immutable Provider object without sending a request;
+4. inside the Tokio runtime, start every plugin, complete bounded handshakes,
    validate all schemas, and reject all collisions;
-4. combine built-in and plugin schemas into one stable request-header snapshot;
-5. construct the Provider and Agent;
+5. combine built-in and plugin schemas into one stable request-header snapshot,
+   then construct the Agent;
 6. on any later assembly failure, shut down the PluginHost before releasing the
    Session;
 7. on normal CLI exit, await Agent tool shutdown and then the Session's normal
@@ -462,8 +476,8 @@ path is never recovered from Session history. A previous unresolved plugin call
 is handled by existing append-only recovery as unknown; it is never replayed to
 a newly started plugin.
 
-The current synchronous assembly becomes cancellation-aware async assembly and
-accepts the CLI startup cancellation token. A startup signal stops new spawn or
+Assembly is cancellation-aware and async, and accepts the CLI startup
+cancellation token. A startup signal stops new spawn or
 handshake work, but the owning future still waits for every partially started
 plugin to be cleaned up and then closes the Session. Provider or Agent
 construction failure follows the same tools-then-Session path. No assembly
@@ -471,18 +485,23 @@ branch relies on `Drop` to reap a plugin.
 
 ## Failure vocabulary and user experience
 
-Startup/config failures are concise CLI errors and contain the plugin ID but not
-raw stderr, arguments, environment, or config contents. Per-call stable failures
-include:
+Startup/config failures are concise CLI errors and include the plugin ID when a
+validated ID is safely attributable; aggregate collision/ownership failures do
+not guess one. They never include raw stderr, arguments, environment, or config
+contents. Per-call stable failures include:
 
 - `PLUGIN_UNAVAILABLE`: process did not become or remain ready;
 - `PLUGIN_BUSY`: the bounded pre-dispatch call queue was full;
-- `PLUGIN_PROTOCOL_ERROR`: the peer broke the closed protocol;
 - `PLUGIN_OUTPUT_INVALID`: a success value broke its declared schema;
 - `PLUGIN_TIMEOUT`: the deadline elapsed before any call byte was sent, or a
   matching result later proved peer settlement while the earlier timeout stayed
   latched;
 - `TOOL_OUTCOME_UNKNOWN`: dispatch occurred but no trustworthy result exists.
+
+A protocol fault before dispatch makes the plugin unavailable. Once any call
+byte may have been written, a protocol fault is deliberately reported as
+`TOOL_OUTCOME_UNKNOWN`; the host never exposes a misleading standalone
+`PLUGIN_PROTOCOL_ERROR` after possible side effects.
 
 Plugin-declared errors use the exact `ToolFailure` plus text-block mapping above
 rather than becoming arbitrary host error types. The TUI uses existing
@@ -499,7 +518,9 @@ coordinates, ANSI styling, or render callbacks.
 | One NDJSON record | 128 KiB |
 | One arguments or wire result value | 64 KiB compact JSON |
 | Rendered plugin content / sealed Action event | 64 KiB / 128 KiB |
+| Strict record parse depth / nodes | 64 / 65,536 |
 | Schema compact JSON / nodes / depth | 32 KiB / 512 / 16 |
+| Schema properties / required names / enum entries | 256 / 64 / 64 |
 | Call queue / active calls / priority shutdown token | 2 / 1 / 1 |
 | Per-plugin / aggregate startup | 5 s / 20 s |
 | One call protocol write | 1 s |

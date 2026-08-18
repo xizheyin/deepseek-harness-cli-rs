@@ -1,5 +1,5 @@
 [package]
-name = "deepseek-harness-cli"
+name = "dsh-rs"
 version = "0.1.0-alpha.0"
 edition = "2024"
 rust-version = "1.85"
@@ -8,6 +8,10 @@ license = "MIT"
 repository = "https://github.com/xizheyin/deepseek-harness-rs"
 readme = "README.md"
 publish = false
+
+[lib]
+name = "deepseek_harness_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "dsh"

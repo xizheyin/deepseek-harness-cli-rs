@@ -8,6 +8,8 @@ mod list;
 #[cfg(unix)]
 mod patch;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod plugin;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod process;
 mod read;
 mod registry;
@@ -16,6 +18,8 @@ mod shell;
 mod workspace;
 
 pub use error::ToolRegistryBuildError;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use plugin::{PluginConfig, PluginConfigError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;

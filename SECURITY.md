@@ -54,12 +54,46 @@ normal save/list/resume, not encryption, a backup, or database-grade durability.
 Protect the account and storage containing them, and delete the configured
 Session directory when its history is no longer needed.
 
-### Extensions and platforms
+### Local subprocess tool plugins
 
-The v0.1 product has no plugin loader, MCP server, Hooks, Skills, native dynamic
-library loading, or background-job system. Phase 10 may add explicitly configured
-local subprocess tools; until that phase is implemented and accepted, README and
-security claims do not include plugins.
+`--plugin-config` starts explicitly named local executables so they can declare
+tools. This happens during CLI startup, before any per-call approval. Therefore
+the config itself must be treated like permission to run those programs as the
+current user. The approval card controls one later model-requested tool call; it
+does not sandbox the already running plugin process.
+
+The config must be a private regular file. Program paths are canonical and
+revalidated, unsafe writable parent chains, symlinks, set-ID files, and macOS
+write-grant ACLs are rejected. This narrows accidental substitution by another
+account; it does not defend against the same trusted account deliberately
+replacing its own executable between the final check and `exec`.
+
+Plugin processes receive a closed five-variable environment without the
+DeepSeek key, Session root, or home directory. Stdout is a bounded protocol
+channel, stderr is bounded diagnostics, calls and queues have deadlines and
+size limits, and normal shutdown/cancellation waits for process-group cleanup.
+As with approved Shell, native code can still access anything the current user
+can access, use the network, or deliberately create a new process session.
+Never configure a plugin executable you would not run directly.
+
+If a call may have been dispatched but no trustworthy matching result arrives,
+`dsh` records `TOOL_OUTCOME_UNKNOWN`, makes that plugin unavailable, and does not
+automatically replay the call after resume. Configured program paths, configured
+program argv, stderr, and protocol IDs are not stored in Session history.
+Model-requested tool arguments are necessarily recorded before dispatch and
+remain model- and Session-visible.
+
+Configured program argv may be visible to other processes running as the same
+account through ordinary operating-system inspection even though dsh does not
+persist it. Do not place API keys, passwords, or unrelated secrets in plugin
+configuration.
+
+### Other extensions and platforms
+
+There is still no MCP server, Hooks, Skills, native dynamic-library loading,
+background-job system, Cordis/npm plugin compatibility, or general extension
+framework. Phase 10 only adds the closed subprocess tool boundary described
+above.
 
 The declared release target is macOS on arm64 and Ubuntu 24.04 on x86_64; a
 candidate is accepted only after both default CI jobs pass. Windows and other

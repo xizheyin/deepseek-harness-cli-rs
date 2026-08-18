@@ -35,3 +35,6 @@ jobs:
 
       - name: Verify the installed release journey
         run: ./scripts/accept-phase9.sh
+
+      - name: Verify the installed plugin journey
+        run: ./scripts/accept-phase10.sh

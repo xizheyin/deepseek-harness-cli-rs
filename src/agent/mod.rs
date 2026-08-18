@@ -46,18 +46,20 @@ use crate::{
 pub use approval::{
     ApprovalFuture, ApprovalPrompt, ApprovalPromptError, ApprovalProvider, ApprovalProviderError,
     ApprovalRequest, FileChangePolicy, MAX_APPROVAL_PREVIEW_BYTES, MAX_APPROVAL_REASON_BYTES,
-    NoApprovalProvider, ShellPolicy,
+    NoApprovalProvider, PluginPolicy, ShellPolicy,
 };
-pub use error::{AgentBuildError, AgentLoopError, AgentRuntimeError};
+pub use error::{
+    AgentBuildError, AgentLoopError, AgentReleaseError, AgentRuntimeError, AgentShutdownError,
+};
 pub(crate) use tool::{
-    ActionDeclineReason, ToolActionControl, ToolActionOutcome, ToolActionSetupControl,
-    ToolActionSetupOutcome, ToolActionTurnStop, ToolDispatchBinding,
+    ActionContract, ActionDeclineReason, ToolActionControl, ToolActionOutcome,
+    ToolActionSetupControl, ToolActionSetupOutcome, ToolActionTurnStop, ToolDispatchBinding,
 };
 pub use tool::{
     MutationDeclineReason, NoTools, PreparedToolAction, PreparedToolActionSetup,
     PreparedToolMutation, ToolClaimProfile, ToolCommitDisposition, ToolCommitFn, ToolCommitOutcome,
     ToolDeclineFn, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
-    ToolExecutorError, ToolPreparation, ToolPreparationFuture,
+    ToolExecutorError, ToolPreparation, ToolPreparationFuture, ToolShutdownFuture,
 };
 
 use assembler::{AssembledAssistant, without_tool_calls};
@@ -350,6 +352,7 @@ pub struct AgentLoopConfig {
     limits: AgentLimits,
     file_change_policy: FileChangePolicy,
     shell_policy: ShellPolicy,
+    plugin_policy: PluginPolicy,
     approval_provider: Arc<dyn ApprovalProvider>,
 }
 
@@ -364,6 +367,7 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("limits", &self.limits)
             .field("file_change_policy", &self.file_change_policy)
             .field("shell_policy", &self.shell_policy)
+            .field("plugin_policy", &self.plugin_policy)
             .field("approval_provider_configured", &true)
             .finish()
     }
@@ -379,6 +383,7 @@ impl AgentLoopConfig {
             limits: AgentLimits::default(),
             file_change_policy: FileChangePolicy::Ask,
             shell_policy: ShellPolicy::Ask,
+            plugin_policy: PluginPolicy::Ask,
             approval_provider: Arc::new(NoApprovalProvider),
         }
     }
@@ -447,6 +452,12 @@ impl AgentLoopConfig {
     }
 
     #[must_use]
+    pub fn with_plugin_policy(mut self, policy: PluginPolicy) -> Self {
+        self.plugin_policy = policy;
+        self
+    }
+
+    #[must_use]
     pub fn file_change_policy(&self) -> FileChangePolicy {
         self.file_change_policy
     }
@@ -454,6 +465,11 @@ impl AgentLoopConfig {
     #[must_use]
     pub fn shell_policy(&self) -> ShellPolicy {
         self.shell_policy
+    }
+
+    #[must_use]
+    pub fn plugin_policy(&self) -> PluginPolicy {
+        self.plugin_policy
     }
 
     #[must_use]
@@ -726,14 +742,28 @@ impl AgentLoop {
         &self.session
     }
 
-    #[must_use]
-    pub fn into_session(self) -> Session {
-        self.session
+    /// Stop tool-owned workers, then return the still-active Session.
+    ///
+    /// This replaces the old synchronous extraction seam, which could drop a
+    /// persistent plugin process without waiting for its process group.
+    pub async fn shutdown_into_session(self) -> Result<Session, AgentReleaseError> {
+        let Self { session, tools, .. } = self;
+        match shutdown_tool_executor(tools.as_ref()).await {
+            Ok(()) => Ok(session),
+            Err(error) => Err(AgentReleaseError::new(error, session)),
+        }
     }
 
-    /// Flush and join the Session writer before the CLI releases this owner.
-    pub async fn shutdown(&mut self) -> Result<(), crate::session::SessionIoError> {
-        self.session.shutdown().await
+    /// Stop and join tools before flushing and joining the Session writer.
+    pub async fn shutdown(&mut self) -> Result<(), AgentShutdownError> {
+        let tools = shutdown_tool_executor(self.tools.as_ref()).await;
+        let session = self.session.shutdown().await;
+        match (tools, session) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(AgentShutdownError::Tools(error)),
+            (Ok(()), Err(error)) => Err(AgentShutdownError::Session(error)),
+            (Err(tools), Err(session)) => Err(AgentShutdownError::Both { tools, session }),
+        }
     }
 
     /// Run one bounded turn and settle every ordinary error/cancellation path.
@@ -806,6 +836,15 @@ impl AgentLoop {
         }
         result
     }
+}
+
+async fn shutdown_tool_executor(tools: &dyn ToolExecutor) -> Result<(), ToolExecutorError> {
+    let future = catch_unwind(AssertUnwindSafe(|| tools.shutdown()))
+        .map_err(|_| ToolExecutorError::new("tool shutdown factory panicked"))?;
+    AssertUnwindSafe(future)
+        .catch_unwind()
+        .await
+        .map_err(|_| ToolExecutorError::new("tool shutdown future panicked"))?
 }
 
 #[derive(Default)]
@@ -2443,31 +2482,24 @@ async fn commit_tool_round(
             call.name.clone(),
             call.arguments.clone(),
         )));
-        let profile = claim_profiles[result_ids.len()];
-        fallbacks.push(if profile.is_shell_action() {
-            shell_prestart_error_event(
-                turn,
-                step,
-                &result_id,
-                call,
-                maximum_source_seq,
-                "TOOL_OUTPUT_BUDGET_EXCEEDED",
-                call.name.as_str(),
-                "shell output could not fit safely in the session",
-                None,
-            )?
-        } else {
-            tool_error_event(
-                turn,
-                step,
-                &result_id,
-                call,
-                maximum_source_seq,
-                "TOOL_OUTPUT_BUDGET_EXCEEDED",
-                call.name.as_str(),
-                "tool output could not fit safely in the session",
-            )?
-        });
+        let profile = claim_profiles[result_ids.len()].clone();
+        fallbacks.push(tool_prestart_error_event(
+            &profile,
+            turn,
+            step,
+            &result_id,
+            call,
+            maximum_source_seq,
+            "TOOL_OUTPUT_BUDGET_EXCEEDED",
+            call.name.as_str(),
+            if profile.is_shell_action() {
+                "shell output could not fit safely in the session"
+            } else if profile.is_plugin_action() {
+                "plugin output could not fit safely in the session"
+            } else {
+                "tool output could not fit safely in the session"
+            },
+        )?);
         result_ids.push(result_id);
     }
     let mut claims = match reservation.claim_batch(fallbacks) {
@@ -2497,16 +2529,24 @@ async fn commit_tool_round(
         });
     }
     for index in 0..planned.len() {
-        if !planned[index].claim_profile.is_shell_action() {
-            continue;
-        }
-        let ceiling = shell_prestart_claim_ceiling(
-            turn,
-            step,
-            &planned[index].result_message_id,
-            &planned[index].call,
-            maximum_source_seq,
-        )?;
+        let ceiling = match planned[index].claim_profile.action_contract() {
+            Some(ActionContract::Shell) => shell_prestart_claim_ceiling(
+                turn,
+                step,
+                &planned[index].result_message_id,
+                &planned[index].call,
+                maximum_source_seq,
+            )?,
+            Some(ActionContract::Plugin { plugin_id }) => plugin_prestart_claim_ceiling(
+                plugin_id.as_str(),
+                turn,
+                step,
+                &planned[index].result_message_id,
+                &planned[index].call,
+                maximum_source_seq,
+            )?,
+            None => continue,
+        };
         if let Err(error) =
             reservation.reserve_claim_retained_json_bytes(&mut planned[index].result_claim, ceiling)
         {
@@ -2554,30 +2594,23 @@ async fn commit_tool_round(
         plan.call_seq = actual_call_seq;
         reservation.rebind_claim_fallback(
             &mut plan.result_claim,
-            if plan.claim_profile.is_shell_action() {
-                shell_prestart_error_event(
-                    turn,
-                    step,
-                    &plan.result_message_id,
-                    &plan.call,
-                    actual_call_seq,
-                    "TOOL_OUTPUT_BUDGET_EXCEEDED",
-                    plan.call.name.as_str(),
-                    "shell output could not fit safely in the session",
-                    None,
-                )?
-            } else {
-                tool_error_event(
-                    turn,
-                    step,
-                    &plan.result_message_id,
-                    &plan.call,
-                    actual_call_seq,
-                    "TOOL_OUTPUT_BUDGET_EXCEEDED",
-                    plan.call.name.as_str(),
-                    "tool output could not fit safely in the session",
-                )?
-            },
+            tool_prestart_error_event(
+                &plan.claim_profile,
+                turn,
+                step,
+                &plan.result_message_id,
+                &plan.call,
+                actual_call_seq,
+                "TOOL_OUTPUT_BUDGET_EXCEEDED",
+                plan.call.name.as_str(),
+                if plan.claim_profile.is_shell_action() {
+                    "shell output could not fit safely in the session"
+                } else if plan.claim_profile.is_plugin_action() {
+                    "plugin output could not fit safely in the session"
+                } else {
+                    "tool output could not fit safely in the session"
+                },
+            )?,
         )?;
         let result = if driver.durable_limit.is_some() {
             prestart_failure(
@@ -2592,7 +2625,7 @@ async fn commit_tool_round(
             || cancellation.is_cancelled()
         {
             cancelled |= cancellation.is_cancelled();
-            if plan.claim_profile.is_shell_action() {
+            if plan.claim_profile.is_owned_action() {
                 prestart_failure(
                     plan,
                     "ABORTED_BEFORE_DISPATCH",
@@ -3105,8 +3138,10 @@ async fn run_one_tool(
             }
             match result {
                 Ok(Ok(ToolPreparation::Complete(result))) => {
-                    if plan.claim_profile.is_shell_action()
-                        && tool::validate_action_not_started_result(&result).is_err()
+                    let contract = plan.claim_profile.action_contract();
+                    if contract.as_ref().is_some_and(|contract| {
+                        tool::validate_action_not_started_result(&result, contract).is_err()
+                    })
                     {
                         ToolRun::Infrastructure {
                             stop: ToolStop::None,
@@ -3120,7 +3155,7 @@ async fn run_one_tool(
                     }
                 }
                 Ok(Ok(ToolPreparation::Mutation(mutation))) => {
-                    if plan.claim_profile.is_shell_action() {
+                    if plan.claim_profile.is_owned_action() {
                         ToolRun::Infrastructure {
                             stop: ToolStop::None,
                         }
@@ -3129,7 +3164,8 @@ async fn run_one_tool(
                     }
                 }
                 Ok(Ok(ToolPreparation::Action(action))) => {
-                    if !plan.claim_profile.is_shell_action()
+                    if !plan.claim_profile.is_owned_action()
+                        || !action.contract().matches_profile(&plan.claim_profile)
                         || !action.matches_dispatch(&plan.dispatch)
                     {
                         ToolRun::Infrastructure {
@@ -3167,7 +3203,7 @@ fn prestart_failure(
     message: &'static str,
     stop: ToolStop,
 ) -> ToolRun {
-    if !plan.claim_profile.is_shell_action() {
+    if !plan.claim_profile.is_owned_action() {
         return match stop {
             ToolStop::TurnTimeout => ToolRun::TurnTimeout,
             ToolStop::Cancelled => ToolRun::ModelError {
@@ -3182,7 +3218,16 @@ fn prestart_failure(
     } else {
         plan.call.name.as_str()
     };
-    match shell_prestart_result(code, failure_name, message, None) {
+    let result = match plan.claim_profile.action_contract() {
+        Some(ActionContract::Shell) => shell_prestart_result(code, failure_name, message, None),
+        Some(ActionContract::Plugin { plugin_id }) => {
+            plugin_prestart_result(plugin_id.as_str(), code, failure_name, message)
+        }
+        None => {
+            return ToolRun::Infrastructure { stop };
+        }
+    };
+    match result {
         Ok(result) => ToolRun::Completed {
             result,
             settlement: ResultSettlement::FallbackAllowed,
@@ -3200,6 +3245,12 @@ async fn resolve_action(
     setup: PreparedToolActionSetup,
     cancellation: &CancellationToken,
 ) -> Result<ToolRun, AgentLoopError> {
+    if !setup.contract().matches_profile(&plan.claim_profile) {
+        return Ok(ToolRun::ActionUnresolved {
+            stop: sample_tool_stop(cancellation, driver.deadline),
+        });
+    }
+    let contract = setup.contract().clone();
     let setup_child = cancellation.child_token();
     let preparation_deadline = Instant::now() + MAX_AGENT_ACTION_PREPARATION_DURATION;
     let setup_control =
@@ -3243,7 +3294,7 @@ async fn resolve_action(
         ToolActionSetupOutcome::Ready(action) => {
             latched_stop =
                 preserve_or_sample_tool_stop(latched_stop, cancellation, driver.deadline);
-            if !action.matches_dispatch(&plan.dispatch) {
+            if action.contract() != &contract || !action.matches_dispatch(&plan.dispatch) {
                 return Ok(ToolRun::ActionUnresolved { stop: latched_stop });
             }
             if latched_stop != ToolStop::None {
@@ -3261,7 +3312,7 @@ async fn resolve_action(
                 cancellation,
                 driver.deadline,
             );
-            if tool::validate_action_not_started_result(&result).is_err() {
+            if tool::validate_action_not_started_result(&result, &contract).is_err() {
                 return Ok(ToolRun::ActionUnresolved { stop });
             }
             return Ok(ToolRun::Completed {
@@ -3281,7 +3332,12 @@ async fn resolve_action(
         }
     };
 
-    if driver.config.shell_policy == ShellPolicy::Deny {
+    let (policy_denied, approval_required) = action_policy(
+        driver.config.shell_policy,
+        driver.config.plugin_policy,
+        &contract,
+    );
+    if policy_denied {
         return Ok(decline_action(
             action,
             ActionDeclineReason::PolicyDenied,
@@ -3326,7 +3382,7 @@ async fn resolve_action(
         Err(error) => return Err(error.into()),
     }
 
-    let action = if driver.config.shell_policy == ShellPolicy::Ask {
+    let action = if approval_required {
         let approval_id = match next_id(driver.runtime, AgentIdKind::Approval) {
             Ok(id) => ApprovalRequestId::new(id),
             Err(_) => {
@@ -3449,6 +3505,7 @@ async fn resolve_action(
     let action_deadline = Instant::now() + driver.config.limits.tool_duration;
     let action_control =
         ToolActionControl::new(action_child.clone(), driver.deadline, action_deadline);
+    let action_contract = action.contract().clone();
     let action_future = match catch_unwind(AssertUnwindSafe(|| action.run(action_control))) {
         Ok(future) => future,
         Err(_) => {
@@ -3491,7 +3548,7 @@ async fn resolve_action(
                 cancellation,
                 driver.deadline,
             );
-            if tool::validate_action_not_started_result(&result).is_err() {
+            if tool::validate_action_not_started_result(&result, &action_contract).is_err() {
                 ToolRun::ActionUnresolved { stop }
             } else {
                 ToolRun::Completed {
@@ -3517,7 +3574,8 @@ async fn resolve_action(
             );
             let result_fits_declared_bound = action_result_event_bytes(reservation, plan, &result)
                 .is_ok_and(|size| size <= maximum_result_bytes);
-            if tool::validate_action_started_result(&result).is_err() || !result_fits_declared_bound
+            if tool::validate_action_started_result(&result, &action_contract).is_err()
+                || !result_fits_declared_bound
             {
                 ToolRun::ActionUnresolved { stop }
             } else {
@@ -3529,6 +3587,23 @@ async fn resolve_action(
             }
         }
     })
+}
+
+fn action_policy(
+    shell_policy: ShellPolicy,
+    plugin_policy: PluginPolicy,
+    contract: &ActionContract,
+) -> (bool, bool) {
+    match contract {
+        ActionContract::Shell => (
+            shell_policy == ShellPolicy::Deny,
+            shell_policy == ShellPolicy::Ask,
+        ),
+        ActionContract::Plugin { .. } => (
+            plugin_policy == PluginPolicy::Deny,
+            plugin_policy == PluginPolicy::Ask,
+        ),
+    }
 }
 
 fn decline_action(
@@ -4103,6 +4178,114 @@ fn shell_prestart_result(
     )?)
 }
 
+fn plugin_prestart_result(
+    plugin_id: &str,
+    code: &str,
+    failure_name: &str,
+    message: impl Into<String>,
+) -> Result<ToolExecutionResult, AgentLoopError> {
+    let meta = serde_json::json!({
+        "kind": "plugin",
+        "pluginId": plugin_id,
+        "dispatched": false,
+        "peerSettled": false,
+        "quiescent": true,
+    });
+    Ok(ToolExecutionResult::new(
+        vec![ContentBlock::text(message.into())?],
+        true,
+        Some(ToolFailure {
+            name: failure_name.to_owned(),
+            code: code.to_owned(),
+        }),
+        Some(JsonValue::new(meta).map_err(|_| {
+            AgentLoopError::Invariant("internal plugin result metadata exceeded model bounds")
+        })?),
+        false,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tool_prestart_error_event(
+    profile: &ToolClaimProfile,
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    code: &'static str,
+    failure_name: &str,
+    message: &'static str,
+) -> Result<NewEvent, AgentLoopError> {
+    match profile.action_contract() {
+        Some(ActionContract::Shell) => shell_prestart_error_event(
+            turn,
+            step,
+            message_id,
+            call,
+            call_seq,
+            code,
+            failure_name,
+            message,
+            None,
+        ),
+        Some(ActionContract::Plugin { plugin_id }) => {
+            let result = plugin_prestart_result(plugin_id.as_str(), code, failure_name, message)?;
+            tool_result_event(turn, step, message_id, call, call_seq, result)
+        }
+        None => tool_error_event(
+            turn,
+            step,
+            message_id,
+            call,
+            call_seq,
+            code,
+            failure_name,
+            message,
+        ),
+    }
+}
+
+fn plugin_prestart_claim_ceiling(
+    plugin_id: &str,
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+) -> Result<usize, AgentLoopError> {
+    let result = plugin_prestart_result(
+        plugin_id,
+        &"X".repeat(256),
+        &"x".repeat(256),
+        "x".repeat(4 * 1024),
+    )?;
+    let probe = tool_result_event(turn, step, message_id, call, call_seq, result)?;
+    Session::event_retained_json_bytes(&probe).map_err(Into::into)
+}
+
+fn tool_result_event(
+    turn: TurnId,
+    step: StepId,
+    message_id: &str,
+    call: &ToolCall,
+    call_seq: EventSeq,
+    result: ToolExecutionResult,
+) -> Result<NewEvent, AgentLoopError> {
+    let (content, is_error, error, meta, _) = result.into_parts();
+    let message = Message::tool_result(message_id, call.id.clone(), content, is_error)?;
+    Ok(NewEvent::surface(
+        EventKind::ToolResult {
+            turn,
+            step,
+            message,
+            error,
+            meta,
+        },
+        SurfaceIntent::append().with_sources(vec![call_seq]),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shell_prestart_error_event(
     turn: TurnId,
@@ -4116,18 +4299,7 @@ fn shell_prestart_error_event(
     parsed: Option<(&str, u64)>,
 ) -> Result<NewEvent, AgentLoopError> {
     let result = shell_prestart_result(code, failure_name, message, parsed)?;
-    let (content, is_error, error, meta, _) = result.into_parts();
-    let message = Message::tool_result(message_id, call.id.clone(), content, is_error)?;
-    Ok(NewEvent::surface(
-        EventKind::ToolResult {
-            turn,
-            step,
-            message,
-            error,
-            meta,
-        },
-        SurfaceIntent::append().with_sources(vec![call_seq]),
-    ))
+    tool_result_event(turn, step, message_id, call, call_seq, result)
 }
 
 fn shell_prestart_claim_ceiling(

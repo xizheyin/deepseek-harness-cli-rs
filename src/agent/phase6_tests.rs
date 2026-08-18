@@ -17,12 +17,14 @@ use tokio_util::sync::CancellationToken;
 use super::{
     AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentLoopError, AgentRuntime,
     ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, FileChangePolicy,
-    MutationDeclineReason, NoApprovalProvider, PreparedToolMutation, ShellPolicy,
+    MutationDeclineReason, NoApprovalProvider, PluginPolicy, PreparedToolMutation, ShellPolicy,
     ToolCommitOutcome, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
     ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture, TurnProposal,
+    action_policy,
     tool::{
-        ActionDeclineReason, PreparedToolAction, PreparedToolActionSetup, ToolActionControl,
-        ToolActionOutcome, ToolActionSetupOutcome, ToolActionTurnStop, ToolClaimProfile,
+        ActionContract, ActionDeclineReason, PreparedToolAction, PreparedToolActionSetup,
+        ToolActionControl, ToolActionOutcome, ToolActionSetupOutcome, ToolActionTurnStop,
+        ToolClaimProfile,
     },
 };
 use crate::{
@@ -47,6 +49,41 @@ use crate::{
 
 const NORMAL_RESULT_BOUND: usize = 128 * 1024;
 const DELIBERATELY_FALSE_RESULT_BOUND: usize = 512;
+
+#[test]
+fn shell_and_plugin_action_policies_are_selected_independently() {
+    let plugin = ActionContract::Plugin {
+        plugin_id: "text-tools".to_owned(),
+    };
+    assert_eq!(
+        action_policy(ShellPolicy::Allow, PluginPolicy::Deny, &plugin),
+        (true, false)
+    );
+    assert_eq!(
+        action_policy(
+            ShellPolicy::Deny,
+            PluginPolicy::Allow,
+            &ActionContract::Shell,
+        ),
+        (true, false)
+    );
+    assert_eq!(
+        action_policy(ShellPolicy::Deny, PluginPolicy::Allow, &plugin),
+        (false, false)
+    );
+    assert_eq!(
+        action_policy(
+            ShellPolicy::Allow,
+            PluginPolicy::Ask,
+            &ActionContract::Shell,
+        ),
+        (false, false)
+    );
+    assert_eq!(
+        action_policy(ShellPolicy::Allow, PluginPolicy::Ask, &plugin),
+        (false, true)
+    );
+}
 
 #[derive(Default)]
 struct FixedRuntime(Mutex<u64>);
@@ -1635,7 +1672,7 @@ async fn hard_wire_limit_prunes_a_durable_tool_result_before_entering_the_step()
 
     let provider = Arc::new(PruneThenFitProvider::default());
     let mut resumed = AgentLoop::with_runtime(
-        first.into_session(),
+        first.shutdown_into_session().await.unwrap(),
         provider.clone(),
         Arc::new(LargePrunableTools),
         Arc::new(FixedRuntime::default()),
@@ -2639,7 +2676,7 @@ async fn marker_only_hard_limit_summarizes_once_unless_cancellation_is_latched()
             ..PruneThenFitProvider::default()
         });
         let mut resumed = AgentLoop::with_runtime(
-            first.into_session(),
+            first.shutdown_into_session().await.unwrap(),
             provider.clone(),
             Arc::new(LargePrunableTools),
             Arc::new(FixedRuntime::default()),
@@ -2757,7 +2794,7 @@ async fn observer_failure_after_a_durable_prune_pair_still_closes_the_turn() {
         ..PruneThenFitProvider::default()
     });
     let mut resumed = AgentLoop::with_runtime(
-        first.into_session(),
+        first.shutdown_into_session().await.unwrap(),
         provider.clone(),
         Arc::new(LargePrunableTools),
         Arc::new(FixedRuntime::default()),

@@ -7,6 +7,7 @@ cd "$project_root"
 
 cargo fmt --all -- --check
 cargo check --all-targets --all-features --locked
+cargo build --examples --all-features --locked
 cargo test --all-targets --all-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 "$script_dir/test-check-whitespace.sh"

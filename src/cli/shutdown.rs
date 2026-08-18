@@ -3,9 +3,10 @@
 use std::future::Future;
 
 use futures_util::{Stream, StreamExt as _};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::AgentLoop,
+    agent::{AgentLoop, AgentShutdownError},
     session::{Session, SessionIoError},
 };
 
@@ -19,7 +20,7 @@ pub(super) async fn agent_with_signals(
     mode: DriverMode,
     signals: &mut SignalStreams,
     initial_signal: Option<UiSignal>,
-) -> (Result<(), SessionIoError>, Option<UiSignal>) {
+) -> (Result<(), AgentShutdownError>, Option<UiSignal>) {
     future_with_signal_streams(agent.shutdown(), mode, signals, initial_signal).await
 }
 
@@ -54,6 +55,35 @@ where
     if let Some(signal) = observed {
         latch.observe(mode, signal);
     }
+    signals.drain_ready(mode, &mut latch);
+    (result, latch.observed())
+}
+
+/// Poll a startup future to completion while latching signals and asking the
+/// startup owner to stop opening new resources. The future itself is never
+/// dropped; it must finish joining anything it already started.
+pub(super) async fn cancellable_future_with_signal_streams<F>(
+    future: F,
+    cancellation: &CancellationToken,
+    mode: DriverMode,
+    signals: &mut SignalStreams,
+) -> (F::Output, Option<UiSignal>)
+where
+    F: Future,
+{
+    let mut latch = SignalLatch::default();
+    tokio::pin!(future);
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut future => break result,
+            signal = signals.next() => {
+                latch.observe(mode, signal);
+                cancellation.cancel();
+            }
+        }
+    };
+    tokio::task::yield_now().await;
     signals.drain_ready(mode, &mut latch);
     (result, latch.observed())
 }

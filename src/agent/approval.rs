@@ -29,6 +29,15 @@ pub enum ShellPolicy {
     Ask,
 }
 
+/// Static Phase 10 decision applied to every configured plugin action.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PluginPolicy {
+    Allow,
+    Deny,
+    #[default]
+    Ask,
+}
+
 /// Bounded, immutable question retained by one prepared mutation.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ApprovalPrompt {

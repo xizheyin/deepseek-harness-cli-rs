@@ -121,6 +121,7 @@ pub struct JobControlHarness {
 struct PtyLaunch {
     color: bool,
     binary: PathBuf,
+    extra_args: Vec<std::ffi::OsString>,
 }
 
 impl PtyLaunch {
@@ -128,6 +129,30 @@ impl PtyLaunch {
         Self {
             color,
             binary: cargo_test_binary(),
+            extra_args: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    fn cargo_with_plugin(color: bool, config: &Path) -> Self {
+        Self {
+            color,
+            binary: cargo_test_binary(),
+            extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
+        }
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    fn cargo_script_with_plugin(config: &Path, prompt: &str) -> Self {
+        Self {
+            color: false,
+            binary: cargo_test_binary(),
+            extra_args: vec![
+                "--plugin-config".into(),
+                config.as_os_str().to_owned(),
+                "--prompt".into(),
+                prompt.into(),
+            ],
         }
     }
 
@@ -136,6 +161,16 @@ impl PtyLaunch {
         Self {
             color,
             binary: dsh_binary(),
+            extra_args: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled Phase 10 acceptance binary.
+    fn installed_with_plugin(color: bool, config: &Path) -> Self {
+        Self {
+            color,
+            binary: dsh_binary(),
+            extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
         }
     }
 }
@@ -198,6 +233,113 @@ impl PtyHarness {
             None,
             None,
             PtyLaunch::cargo(true),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    pub fn spawn_color_with_plugin_config(
+        base_url: &str,
+        workspace: &Path,
+        plugin_config: &Path,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            None,
+            None,
+            PtyLaunch::cargo_with_plugin(true, plugin_config),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    pub fn spawn_color_with_plugin_config_and_session_root(
+        base_url: &str,
+        workspace: &Path,
+        plugin_config: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            PtyLaunch::cargo_with_plugin(true, plugin_config),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    pub fn spawn_script_with_plugin_config(
+        base_url: &str,
+        workspace: &Path,
+        plugin_config: &Path,
+        prompt: &str,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            None,
+            None,
+            PtyLaunch::cargo_script_with_plugin(plugin_config, prompt),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled Phase 10 acceptance binary.
+    pub fn spawn_installed_color_with_plugin_config(
+        base_url: &str,
+        workspace: &Path,
+        plugin_config: &Path,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            None,
+            None,
+            PtyLaunch::installed_with_plugin(true, plugin_config),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled Phase 10 acceptance binary.
+    pub fn spawn_installed_color_with_plugin_config_and_session_root(
+        base_url: &str,
+        workspace: &Path,
+        plugin_config: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            PtyLaunch::installed_with_plugin(true, plugin_config),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    pub fn spawn_resume_color_with_plugin_config(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+        session_id: &str,
+        plugin_config: &Path,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            Some(session_id),
+            PtyLaunch::cargo_with_plugin(true, plugin_config),
         )
     }
 
@@ -290,7 +432,11 @@ impl PtyHarness {
         resume_id: Option<&str>,
         launch: PtyLaunch,
     ) -> Self {
-        let PtyLaunch { color, binary } = launch;
+        let PtyLaunch {
+            color,
+            binary,
+            extra_args,
+        } = launch;
         let (master, slave) = open_test_pty();
         let mut termios =
             rustix::termios::tcgetattr(&slave).expect("PTY terminal settings should be readable");
@@ -409,6 +555,7 @@ impl PtyHarness {
             ])
         };
         let command = command
+            .args(extra_args)
             .current_dir(workspace)
             .env_clear()
             .env("DEEPSEEK_BASE_URL", base_url)

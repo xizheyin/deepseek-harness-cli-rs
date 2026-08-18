@@ -324,7 +324,7 @@ async fn run_patch_with_provider(
         .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
         .await
         .unwrap();
-    agent.into_session()
+    agent.shutdown_into_session().await.unwrap()
 }
 
 fn patch_agent(

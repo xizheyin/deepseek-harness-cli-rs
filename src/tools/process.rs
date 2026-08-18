@@ -32,9 +32,15 @@ mod capture;
 mod host;
 #[cfg(any(target_os = "linux", test))]
 mod mountinfo;
+mod plugin;
 #[cfg(any(target_os = "linux", test))]
 mod proc_stat;
 mod spawn;
+
+pub(crate) use plugin::{
+    PluginCleanup, PluginCleanupReport, PluginEmergencyHandle, PluginIo, PluginLeaderState,
+    PluginProcess, PluginProcessError,
+};
 
 const MAX_COMMAND_BYTES: usize = 32 * 1_024;
 const MAX_ENVIRONMENT_BYTES: usize = 32 * 1_024;

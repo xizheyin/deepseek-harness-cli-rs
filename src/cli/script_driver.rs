@@ -14,6 +14,8 @@ use super::{
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum ScriptDriverError {
+    #[error("CLI_AGENT_UNAVAILABLE")]
+    Agent,
     #[error("CLI_OUTPUT_FAILED")]
     Output,
     #[error(transparent)]
@@ -37,9 +39,12 @@ pub(super) async fn run_one_turn(
     }
     let output = match (result, shutdown) {
         (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(ScriptDriverError::Storage(storage_failure::from_shutdown(
-            &error,
-        ))),
+        (Ok(_), Err(error)) => match error.session_error() {
+            Some(error) => Err(ScriptDriverError::Storage(storage_failure::from_shutdown(
+                error,
+            ))),
+            None => Err(ScriptDriverError::Agent),
+        },
         (Ok(output), Ok(())) => Ok(output),
     }?;
     if let Some(frames) = output.frames {
