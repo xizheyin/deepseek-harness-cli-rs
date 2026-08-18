@@ -208,7 +208,7 @@ fn installed_dsh_renders_the_real_readme_scene() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"Review src/message.txt and prepare the release update\r");
     dsh.expect(b"Completed  Read");
-    dsh.approval_ready_for_call(b"call-readme-patch");
+    dsh.approval_ready();
     let selection = dsh.checkpoint();
     dsh.write(b"\x1b[A");
     dsh.expect_after(selection, b"> Allow once");
@@ -307,7 +307,7 @@ fn installed_dsh_completes_one_safe_resumable_compacting_journey() {
     ] {
         first.expect(marker);
     }
-    first.approval_ready_for_call(b"call-patch");
+    first.approval_ready();
     let patch_selection = first.checkpoint();
     first.write(b"\x1b[A");
     first.expect_after(patch_selection, b"> Allow once");

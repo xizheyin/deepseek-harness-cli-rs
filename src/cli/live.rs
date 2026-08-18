@@ -1,4 +1,4 @@
-use std::{fmt, fmt::Write as _};
+use std::{fmt, fmt::Write as _, sync::Arc};
 
 use thiserror::Error;
 
@@ -8,6 +8,7 @@ use crate::session::{
     UiTurnEndCancelCause, UiTurnEndReason,
 };
 use crate::tui::{
+    approval_preview::present_canonical_patch,
     markup::{MAX_MARKUP_FRAME_TEXT_BYTES, MarkupState},
     presentation::{PresentationError, PresentedChunk, PresentedChunkBuilder, TextStyle},
     projector::UiProjector,
@@ -15,7 +16,7 @@ use crate::tui::{
     visible::{render_visible_owned, render_visible_owned_bounded},
 };
 
-use crate::agent::TurnOutcome;
+use crate::agent::{ApprovalPreviewKind, TurnOutcome};
 
 use super::{
     render::VisibleRenderer,
@@ -131,11 +132,30 @@ enum LivePart {
     TrustedLine(&'static str),
     TrustedOwned(String),
     TrustedInline(&'static str),
-    AssistantMarkup { key: MarkupStreamKey, text: String },
-    AssistantMarkupFinish { key: Option<MarkupStreamKey> },
+    AssistantMarkup {
+        key: MarkupStreamKey,
+        text: String,
+    },
+    AssistantMarkupFinish {
+        key: Option<MarkupStreamKey>,
+    },
     AssistantMarkupAbort,
-    Untrusted { role: UiRole, text: String },
-    UntrustedStyled { style: TextStyle, text: String },
+    Untrusted {
+        role: UiRole,
+        text: String,
+    },
+    LinearOnlyUntrusted {
+        role: UiRole,
+        text: String,
+    },
+    ApprovalPreview {
+        kind: ApprovalPreviewKind,
+        text: Arc<str>,
+    },
+    UntrustedStyled {
+        style: TextStyle,
+        text: String,
+    },
 }
 
 impl fmt::Debug for LivePart {
@@ -166,6 +186,16 @@ impl fmt::Debug for LivePart {
             Self::Untrusted { role, text } => formatter
                 .debug_struct("Untrusted")
                 .field("role", role)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::LinearOnlyUntrusted { role, text } => formatter
+                .debug_struct("LinearOnlyUntrusted")
+                .field("role", role)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::ApprovalPreview { kind, text } => formatter
+                .debug_struct("ApprovalPreview")
+                .field("kind", kind)
                 .field("bytes", &text.len())
                 .finish(),
             Self::UntrustedStyled { style, text } => formatter
@@ -257,7 +287,8 @@ impl LiveFrame {
         tool_name: &str,
         call_id: Option<&str>,
         reason: Option<&str>,
-        preview: &str,
+        preview: Arc<str>,
+        preview_kind: &ApprovalPreviewKind,
         retry: bool,
     ) -> Result<Self, LiveRenderError> {
         let mut parts = try_parts(12)?;
@@ -266,14 +297,19 @@ impl LiveFrame {
         } else {
             "[approval requested]\n"
         }));
-        push_untrusted_line(&mut parts, UiRole::Tool, tool_name)?;
+        let canonical_patch = matches!(preview_kind, ApprovalPreviewKind::CanonicalPatch(_));
+        push_approval_metadata_line(&mut parts, UiRole::Tool, tool_name, canonical_patch)?;
         if let Some(call_id) = call_id {
-            push_untrusted_line(&mut parts, UiRole::Call, call_id)?;
+            push_approval_metadata_line(&mut parts, UiRole::Call, call_id, canonical_patch)?;
         }
         if let Some(reason) = reason {
-            push_untrusted_line(&mut parts, UiRole::Reason, reason)?;
+            push_approval_metadata_line(&mut parts, UiRole::Reason, reason, canonical_patch)?;
         }
-        push_untrusted_line(&mut parts, UiRole::Preview, preview)?;
+        parts.push(LivePart::ApprovalPreview {
+            kind: preview_kind.clone(),
+            text: preview,
+        });
+        parts.push(LivePart::TrustedInline("\n"));
         Ok(Self { parts })
     }
 
@@ -394,6 +430,46 @@ impl PendingLiveFrame {
                         return Err(LiveRenderError);
                     }
                     presenter.render_untrusted(*role, &text[start..end], |chunk| {
+                        append_output(&mut self.output, chunk)
+                    })?;
+                    self.text_offset = end;
+                    if end == text.len() {
+                        self.part_index += 1;
+                        self.text_offset = 0;
+                    }
+                }
+                LivePart::LinearOnlyUntrusted { role, text } => {
+                    let start = self.text_offset;
+                    let mut end = start
+                        .saturating_add(FRAME_SOURCE_CHUNK_BYTES)
+                        .min(text.len());
+                    while end > start && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if end == start && start != text.len() {
+                        return Err(LiveRenderError);
+                    }
+                    presenter.render_untrusted(*role, &text[start..end], |chunk| {
+                        append_output(&mut self.output, chunk)
+                    })?;
+                    self.text_offset = end;
+                    if end == text.len() {
+                        self.part_index += 1;
+                        self.text_offset = 0;
+                    }
+                }
+                LivePart::ApprovalPreview { text, .. } => {
+                    let start = self.text_offset;
+                    let mut end = start
+                        .saturating_add(FRAME_SOURCE_CHUNK_BYTES)
+                        .min(text.len());
+                    while end > start && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    if end == start && start != text.len() {
+                        return Err(LiveRenderError);
+                    }
+                    presenter.render_untrusted(UiRole::Preview, &text[start..end], |chunk| {
                         append_output(&mut self.output, chunk)
                     })?;
                     self.text_offset = end;
@@ -552,6 +628,24 @@ impl EnhancedPresenter {
                     self.abort_active_markup(&mut builder)?;
                     let text = render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
                     self.push_role_fragment(&mut builder, role, &text)?;
+                }
+                LivePart::LinearOnlyUntrusted { .. } => {}
+                LivePart::ApprovalPreview { kind, text } => {
+                    self.abort_active_markup(&mut builder)?;
+                    match kind {
+                        ApprovalPreviewKind::Opaque => {
+                            let text =
+                                render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
+                            self.push_role_fragment(&mut builder, UiRole::Preview, &text)?;
+                        }
+                        ApprovalPreviewKind::CanonicalPatch(facts) => {
+                            self.ensure_line_start(&mut builder)?;
+                            present_canonical_patch(&mut builder, &facts, &text)
+                                .map_err(|_| LiveRenderError)?;
+                            self.at_line_start = true;
+                            self.active_role = None;
+                        }
+                    }
                 }
                 LivePart::UntrustedStyled { style, text } => {
                     self.abort_active_markup(&mut builder)?;
@@ -859,6 +953,12 @@ impl InteractivePresenter {
                 LivePart::AssistantMarkupAbort => {}
                 LivePart::Untrusted { role, text } => {
                     self.render_untrusted(*role, text, &mut emit)?
+                }
+                LivePart::LinearOnlyUntrusted { role, text } => {
+                    self.render_untrusted(*role, text, &mut emit)?
+                }
+                LivePart::ApprovalPreview { text, .. } => {
+                    self.render_untrusted(UiRole::Preview, text, &mut emit)?
                 }
                 LivePart::UntrustedStyled { text, .. } => {
                     self.render_untrusted_styled(text, &mut emit)?
@@ -1621,6 +1721,24 @@ fn push_untrusted_line(
     Ok(())
 }
 
+fn push_approval_metadata_line(
+    parts: &mut Vec<LivePart>,
+    role: UiRole,
+    value: &str,
+    linear_only: bool,
+) -> Result<(), LiveRenderError> {
+    if !linear_only {
+        return push_untrusted_line(parts, role, value);
+    }
+    let mut text = String::new();
+    text.try_reserve_exact(value.len())
+        .map_err(|_| LiveRenderError)?;
+    text.push_str(value);
+    parts.push(LivePart::LinearOnlyUntrusted { role, text });
+    parts.push(LivePart::TrustedInline("\n"));
+    Ok(())
+}
+
 fn try_parts(capacity: usize) -> Result<Vec<LivePart>, LiveRenderError> {
     let mut parts = Vec::new();
     parts
@@ -2007,11 +2125,18 @@ enum Comparison {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::LlmFailure;
+    use std::sync::Arc;
+
+    use crate::agent::{
+        ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPreviewKind, ApprovalPrompt,
+        ApprovalRequest,
+    };
+    use crate::model::{CallId, LlmFailure};
     use crate::session::{
-        CommittedUiEvent, CommittedUiKind, EventSeq, RetryNumber, SourceSeqBitmap, StepId,
-        TurnEndReason, TurnId, UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent,
-        UiIdentity, UiOpaquePayload, UiToolFailure, UiTurnEndReason, UnixMillis,
+        ApprovalRequestId, CommittedUiEvent, CommittedUiKind, EventSeq, RetryNumber,
+        SourceSeqBitmap, StepId, TurnEndReason, TurnId, UiAssistantBlock, UiAssistantBlockKind,
+        UiAssistantContent, UiIdentity, UiOpaquePayload, UiToolFailure, UiTurnEndReason,
+        UnixMillis,
     };
     use crate::tui::{
         presentation::{PresentedItem, TextStyle},
@@ -2756,7 +2881,8 @@ mod tests {
             "apply_patch",
             Some("call-patch"),
             Some("update note.txt"),
-            "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            Arc::from("--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n"),
+            &ApprovalPreviewKind::Opaque,
             false,
         )
         .unwrap();
@@ -2784,6 +2910,182 @@ mod tests {
         assert_eq!(selector_output, "[approval selector]\n");
         let oversized = "x".repeat(FRAME_OUTPUT_CHUNK_BYTES + 1);
         assert!(LiveFrame::approval_selector(oversized).is_err());
+    }
+
+    fn canonical_patch_request() -> ApprovalRequest {
+        let source = concat!(
+            "--- a/file.txt\n",
+            "+++ b/file.txt\n",
+            "@@ -1 +1 @@\n",
+            "--- a/decoy\n",
+            "+++ b/decoy\n",
+        );
+        let prompt = ApprovalPrompt::canonical_patch(
+            Some("SECRET_DUPLICATE_REASON".to_owned()),
+            source.to_owned(),
+            ApprovalPatchOperation::Update,
+            "file.txt".to_owned(),
+            vec![
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::Hunk,
+                ApprovalDiffRowKind::Removal,
+                ApprovalDiffRowKind::Addition,
+            ],
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+        ApprovalRequest::new(
+            ApprovalRequestId::new("approval-secret"),
+            "apply_patch".to_owned(),
+            CallId::new("SECRET_CALL_ID"),
+            &prompt,
+        )
+    }
+
+    #[test]
+    fn canonical_patch_uses_signed_row_styles_without_exposing_internal_metadata() {
+        let request = canonical_patch_request();
+        let frame = LiveFrame::approval(
+            request.tool_name(),
+            Some(request.call_id().as_str()),
+            request.reason(),
+            request.preview_arc(),
+            request.preview_kind(),
+            false,
+        )
+        .unwrap();
+        let prepared = EnhancedPresenter::new().prepare(frame).unwrap();
+        let text = presented_text(&prepared);
+        assert!(text.contains("Approval required\nProposed update · not applied\n"));
+        assert!(text.contains("file.txt · +1 -1 · 1 hunk\n"));
+        assert!(text.contains("One workspace file · no shell command\n"));
+        let diff_start = text.find("--- a/file.txt").unwrap();
+        assert_eq!(&text[diff_start..], request.preview());
+        assert_eq!(text.matches("--- a/decoy").count(), 1);
+        assert_eq!(text.matches("+++ b/decoy").count(), 1);
+        assert!(!text.contains("apply_patch"));
+        assert!(!text.contains("SECRET_CALL_ID"));
+        assert!(!text.contains("SECRET_DUPLICATE_REASON"));
+        assert_eq!(
+            presented_text_with_style(&prepared, TextStyle::DiffHeader),
+            "--- a/file.txt+++ b/file.txt"
+        );
+        assert_eq!(
+            presented_text_with_style(&prepared, TextStyle::DiffRemove),
+            "--- a/decoy"
+        );
+        assert_eq!(
+            presented_text_with_style(&prepared, TextStyle::DiffAdd),
+            "+++ b/decoy"
+        );
+        let debug = format!("{prepared:?}");
+        assert!(!debug.contains("file.txt"));
+        assert!(!debug.contains("decoy"));
+    }
+
+    #[test]
+    fn opaque_patch_lookalike_never_gains_semantic_diff_styles() {
+        let source = Arc::<str>::from("--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n");
+        let frame = LiveFrame::approval(
+            "apply_patch",
+            Some("call-opaque"),
+            Some("looks canonical"),
+            source,
+            &ApprovalPreviewKind::Opaque,
+            false,
+        )
+        .unwrap();
+        let prepared = EnhancedPresenter::new().prepare(frame).unwrap();
+        assert!(presented_text(&prepared).contains("--- a/file.txt"));
+        for style in [
+            TextStyle::DiffHeader,
+            TextStyle::DiffHunk,
+            TextStyle::DiffAdd,
+            TextStyle::DiffRemove,
+        ] {
+            assert!(presented_text_with_style(&prepared, style).is_empty());
+        }
+    }
+
+    #[test]
+    fn canonical_patch_path_and_payload_controls_are_visible_before_styling() {
+        let path = "note\u{202e}.txt";
+        let source = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+safe\u{202e}end\n");
+        let prompt = ApprovalPrompt::canonical_patch(
+            None,
+            source,
+            ApprovalPatchOperation::Create,
+            path.to_owned(),
+            vec![
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::Hunk,
+                ApprovalDiffRowKind::Addition,
+            ],
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        let request = ApprovalRequest::new(
+            ApprovalRequestId::new("approval-visible"),
+            "apply_patch".to_owned(),
+            CallId::new("call-visible"),
+            &prompt,
+        );
+        let frame = LiveFrame::approval(
+            request.tool_name(),
+            Some(request.call_id().as_str()),
+            request.reason(),
+            request.preview_arc(),
+            request.preview_kind(),
+            false,
+        )
+        .unwrap();
+        let prepared = EnhancedPresenter::new().prepare(frame).unwrap();
+        let text = presented_text(&prepared);
+        assert!(text.contains("note\\u{202e}.txt"));
+        assert!(text.contains("+safe\\u{202e}end"));
+        assert!(!text.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn linear_canonical_patch_keeps_the_complete_phase_nine_record_without_escape_bytes() {
+        let request = canonical_patch_request();
+        let frame = LiveFrame::approval(
+            request.tool_name(),
+            Some(request.call_id().as_str()),
+            request.reason(),
+            request.preview_arc(),
+            request.preview_kind(),
+            false,
+        )
+        .unwrap();
+        let mut output = String::new();
+        InteractivePresenter::new()
+            .render(&frame, |chunk| {
+                output.push_str(chunk);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "[approval requested]\n",
+                "tool | apply_patch\n",
+                "call | SECRET_CALL_ID\n",
+                "reason | SECRET_DUPLICATE_REASON\n",
+                "preview | --- a/file.txt\n",
+                "preview | +++ b/file.txt\n",
+                "preview | @@ -1 +1 @@\n",
+                "preview | --- a/decoy\n",
+                "preview | +++ b/decoy\n",
+            )
+        );
+        assert!(!output.contains('\u{1b}'));
     }
 
     #[test]

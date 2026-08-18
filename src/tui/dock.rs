@@ -145,20 +145,36 @@ impl DockFrame {
             lines.push(line(
                 DockRole::Notice,
                 fit_ascii(
-                    "Approval required | review the exact action above",
+                    if compact {
+                        "Not applied"
+                    } else {
+                        "Approval required | proposed action above"
+                    },
                     width_usize,
                 ),
             ));
             lines.push(line(DockRole::Divider, "-".repeat(width_usize)));
             let choices = [
-                (DockApprovalSelection::AllowOnce, "Allow once"),
-                (DockApprovalSelection::Reject, "Reject"),
-                (DockApprovalSelection::Cancel, "Stop turn"),
+                (
+                    DockApprovalSelection::AllowOnce,
+                    "Allow once | apply exact preview",
+                ),
+                (DockApprovalSelection::Reject, "Reject | make no change"),
+                (DockApprovalSelection::Cancel, "Stop turn | cancel work"),
             ];
             for (choice, label) in choices {
                 if compact && choice != selected {
                     continue;
                 }
+                let label = if compact {
+                    match choice {
+                        DockApprovalSelection::AllowOnce => "Allow once",
+                        DockApprovalSelection::Reject => "Reject",
+                        DockApprovalSelection::Cancel => "Stop turn",
+                    }
+                } else {
+                    label
+                };
                 let marker = if choice == selected { ">" } else { " " };
                 lines.push(line(
                     DockRole::ApprovalChoice,
@@ -591,6 +607,15 @@ mod tests {
             .unwrap();
             assert_eq!(frame.rows().unwrap(), 4);
             assert_eq!(frame.output_bottom(), 2);
+            if matches!(interaction, DockInteraction::Approval(_)) {
+                assert_eq!(frame.lines[0].text, "Not applied");
+                assert!(
+                    frame
+                        .lines
+                        .iter()
+                        .any(|line| line.text.contains("> Reject"))
+                );
+            }
             assert!(
                 frame.lines.iter().all(|line| {
                     unicode_width::UnicodeWidthStr::width(line.text.as_str()) <= 14
@@ -617,6 +642,13 @@ mod tests {
         .unwrap();
         assert_eq!(frame.rows().unwrap(), 4);
         assert_eq!(frame.output_bottom(), 1);
+        assert_eq!(frame.lines[0].text, "Not applied");
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.text.contains("> Reject"))
+        );
         assert!(
             DockFrame::layout(
                 DockModel {
@@ -643,6 +675,55 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn full_approval_surface_keeps_status_choices_and_safety_text_at_supported_widths() {
+        let composer = Composer::default();
+        let queue = PromptQueue::default();
+        for (rows, columns) in [(20, 44), (24, 80), (34, 112)] {
+            let frame = DockFrame::layout(
+                DockModel {
+                    interaction: DockInteraction::Approval(DockApprovalSelection::Reject),
+                    composer: &composer,
+                    queue: &queue,
+                    notice: None,
+                },
+                rows,
+                columns,
+            )
+            .unwrap();
+            assert_eq!(frame.lines.len(), 7);
+            assert!(frame.lines[0].text.contains("Approval required"));
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("Allow once"))
+            );
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("> Reject"))
+            );
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("Stop turn"))
+            );
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("Not sandboxed"))
+            );
+            assert!(frame.lines.iter().all(|line| {
+                unicode_width::UnicodeWidthStr::width(line.text.as_str())
+                    <= usize::from(columns - 1)
+            }));
+        }
     }
 
     #[test]

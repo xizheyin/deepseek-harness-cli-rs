@@ -1,6 +1,9 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use crate::session::{ApprovalOutcome, ApprovalRequestId};
+use crate::{
+    agent::ApprovalPreviewKind,
+    session::{ApprovalOutcome, ApprovalRequestId},
+};
 use thiserror::Error;
 
 use super::approval::{
@@ -49,8 +52,12 @@ impl ApprovalQuestion<'_> {
         self.active.asked.reason.as_deref()
     }
 
-    pub(super) fn preview(&self) -> &str {
-        self.active.envelope.request.preview()
+    pub(super) fn preview_kind(&self) -> &ApprovalPreviewKind {
+        self.active.envelope.request.preview_kind()
+    }
+
+    pub(super) fn preview_arc(&self) -> Arc<str> {
+        self.active.envelope.request.preview_arc()
     }
 
     pub(super) fn challenge(&self) -> uuid::Uuid {
@@ -280,6 +287,10 @@ impl ApprovalJoin {
             || envelope.request.tool_name() != asked.tool_name
             || Some(envelope.request.call_id().as_str()) != asked.call_id.as_deref()
             || envelope.request.reason() != asked.reason.as_deref()
+            || (matches!(
+                envelope.request.preview_kind(),
+                ApprovalPreviewKind::CanonicalPatch(_)
+            ) && asked.tool_name != "apply_patch")
         {
             drop(envelope);
             return Err(ApprovalJoinError);
@@ -337,7 +348,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::{
-        agent::{ApprovalPrompt, ApprovalRequest},
+        agent::{ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPrompt, ApprovalRequest},
         entropy::{EntropyError, EntropySource},
         model::CallId,
         session::{ApprovalOutcome, ApprovalRequestId},
@@ -398,7 +409,7 @@ mod tests {
         assert_eq!(question.tool_name(), "apply_patch");
         assert_eq!(question.call_id(), Some("call-1"));
         assert_eq!(question.reason(), Some("change one file"));
-        assert_eq!(question.preview(), "bounded preview");
+        assert_eq!(question.preview_arc().as_ref(), "bounded preview");
         let challenge = question.challenge();
         asked_first.answer(ApprovalOutcome::AllowedOnce).unwrap();
         assert_eq!(
@@ -426,6 +437,49 @@ mod tests {
         join.receive_envelope(value).unwrap();
         assert!(join.question().is_none());
         assert!(response.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn canonical_patch_provenance_cannot_be_joined_to_another_tool() {
+        let prompt = ApprovalPrompt::canonical_patch(
+            Some("run bash".to_owned()),
+            "--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n".to_owned(),
+            ApprovalPatchOperation::Update,
+            "file.txt".to_owned(),
+            vec![
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::Hunk,
+                ApprovalDiffRowKind::Removal,
+                ApprovalDiffRowKind::Addition,
+            ],
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+        let request = ApprovalRequest::new(
+            ApprovalRequestId::new("approval-foreign"),
+            "bash".to_owned(),
+            CallId::new("call-1"),
+            &prompt,
+        );
+        let (response, receive) = oneshot::channel();
+        let envelope = ApprovalEnvelope { request, response };
+        let mut join = join();
+        join.observe_asked(
+            "approval-foreign".to_owned(),
+            "bash".to_owned(),
+            Some("call-1".to_owned()),
+            Some("run bash".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            join.receive_envelope(envelope),
+            Err(super::ApprovalJoinError)
+        );
+        assert!(join.question().is_none());
+        assert!(receive.await.is_err());
     }
 
     #[tokio::test]

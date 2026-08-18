@@ -6,8 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{
-        ApprovalPrompt, MutationDeclineReason, PreparedToolMutation, ToolCommitOutcome,
-        ToolExecutionResult, ToolExecutorError, ToolPreparation,
+        ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPrompt, MutationDeclineReason,
+        PreparedToolMutation, ToolCommitOutcome, ToolExecutionResult, ToolExecutorError,
+        ToolPreparation,
     },
     model::{ContentBlock, JsonValue},
     session::ToolFailure,
@@ -97,7 +98,7 @@ pub(crate) async fn prepare(
         .into_execution_result()
         .map(ToolPreparation::Complete);
     }
-    let canonical_diff = match canonical_diff(
+    let canonical = match canonical_diff(
         &parsed.path,
         parsed.operation,
         &before.normalized,
@@ -108,11 +109,11 @@ pub(crate) async fn prepare(
         Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
     };
     let meta_probe =
-        match mutation_meta(&parsed.path, parsed.operation, &canonical_diff, false, true) {
+        match mutation_meta(&parsed.path, parsed.operation, &canonical.text, false, true) {
             Ok(meta) => meta,
             Err(error) => return Err(error),
         };
-    if canonical_diff.is_empty() || meta_probe.encoded_len() > MAX_CANONICAL_DIFF_JSON_BYTES {
+    if canonical.text.is_empty() || meta_probe.encoded_len() > MAX_CANONICAL_DIFF_JSON_BYTES {
         return ToolCallError::model(
             "PatchError",
             "DIFF_TOO_LARGE",
@@ -121,11 +122,21 @@ pub(crate) async fn prepare(
         .into_execution_result()
         .map(ToolPreparation::Complete);
     }
-    let prompt = ApprovalPrompt::new(
+    let prompt = ApprovalPrompt::canonical_patch(
         approval_reason(parsed.operation, &parsed.path),
-        canonical_diff.clone(),
+        canonical.text,
+        match parsed.operation {
+            WorkspaceMutationOperation::Create => ApprovalPatchOperation::Create,
+            WorkspaceMutationOperation::Update => ApprovalPatchOperation::Update,
+        },
+        parsed.path.clone(),
+        canonical.rows,
+        canonical.additions,
+        canonical.removals,
+        canonical.hunks,
     )
     .map_err(|_| ToolExecutorError::new("approval prompt normalization failed"))?;
+    let canonical_diff = prompt.preview_arc();
 
     let decline_path = parsed.path.clone();
     let decline_diff = canonical_diff.clone();
@@ -623,6 +634,27 @@ enum CanonicalOp<'a> {
     Insert(&'a str),
 }
 
+struct CanonicalDiff {
+    text: String,
+    rows: Vec<ApprovalDiffRowKind>,
+    additions: usize,
+    removals: usize,
+    hunks: usize,
+}
+
+impl std::fmt::Debug for CanonicalDiff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CanonicalDiff")
+            .field("text_bytes", &self.text.len())
+            .field("rows", &self.rows.len())
+            .field("additions", &self.additions)
+            .field("removals", &self.removals)
+            .field("hunks", &self.hunks)
+            .finish()
+    }
+}
+
 impl<'a> CanonicalOp<'a> {
     fn is_equal(self) -> bool {
         matches!(self, Self::Equal(_))
@@ -655,7 +687,7 @@ fn canonical_diff<'a>(
     before: &'a str,
     patch: &'a Patch<'_, str>,
     cancellation: &CancellationToken,
-) -> Result<String, ToolCallError> {
+) -> Result<CanonicalDiff, ToolCallError> {
     let original = before.split_inclusive('\n').collect::<Vec<_>>();
     let mut operations = Vec::new();
     operations
@@ -766,13 +798,33 @@ fn canonical_diff<'a>(
     }
 
     let mut output = String::new();
+    let mut rows = Vec::new();
+    rows.try_reserve(
+        operations
+            .len()
+            .min(crate::agent::MAX_APPROVAL_PREVIEW_BYTES),
+    )
+    .map_err(|_| ToolCallError::Infrastructure)?;
     let original_header = match operation {
         WorkspaceMutationOperation::Create => "--- /dev/null\n".to_owned(),
         WorkspaceMutationOperation::Update => format!("--- a/{path}\n"),
     };
-    push_diff_output(&mut output, &original_header)?;
-    push_diff_output(&mut output, &format!("+++ b/{path}\n"))?;
+    push_diff_row(
+        &mut output,
+        &mut rows,
+        ApprovalDiffRowKind::FileHeader,
+        &original_header,
+    )?;
+    push_diff_row(
+        &mut output,
+        &mut rows,
+        ApprovalDiffRowKind::FileHeader,
+        &format!("+++ b/{path}\n"),
+    )?;
 
+    let hunks = clusters.len();
+    let mut additions = 0_usize;
+    let mut removals = 0_usize;
     for (first_change, last_change) in clusters {
         let mut start = first_change;
         let mut leading = 0_usize;
@@ -794,24 +846,61 @@ fn canonical_diff<'a>(
         let new_len = new_prefix[end] - new_prefix[start];
         let old_range = format_hunk_range(old_prefix[start], old_len);
         let new_range = format_hunk_range(new_prefix[start], new_len);
-        push_diff_output(&mut output, &format!("@@ -{old_range} +{new_range} @@\n"))?;
+        push_diff_row(
+            &mut output,
+            &mut rows,
+            ApprovalDiffRowKind::Hunk,
+            &format!("@@ -{old_range} +{new_range} @@\n"),
+        )?;
         for operation in operations[start..end].iter().copied() {
             if cancellation.is_cancelled() {
                 return Err(ToolCallError::aborted());
             }
             let (prefix, value) = operation.rendered();
-            if prefix == ' ' && value == "\n" {
-                push_diff_output(&mut output, value)?;
-            } else {
-                push_diff_output(&mut output, &prefix.to_string())?;
-                push_diff_output(&mut output, value)?;
+            let kind = match operation {
+                CanonicalOp::Equal(_) => ApprovalDiffRowKind::Context,
+                CanonicalOp::Delete(_) => {
+                    removals = removals
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_patch("diff removal count overflow"))?;
+                    ApprovalDiffRowKind::Removal
+                }
+                CanonicalOp::Insert(_) => {
+                    additions = additions
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_patch("diff addition count overflow"))?;
+                    ApprovalDiffRowKind::Addition
+                }
+            };
+            let mut rendered = String::new();
+            rendered
+                .try_reserve(value.len().saturating_add(2))
+                .map_err(|_| ToolCallError::Infrastructure)?;
+            if prefix != ' ' || value != "\n" {
+                rendered.push(prefix);
             }
+            rendered.push_str(value);
             if !value.ends_with('\n') {
-                push_diff_output(&mut output, "\n\\ No newline at end of file\n")?;
+                rendered.push('\n');
+            }
+            push_diff_row(&mut output, &mut rows, kind, &rendered)?;
+            if !value.ends_with('\n') {
+                push_diff_row(
+                    &mut output,
+                    &mut rows,
+                    ApprovalDiffRowKind::NoNewline,
+                    "\\ No newline at end of file\n",
+                )?;
             }
         }
     }
-    Ok(output)
+    Ok(CanonicalDiff {
+        text: output,
+        rows,
+        additions,
+        removals,
+        hunks,
+    })
 }
 
 fn reject_redundant_edits(operations: &[CanonicalOp<'_>]) -> Result<(), ToolCallError> {
@@ -870,6 +959,22 @@ fn push_diff_output(output: &mut String, value: &str) -> Result<(), ToolCallErro
         ));
     }
     output.push_str(value);
+    Ok(())
+}
+
+fn push_diff_row(
+    output: &mut String,
+    rows: &mut Vec<ApprovalDiffRowKind>,
+    kind: ApprovalDiffRowKind,
+    value: &str,
+) -> Result<(), ToolCallError> {
+    if !value.ends_with('\n') || value[..value.len() - 1].contains('\n') {
+        return Err(invalid_patch("canonical diff row is not one physical line"));
+    }
+    push_diff_output(output, value)?;
+    rows.try_reserve(1)
+        .map_err(|_| ToolCallError::Infrastructure)?;
+    rows.push(kind);
     Ok(())
 }
 
@@ -1026,6 +1131,8 @@ fn approval_reason(operation: WorkspaceMutationOperation, path: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::ApprovalDiffRowKind;
+
     use serde_json::json;
 
     use super::{
@@ -1054,16 +1161,34 @@ mod tests {
             apply_strict("one\ntwo", &parsed.patch, &cancellation).unwrap(),
             "one\nTWO"
         );
+        let canonical = canonical_diff(
+            &parsed.path,
+            parsed.operation,
+            "one\ntwo",
+            &parsed.patch,
+            &cancellation,
+        )
+        .unwrap();
         assert_eq!(
-            canonical_diff(
-                &parsed.path,
-                parsed.operation,
-                "one\ntwo",
-                &parsed.patch,
-                &cancellation,
-            )
-            .unwrap(),
+            canonical.text,
             "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n one\n-two\n\\ No newline at end of file\n+TWO\n\\ No newline at end of file\n"
+        );
+        assert_eq!(
+            canonical.rows,
+            [
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::Hunk,
+                ApprovalDiffRowKind::Context,
+                ApprovalDiffRowKind::Removal,
+                ApprovalDiffRowKind::NoNewline,
+                ApprovalDiffRowKind::Addition,
+                ApprovalDiffRowKind::NoNewline,
+            ]
+        );
+        assert_eq!(
+            (canonical.additions, canonical.removals, canonical.hunks),
+            (1, 1, 1)
         );
 
         for invalid in [
@@ -1111,10 +1236,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            preview,
+            preview.text,
             "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n one\n\n-three\n+THREE\n"
         );
-        let reparsed = parse_patch(&preview).unwrap();
+        assert_eq!(preview.rows[4], ApprovalDiffRowKind::Context);
+        let reparsed = parse_patch(&preview.text).unwrap();
         assert_eq!(
             apply_strict("one\n\nthree\n", &reparsed.patch, &cancellation).unwrap(),
             "one\n\nTHREE\n"
@@ -1123,16 +1249,37 @@ mod tests {
 
     #[test]
     fn strict_parser_accepts_header_like_content_and_rejects_unsupported_dialects() {
-        let patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n---- heading\n-+++ heading\n+--- HEADING\n++++ HEADING\n";
+        let patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,2 @@\n--- a/decoy\n-++ b/decoy\n+-- A/DECOY\n+++ B/DECOY\n";
         let parsed = parse_patch(patch).unwrap();
+        let cancellation = CancellationToken::new();
         assert_eq!(
-            apply_strict(
-                "--- heading\n+++ heading\n",
-                &parsed.patch,
-                &CancellationToken::new(),
-            )
-            .unwrap(),
-            "--- HEADING\n+++ HEADING\n"
+            apply_strict("-- a/decoy\n++ b/decoy\n", &parsed.patch, &cancellation,).unwrap(),
+            "-- A/DECOY\n++ B/DECOY\n"
+        );
+        let canonical = canonical_diff(
+            &parsed.path,
+            parsed.operation,
+            "-- a/decoy\n++ b/decoy\n",
+            &parsed.patch,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(canonical.text, patch);
+        assert_eq!(
+            canonical.rows,
+            [
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::FileHeader,
+                ApprovalDiffRowKind::Hunk,
+                ApprovalDiffRowKind::Removal,
+                ApprovalDiffRowKind::Removal,
+                ApprovalDiffRowKind::Addition,
+                ApprovalDiffRowKind::Addition,
+            ]
+        );
+        assert_eq!(
+            (canonical.additions, canonical.removals, canonical.hunks),
+            (2, 2, 1)
         );
 
         for invalid in [

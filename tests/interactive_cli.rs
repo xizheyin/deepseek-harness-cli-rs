@@ -1070,7 +1070,15 @@ fn enhanced_resize_during_a_partial_stream_reanchors_without_cancelling_the_turn
 
 #[test]
 fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
-    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let patch = concat!(
+        "--- a/note.txt\n",
+        "+++ b/note.txt\n",
+        "@@ -1,2 +1,2 @@\n",
+        "--- a/decoy\n",
+        "-++ b/decoy\n",
+        "+-- A/DECOY\n",
+        "+++ B/DECOY\n",
+    );
     let server = SequenceSseServer::start(vec![
         tool_sse(
             "call-styled-patch",
@@ -1081,23 +1089,32 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     ]);
     let workspace = TestWorkspace::new();
     let target = workspace.0.join("note.txt");
-    std::fs::write(&target, "old\n").expect("test file should be created");
+    let old = "-- a/decoy\n++ b/decoy\n";
+    let new = "-- A/DECOY\n++ B/DECOY\n";
+    std::fs::write(&target, old).expect("test file should be created");
     let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
 
     dsh.expect("❯".as_bytes());
     dsh.write(b"show the styled approval selector\r");
+    dsh.expect(b"Proposed update");
+    dsh.expect(b"note.txt");
+    dsh.expect(b"+2 -2");
+    dsh.expect(b"\x1b[1;36m--- a/note.txt");
+    dsh.expect(b"\x1b[36m@@ -1,2 +1,2 @@");
+    dsh.expect(b"\x1b[31m--- a/decoy");
+    dsh.expect(b"\x1b[32m+++ B/DECOY");
     dsh.approval_ready();
     dsh.expect(b"> Reject");
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
     let selection = dsh.checkpoint();
     dsh.write(b"\x1b[A");
     dsh.expect_after(selection, b"> Allow once");
     dsh.expect_after(selection, b"Arrow keys move | Enter confirms | Esc stops");
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
     let compact = dsh.checkpoint();
     dsh.resize(6, 15);
     dsh.expect_after(compact, b"> Allow once");
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
     dsh.write(b"\r");
     dsh.expect(b"Updated  note.txt");
     dsh.expect(b"styled patch finished");
@@ -1105,8 +1122,18 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     let (status, transcript) = dsh.exit_cleanly();
 
     assert!(status.success());
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), new);
     assert!(transcript.contains(&0x1b));
+    for sentinel in [b"--- a/decoy".as_slice(), b"+++ B/DECOY"] {
+        assert_eq!(
+            transcript
+                .windows(sentinel.len())
+                .filter(|window| *window == sentinel)
+                .count(),
+            1,
+            "the immutable approval preview must enter scrollback once"
+        );
+    }
     assert_eq!(server.finish().len(), 2);
 }
 
@@ -1169,6 +1196,16 @@ fn enhanced_approval_rejects_printable_same_read_and_pasted_authority() {
             .count(),
         1
     );
+    for sentinel in [b"--- a/note.txt".as_slice(), b"+++ b/note.txt"] {
+        assert_eq!(
+            transcript
+                .windows(sentinel.len())
+                .filter(|window| *window == sentinel)
+                .count(),
+            1,
+            "invalid selector input must redraw only the Dock"
+        );
+    }
     for obsolete in [
         b"Tool requested".as_slice(),
         b"Tool finished",
@@ -2628,6 +2665,13 @@ fn approval_preview_and_path_bidi_are_visible_text_not_terminal_controls() {
         transcript
             .windows(b"note\\u{202e}.txt".len())
             .any(|window| window == b"note\\u{202e}.txt")
+    );
+    assert_eq!(
+        transcript
+            .windows(b"preview | +safe\\u{202e}end".len())
+            .filter(|window| *window == b"preview | +safe\\u{202e}end")
+            .count(),
+        1
     );
     assert!(
         transcript

@@ -3094,7 +3094,8 @@ fn approval_frame(joins: &ApprovalJoin, retry: bool) -> Result<LiveFrame, Intera
         question.tool_name(),
         question.call_id(),
         question.reason(),
-        question.preview(),
+        question.preview_arc(),
+        question.preview_kind(),
         retry,
     )
     .map_err(|_| InteractiveError::Output)?;

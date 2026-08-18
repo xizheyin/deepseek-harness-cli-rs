@@ -43,6 +43,9 @@ use crate::{
     },
 };
 
+pub(crate) use approval::{
+    ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPreviewKind, CanonicalPatchApproval,
+};
 pub use approval::{
     ApprovalFuture, ApprovalPrompt, ApprovalPromptError, ApprovalProvider, ApprovalProviderError,
     ApprovalRequest, FileChangePolicy, MAX_APPROVAL_PREVIEW_BYTES, MAX_APPROVAL_REASON_BYTES,

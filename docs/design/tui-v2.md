@@ -462,9 +462,10 @@ assistant text:
   addition, deletion, and context styles.
 
 The parser does not decode HTML entities or interpret raw ANSI. Tables,
-emphasis, links, images, and HTML rendering remain unimplemented. Diff styling
-currently applies only to assistant fenced `diff`/`patch`; the real canonical
-`apply_patch` approval preview remains a safely escaped Warning block.
+emphasis, links, images, and HTML rendering remain unimplemented. Assistant
+fenced `diff`/`patch` remains presentation-only and never proves a file effect.
+Real `apply_patch` approval uses a separate provenance path described below;
+it never promotes assistant text or a generic diff-looking prompt.
 
 Untrusted content is converted to visible text before parsing, and the closed
 presentation builder rejects terminal controls again. Only a matching
@@ -490,6 +491,32 @@ dock then presents the decision:
     Allow once      ● Reject      Stop turn
     ←/→ choose · Enter confirm · Esc stop
 ```
+
+The patch tool signs this view while it builds the canonical single-file diff.
+One immutable preview string remains the source for the approval card and the
+eventual tool-result `meta.diff`; a compact, bounded row-kind vector records
+file headers, hunks, context, additions, removals, and no-newline markers.
+Operation, workspace-relative path, hunk count, and `+N/-N` are produced at the
+same boundary. This is process-local presentation provenance and is not added
+to the Session schema.
+
+`ApprovalPrompt::new` always creates an opaque preview. A tool name, model
+reason, raw tool arguments, result prose, or text that merely resembles a diff
+can never acquire patch styling. Only the patch preparation path can construct
+the closed canonical-patch presentation. The row vector is aligned with every
+physical preview line and is validated before the prompt can exist. This also
+keeps hunk content such as `--- a/decoy` classified as a deletion rather than a
+file header. The enhanced presenter first makes every variable character
+terminal-visible, then applies the signed row styles without changing the
+copyable text. The linear renderer ignores the metadata and preserves its
+complete zero-ESC record.
+
+The card says **proposed** / **not applied** until a real tool result arrives.
+It shows the closed operation, path, hunk and line counts, the fact that this is
+one workspace file with no Shell command, and the complete diff. A malformed
+or resource-invalid semantic preview fails before the selector can accept
+input; it is never partially trusted or silently truncated. Generic Shell and
+plugin previews remain opaque Warning text.
 
 Shell and plugin approvals visibly state that native execution is not a
 sandbox. Risk statements come from closed local action contracts. The model's
@@ -591,6 +618,9 @@ text never controls it and the default is off.
 | CSI sequence | 32 bytes |
 | projected tool activities / approval links | 256 each |
 | projected tool summary / Dock activity source | 4 KiB UTF-8 each |
+| canonical patch approval path | 4 KiB UTF-8 |
+| canonical patch approval preview | existing 64 KiB UTF-8 |
+| canonical patch row provenance | one byte per physical preview row, at most 64 Ki entries |
 | final tool-card headline / detail | 256 UTF-8 bytes each |
 | receipt headline / counters / effects | 4 KiB UTF-8 each |
 | markup line-prefix candidate | 64 sanitized UTF-8 bytes |
@@ -695,10 +725,12 @@ remain in force.
    quotes, inline code, fenced code and fenced diff; authoritative-finish versus
    abort semantics; visible-control safety; graceful display omission;
    44/80/112-column terminal models; and enhanced/linear PTY evidence.
-6. **Remaining product checkpoint**: semantic `apply_patch` preview, tables,
-   Focus/Inspect/Review, commands/suggestions, themes, context/compaction, and
-   session picker.
-7. **Release checkpoint**: remove the replaced log renderer, installed-binary
+6. **Canonical patch approval (in progress)**: generator-signed, single-source
+   `apply_patch` facts; one copyable semantic diff card; unchanged linear
+   record; and the existing default-Reject input fence.
+7. **Remaining product checkpoint**: tables, Focus/Inspect/Review,
+   commands/suggestions, themes, context/compaction, and session picker.
+8. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status
    commit.
