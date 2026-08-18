@@ -294,7 +294,7 @@ fn source_bitmap_rejects_a_span_larger_than_one_provider_attempt() {
 }
 
 #[test]
-fn projection_omits_opaque_and_tool_result_bodies() {
+fn projection_retains_bounded_tool_payloads_but_redacts_them_from_debug() {
     const SECRET: &str = "SENTINEL_MUST_NOT_ENTER_UI_PROJECTION";
     let mut session = session("minimal-projection");
     let mut receiver = session.attach_ui_observer().unwrap();
@@ -378,7 +378,7 @@ fn projection_omits_opaque_and_tool_result_bodies() {
     assert!(debug.contains("visible streamed text"));
     assert!(debug.contains("visible final text"));
     assert!(debug.contains("visible reasoning"));
-    assert!(debug.contains("READ_FAILED"));
+    assert!(!debug.contains("READ_FAILED"));
     assert!(matches!(
         &projected[3].kind,
         CommittedUiKind::AssistantMessage { sources, .. }
@@ -387,10 +387,22 @@ fn projection_omits_opaque_and_tool_result_bodies() {
     assert!(matches!(
         &projected[4].kind,
         CommittedUiKind::ToolRequested {
-            arguments_preview,
-            arguments_truncated: true,
+            arguments,
             ..
-        } if arguments_preview == "arguments omitted"
+        } if arguments.as_str().is_some_and(|value| value.contains(SECRET))
+    ));
+    assert!(matches!(
+        &projected[5].kind,
+        CommittedUiKind::ToolResult {
+            failure: Some(failure),
+            content,
+            meta,
+            ..
+        }
+            if failure.code == "READ_FAILED"
+                && failure.name == "ReadError"
+                && content.as_str().is_some_and(|value| value.contains(SECRET))
+                && meta.as_str().is_some_and(|value| value.contains(SECRET))
     ));
     assert!(size_of::<CommittedUiEvent>() <= 512);
 }

@@ -360,8 +360,10 @@ The composer supports:
 - Ctrl+R bounded reverse history search;
 - Ctrl+J or Shift+Enter where the terminal reports it for a newline; Enter for
   submit/queue;
-- bracketed paste whose newlines never submit and whose control bytes are
-  rendered as visible text;
+- bracketed paste whose newlines never submit and whose control bytes that
+  actually reach the application are rendered as visible text. `VINTR`,
+  `VSUSP`, and `VQUIT` remain kernel signal characters even inside paste
+  because preserving `ISIG` is the stronger cleanup and safety contract;
 - slash-command and bounded file-suggestion modes with explicit focus;
 - a draft that survives running work, approval, resize, cancellation, and
   temporary menus.

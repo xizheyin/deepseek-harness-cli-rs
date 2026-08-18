@@ -5,6 +5,7 @@
 mod entropy;
 mod json_value;
 mod resident_credit;
+mod tui;
 mod workspace_authority;
 
 pub mod agent;

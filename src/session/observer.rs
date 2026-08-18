@@ -1,24 +1,31 @@
 //! Bounded projection of facts that have already committed to one Session.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    fmt::{self, Write as _},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use aws_lc_rs::digest::{SHA256, digest};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::model::{ContentBlockKind, MessageSourceKind, StreamChunkKind};
+use crate::model::{ContentBlockKind, ContextForm, MessageSourceKind, StreamChunkKind, TokenUsage};
 
 use super::{
-    ApprovalOutcome, ApprovalRequestId, EventKind, EventSeq, RetryNumber, SessionEvent, StepId,
-    ToolFailure, TurnEndReason, TurnId, UnixMillis,
+    ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionTrigger, EventKind, EventSeq,
+    RetryNumber, SessionEvent, StepId, SurfaceOp, ToolFailure, TurnEndCancelCause, TurnEndReason,
+    TurnId, UnixMillis,
 };
 
 const SOURCE_BITMAP_WORDS: usize = 64;
 const MAX_SOURCE_BITMAP_CAPACITY: usize = 128;
 const MAX_INDEXED_ASSISTANT_BLOCKS: usize = 128;
 const MAX_INDEXED_ASSISTANT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_UI_OPAQUE_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_UI_IDENTITY_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum UiObserverAttachError {
@@ -52,6 +59,10 @@ pub(crate) enum CommittedUiKind {
         turn: TurnId,
         step: StepId,
     },
+    UserMessage {
+        source: UiUserSource,
+        content: UiOpaquePayload,
+    },
     AssistantTextDelta {
         turn: TurnId,
         step: StepId,
@@ -64,43 +75,85 @@ pub(crate) enum CommittedUiKind {
         index: u64,
         text: String,
     },
+    UsageSample {
+        turn: TurnId,
+        step: StepId,
+        usage: UiTokenUsage,
+    },
     AssistantMessage {
         turn: TurnId,
         step: StepId,
         content: UiAssistantContent,
         sources: SourceSeqBitmap,
+        provider: UiIdentity,
+        model: UiIdentity,
+        usage: Option<UiTokenUsage>,
     },
     ToolRequested {
         turn: TurnId,
         step: StepId,
-        call_id: String,
-        name: String,
-        arguments_preview: String,
-        arguments_truncated: bool,
+        call_id: UiIdentity,
+        name: UiIdentity,
+        arguments: UiOpaquePayload,
     },
     ToolResult {
         turn: TurnId,
         step: StepId,
-        call_id: String,
+        call_id: UiIdentity,
         is_error: bool,
         failure: Option<UiToolFailure>,
+        content: UiOpaquePayload,
+        meta: UiOpaquePayload,
+        surface_replacement_target: Option<EventSeq>,
+    },
+    RequestContextChanged {
+        provider: Option<UiIdentity>,
+        model: Option<UiIdentity>,
+        context_window: Option<u64>,
+    },
+    CompactionStarted {
+        id: UiIdentity,
+        turn: Option<TurnId>,
+        trigger: Option<CompactionTrigger>,
+        shadowed_nodes: Option<usize>,
+    },
+    CompactionSummarized {
+        id: UiIdentity,
+        shadowed_tokens: u64,
+        provider: UiIdentity,
+        model: UiIdentity,
+        usage: Option<UiTokenUsage>,
+    },
+    CompactionEnded {
+        id: UiIdentity,
+        turn: Option<TurnId>,
+        error: Option<UiCompactionError>,
+    },
+    CompactionPruneMarked {
+        target: EventSeq,
+        shadowed_tokens: u64,
     },
     ApprovalAsked {
-        id: String,
-        tool_name: String,
-        call_id: Option<String>,
+        id: UiIdentity,
+        tool_name: UiIdentity,
+        call_id: Option<UiIdentity>,
         reason: Option<String>,
     },
     ApprovalDecided {
-        id: String,
+        id: UiIdentity,
         outcome: ApprovalOutcome,
     },
     RetryScheduled {
-        retry_id: String,
+        retry_id: UiIdentity,
         retry: RetryNumber,
+        provider: UiIdentity,
+        delay_ms: f64,
+        max_retries: Option<RetryNumber>,
+        failure_code: String,
+        failure_message: String,
     },
     RetryStarted {
-        retry_id: String,
+        retry_id: UiIdentity,
         retry: RetryNumber,
     },
     TypeOnly {
@@ -108,15 +161,214 @@ pub(crate) enum CommittedUiKind {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UiTokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_tokens: Option<u64>,
+    pub(crate) cache_write_tokens: Option<u64>,
+    pub(crate) reasoning_tokens: Option<u64>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct UiIdentity(Arc<UiIdentityInner>);
+
+#[derive(Eq, PartialEq)]
+struct UiIdentityInner {
+    display: String,
+    fingerprint: [u8; 32],
+    original_bytes: usize,
+    omitted: bool,
+}
+
+impl UiIdentity {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0.display
+    }
+
+    pub(crate) fn into_display(self) -> String {
+        Arc::try_unwrap(self.0)
+            .map(|inner| inner.display)
+            .unwrap_or_else(|inner| inner.display.clone())
+    }
+
+    pub(crate) fn from_static(value: &'static str) -> Self {
+        let fingerprint = digest(&SHA256, value.as_bytes());
+        let mut fingerprint_bytes = [0_u8; 32];
+        fingerprint_bytes.copy_from_slice(fingerprint.as_ref());
+        Self(Arc::new(UiIdentityInner {
+            display: value.to_owned(),
+            fingerprint: fingerprint_bytes,
+            original_bytes: value.len(),
+            omitted: false,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_text_for_test(value: &str) -> Self {
+        try_ui_identity(value).expect("test identity allocation should succeed")
+    }
+}
+
+impl std::ops::Deref for UiIdentity {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for UiIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UiIdentity")
+            .field("display_bytes", &self.0.display.len())
+            .field("original_bytes", &self.0.original_bytes)
+            .field("omitted", &self.0.omitted)
+            .finish()
+    }
+}
+
+impl From<&TokenUsage> for UiTokenUsage {
+    fn from(usage: &TokenUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens().get(),
+            output_tokens: usage.output_tokens().get(),
+            cache_read_tokens: usage.cache_read_tokens().map(|value| value.get()),
+            cache_write_tokens: usage.cache_write_tokens().map(|value| value.get()),
+            reasoning_tokens: usage.reasoning_tokens().map(|value| value.get()),
+        }
+    }
+}
+
+pub(crate) enum UiUserSource {
+    Human,
+    Context {
+        plugin: String,
+        form: Option<ContextForm>,
+    },
+    Other {
+        kind: String,
+    },
+}
+
+impl fmt::Debug for UiUserSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Human => formatter.write_str("Human"),
+            Self::Context { plugin, form } => formatter
+                .debug_struct("Context")
+                .field("plugin_bytes", &plugin.len())
+                .field("form", form)
+                .finish(),
+            Self::Other { kind } => formatter
+                .debug_struct("Other")
+                .field("kind_bytes", &kind.len())
+                .finish(),
+        }
+    }
+}
+
+pub(crate) struct UiOpaquePayload {
+    value: Option<String>,
+    original_bytes: usize,
+    omitted_parts: usize,
+}
+
+impl UiOpaquePayload {
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    pub(crate) fn original_bytes(&self) -> usize {
+        self.original_bytes
+    }
+
+    pub(crate) fn was_omitted(&self) -> bool {
+        (self.value.is_none() && self.original_bytes != 0) || self.omitted_parts != 0
+    }
+
+    pub(crate) fn omitted_parts(&self) -> usize {
+        self.omitted_parts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_text_for_test(value: &str) -> Self {
+        opaque_payload(value).expect("test payload allocation should succeed")
+    }
+}
+
+impl fmt::Debug for UiOpaquePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UiOpaquePayload")
+            .field(
+                "retained_bytes",
+                &self.value.as_ref().map_or(0, String::len),
+            )
+            .field("original_bytes", &self.original_bytes)
+            .field("omitted_parts", &self.omitted_parts)
+            .field("omitted", &self.was_omitted())
+            .finish()
+    }
+}
+
+pub(crate) struct UiCompactionError {
+    pub(crate) code: Option<String>,
+    pub(crate) message: String,
+}
+
+impl fmt::Debug for UiCompactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UiCompactionError")
+            .field("code_bytes", &self.code.as_ref().map_or(0, String::len))
+            .field("message_bytes", &self.message.len())
+            .finish()
+    }
+}
+
 pub(crate) enum UiTurnEndReason {
     Completed,
-    Aborted,
+    Aborted { cause: UiTurnEndCancelCause },
     Blocked,
     Error { code: String, message: String },
     MaxTokens,
     Interrupted,
     Other { kind: Option<String> },
+}
+
+impl fmt::Debug for UiTurnEndReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed => formatter.write_str("Completed"),
+            Self::Aborted { cause } => formatter
+                .debug_struct("Aborted")
+                .field("cause", cause)
+                .finish(),
+            Self::Blocked => formatter.write_str("Blocked"),
+            Self::Error { code, message } => formatter
+                .debug_struct("Error")
+                .field("code_bytes", &code.len())
+                .field("message_bytes", &message.len())
+                .finish(),
+            Self::MaxTokens => formatter.write_str("MaxTokens"),
+            Self::Interrupted => formatter.write_str("Interrupted"),
+            Self::Other { kind } => formatter
+                .debug_struct("Other")
+                .field("kind_bytes", &kind.as_ref().map_or(0, String::len))
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UiTurnEndCancelCause {
+    User,
+    Parent,
+    Hook,
+    Disposed,
+    Legacy,
 }
 
 #[derive(Debug)]
@@ -141,10 +393,19 @@ pub(crate) enum UiAssistantBlockKind {
     Reasoning,
 }
 
-#[derive(Debug)]
 pub(crate) struct UiToolFailure {
     pub(crate) name: String,
     pub(crate) code: String,
+}
+
+impl fmt::Debug for UiToolFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UiToolFailure")
+            .field("name_bytes", &self.name.len())
+            .field("code_bytes", &self.code.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -388,6 +649,11 @@ impl CommittedUiEvent {
                         text: try_copy(text)?,
                     }
                 }
+                StreamChunkKind::Usage { usage } => CommittedUiKind::UsageSample {
+                    turn: *turn,
+                    step: *step,
+                    usage: UiTokenUsage::from(usage),
+                },
                 _ => CommittedUiKind::TypeOnly {
                     event_type: "assistant/chunk",
                 },
@@ -396,8 +662,17 @@ impl CommittedUiEvent {
                 turn,
                 step,
                 message,
-                ..
+                usage,
             } => {
+                let (provider, model) = match message.source().kind() {
+                    MessageSourceKind::Model {
+                        provider, model, ..
+                    } => (provider.as_str(), model.as_str()),
+                    // Memory-compatible/imported sessions can retain unusual
+                    // but valid assistant facts. The UI must degrade instead
+                    // of imposing a stronger invariant than Session.
+                    _ => ("unknown", "unknown"),
+                };
                 let visible_blocks = message
                     .content()
                     .iter()
@@ -452,6 +727,9 @@ impl CommittedUiEvent {
                     sources: SourceSeqBitmap::from_sources(
                         event.source_event_seqs().unwrap_or_default(),
                     )?,
+                    provider: try_ui_identity(provider)?,
+                    model: try_ui_identity(model)?,
+                    usage: usage.as_ref().map(UiTokenUsage::from),
                 }
             }
             EventKind::ToolCall {
@@ -460,24 +738,19 @@ impl CommittedUiEvent {
                 call_id,
                 name,
                 arguments,
-            } => {
-                CommittedUiKind::ToolRequested {
-                    turn: *turn,
-                    step: *step,
-                    call_id: try_copy(call_id.as_str())?,
-                    name: try_copy(name)?,
-                    // Tool arguments can contain patch/file bodies. The live
-                    // status channel therefore reports omission, not a prefix.
-                    arguments_preview: try_copy("arguments omitted")?,
-                    arguments_truncated: !arguments.is_empty(),
-                }
-            }
+            } => CommittedUiKind::ToolRequested {
+                turn: *turn,
+                step: *step,
+                call_id: try_ui_identity(call_id.as_str())?,
+                name: try_ui_identity(name)?,
+                arguments: opaque_payload(arguments)?,
+            },
             EventKind::ToolResult {
                 turn,
                 step,
                 message,
                 error,
-                ..
+                meta,
             } => {
                 let Some(block) = message.content().first() else {
                     return Err(UiProjectionError);
@@ -498,34 +771,49 @@ impl CommittedUiEvent {
                 CommittedUiKind::ToolResult {
                     turn: *turn,
                     step: *step,
-                    call_id: try_copy(call_id.as_str())?,
+                    call_id: try_ui_identity(call_id.as_str())?,
                     is_error: (*is_error).unwrap_or(error.is_some()),
                     failure: error.as_ref().map(project_tool_failure).transpose()?,
+                    content: opaque_json(block.tool_result_content().ok_or(UiProjectionError)?)?,
+                    meta: match meta {
+                        Some(meta) => opaque_json(meta.as_value())?,
+                        None => opaque_payload("")?,
+                    },
+                    surface_replacement_target: match event.surface_op() {
+                        Some(SurfaceOp::Replace(replacement)) => Some(replacement.start),
+                        _ => None,
+                    },
                 }
             }
             EventKind::ApprovalAsked { asked } => CommittedUiKind::ApprovalAsked {
                 id: approval_id(asked.id())?,
-                tool_name: try_copy(asked.tool_name())?,
+                tool_name: try_ui_identity(asked.tool_name())?,
                 call_id: asked
                     .call_id()
-                    .map(|call_id| try_copy(call_id.as_str()))
+                    .map(|call_id| try_ui_identity(call_id.as_str()))
                     .transpose()?,
-                reason: asked.reason().map(try_copy).transpose()?,
+                reason: asked.reason().map(try_ui_text).transpose()?,
             },
             EventKind::ApprovalDecided { decided } => CommittedUiKind::ApprovalDecided {
                 id: approval_id(decided.id())?,
                 outcome: decided.outcome(),
             },
             EventKind::LlmRetry { retry } => CommittedUiKind::RetryScheduled {
-                retry_id: try_copy(retry.retry_id().as_str())?,
+                retry_id: try_ui_identity(retry.retry_id().as_str())?,
                 retry: retry.retry(),
+                provider: try_ui_identity(retry.provider())?,
+                delay_ms: retry.delay_ms().get(),
+                max_retries: retry.max_retries(),
+                failure_code: try_ui_text(retry.failure().code())?,
+                failure_message: try_ui_text(retry.failure().message())?,
             },
             EventKind::LlmRetryStarted { started } => CommittedUiKind::RetryStarted {
-                retry_id: try_copy(started.retry_id().as_str())?,
+                retry_id: try_ui_identity(started.retry_id().as_str())?,
                 retry: started.retry(),
             },
-            EventKind::UserMessage { .. } => CommittedUiKind::TypeOnly {
-                event_type: "user/message",
+            EventKind::UserMessage { message } => CommittedUiKind::UserMessage {
+                source: project_user_source(message.source().kind())?,
+                content: message_text_payload(message.content())?,
             },
             EventKind::TodoWrite { .. } => CommittedUiKind::TypeOnly {
                 event_type: "todo/write",
@@ -533,20 +821,35 @@ impl CommittedUiEvent {
             EventKind::RequestHeader { .. } => CommittedUiKind::TypeOnly {
                 event_type: "request/header",
             },
-            EventKind::RequestContext { .. } => CommittedUiKind::TypeOnly {
-                event_type: "request/context",
+            EventKind::RequestContext { context } => CommittedUiKind::RequestContextChanged {
+                provider: context.provider().map(try_ui_identity).transpose()?,
+                model: context.model().map(try_ui_identity).transpose()?,
+                context_window: context.context_window().map(|value| value.get()),
             },
-            EventKind::CompactionStart { .. } => CommittedUiKind::TypeOnly {
-                event_type: "compaction/start",
+            EventKind::CompactionStart { start } => {
+                let dispatch = start.dispatch();
+                CommittedUiKind::CompactionStarted {
+                    id: try_ui_identity(start.compaction_id().as_str())?,
+                    turn: start.turn(),
+                    trigger: dispatch.map(|value| value.trigger()),
+                    shadowed_nodes: dispatch.map(|value| value.shadowed_seqs().len()),
+                }
+            }
+            EventKind::CompactionSummary { summary } => CommittedUiKind::CompactionSummarized {
+                id: try_ui_identity(summary.compaction_id().as_str())?,
+                shadowed_tokens: summary.shadowed_token_count().get(),
+                provider: try_ui_identity(summary.provider())?,
+                model: try_ui_identity(summary.model())?,
+                usage: summary.usage().map(UiTokenUsage::from),
             },
-            EventKind::CompactionSummary { .. } => CommittedUiKind::TypeOnly {
-                event_type: "compaction/summary",
+            EventKind::CompactionEnd { end } => CommittedUiKind::CompactionEnded {
+                id: try_ui_identity(end.compaction_id().as_str())?,
+                turn: end.turn(),
+                error: end.error().map(project_compaction_error).transpose()?,
             },
-            EventKind::CompactionEnd { .. } => CommittedUiKind::TypeOnly {
-                event_type: "compaction/end",
-            },
-            EventKind::CompactionPrune { .. } => CommittedUiKind::TypeOnly {
-                event_type: "compaction/prune",
+            EventKind::CompactionPrune { prune } => CommittedUiKind::CompactionPruneMarked {
+                target: prune.shadowed_range().start(),
+                shadowed_tokens: prune.shadowed_token_count().get(),
             },
             EventKind::EndSeed => CommittedUiKind::TypeOnly {
                 event_type: "session/end-seed",
@@ -564,29 +867,129 @@ impl CommittedUiEvent {
 fn project_turn_end_reason(reason: &TurnEndReason) -> Result<UiTurnEndReason, UiProjectionError> {
     Ok(match reason {
         TurnEndReason::Completed => UiTurnEndReason::Completed,
-        TurnEndReason::Aborted { .. } => UiTurnEndReason::Aborted,
+        TurnEndReason::Aborted { reason } => UiTurnEndReason::Aborted {
+            cause: match reason {
+                TurnEndCancelCause::User => UiTurnEndCancelCause::User,
+                TurnEndCancelCause::Parent => UiTurnEndCancelCause::Parent,
+                TurnEndCancelCause::Hook { .. } => UiTurnEndCancelCause::Hook,
+                TurnEndCancelCause::Disposed => UiTurnEndCancelCause::Disposed,
+                TurnEndCancelCause::Legacy => UiTurnEndCancelCause::Legacy,
+            },
+        },
         TurnEndReason::Blocked => UiTurnEndReason::Blocked,
         TurnEndReason::Error { error } => UiTurnEndReason::Error {
-            code: try_copy(error.code())?,
-            message: try_copy(error.message())?,
+            code: try_ui_text(error.code())?,
+            message: try_ui_text(error.message())?,
         },
         TurnEndReason::MaxTokens => UiTurnEndReason::MaxTokens,
         TurnEndReason::Interrupted => UiTurnEndReason::Interrupted,
         TurnEndReason::Other { kind, .. } => UiTurnEndReason::Other {
-            kind: kind.as_deref().map(try_copy).transpose()?,
+            kind: kind.as_deref().map(try_ui_text).transpose()?,
         },
     })
 }
 
 fn project_tool_failure(failure: &ToolFailure) -> Result<UiToolFailure, UiProjectionError> {
     Ok(UiToolFailure {
-        name: try_copy(&failure.name)?,
-        code: try_copy(&failure.code)?,
+        name: try_ui_text(&failure.name)?,
+        code: try_ui_text(&failure.code)?,
     })
 }
 
-fn approval_id(id: &ApprovalRequestId) -> Result<String, UiProjectionError> {
-    try_copy(id.as_str())
+fn project_user_source(source: &MessageSourceKind) -> Result<UiUserSource, UiProjectionError> {
+    Ok(match source {
+        MessageSourceKind::User => UiUserSource::Human,
+        MessageSourceKind::Plugin { plugin, form, .. } => UiUserSource::Context {
+            plugin: try_ui_text(plugin)?,
+            form: *form,
+        },
+        MessageSourceKind::Other { kind } => UiUserSource::Other {
+            kind: try_ui_text(kind)?,
+        },
+        MessageSourceKind::Model { .. } => UiUserSource::Other {
+            kind: try_copy("model")?,
+        },
+        MessageSourceKind::Tool { .. } => UiUserSource::Other {
+            kind: try_copy("tool")?,
+        },
+    })
+}
+
+fn project_compaction_error(
+    error: &CompactionEndError,
+) -> Result<UiCompactionError, UiProjectionError> {
+    Ok(match error {
+        CompactionEndError::Failure(failure) => UiCompactionError {
+            code: Some(try_ui_text(failure.code())?),
+            message: try_ui_text(failure.message())?,
+        },
+        CompactionEndError::LegacyString(message) => UiCompactionError {
+            code: None,
+            message: try_ui_text(message)?,
+        },
+    })
+}
+
+fn message_text_payload(
+    blocks: &[crate::model::ContentBlock],
+) -> Result<UiOpaquePayload, UiProjectionError> {
+    let omitted_parts = blocks
+        .iter()
+        .filter(|block| !matches!(block.kind(), ContentBlockKind::Text { .. }))
+        .count();
+    let total = blocks.iter().try_fold(0_usize, |total, block| {
+        if let ContentBlockKind::Text { text } = block.kind() {
+            total.checked_add(text.len()).ok_or(UiProjectionError)
+        } else {
+            Ok(total)
+        }
+    })?;
+    if total > MAX_UI_OPAQUE_PAYLOAD_BYTES {
+        return Ok(UiOpaquePayload {
+            value: None,
+            original_bytes: total,
+            omitted_parts,
+        });
+    }
+    let mut text = String::new();
+    text.try_reserve_exact(total)
+        .map_err(|_| UiProjectionError)?;
+    for block in blocks {
+        if let ContentBlockKind::Text { text: block_text } = block.kind() {
+            text.push_str(block_text);
+        }
+    }
+    Ok(UiOpaquePayload {
+        value: Some(text),
+        original_bytes: total,
+        omitted_parts,
+    })
+}
+
+fn opaque_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> Result<UiOpaquePayload, UiProjectionError> {
+    let encoded = serde_json::to_string(value).map_err(|_| UiProjectionError)?;
+    opaque_payload(&encoded)
+}
+
+fn opaque_payload(value: &str) -> Result<UiOpaquePayload, UiProjectionError> {
+    if value.len() > MAX_UI_OPAQUE_PAYLOAD_BYTES {
+        return Ok(UiOpaquePayload {
+            value: None,
+            original_bytes: value.len(),
+            omitted_parts: 0,
+        });
+    }
+    Ok(UiOpaquePayload {
+        value: Some(try_copy(value)?),
+        original_bytes: value.len(),
+        omitted_parts: 0,
+    })
+}
+
+fn approval_id(id: &ApprovalRequestId) -> Result<UiIdentity, UiProjectionError> {
+    try_ui_identity(id.as_str())
 }
 
 fn try_copy(value: &str) -> Result<String, UiProjectionError> {
@@ -595,6 +998,46 @@ fn try_copy(value: &str) -> Result<String, UiProjectionError> {
         .map_err(|_| UiProjectionError)?;
     copy.push_str(value);
     Ok(copy)
+}
+
+fn try_ui_identity(value: &str) -> Result<UiIdentity, UiProjectionError> {
+    let fingerprint = digest(&SHA256, value.as_bytes());
+    let mut fingerprint_bytes = [0_u8; 32];
+    fingerprint_bytes.copy_from_slice(fingerprint.as_ref());
+    let omitted = value.len() > MAX_UI_IDENTITY_BYTES;
+    let display = if omitted {
+        let mut marker = String::new();
+        marker
+            .try_reserve_exact(128)
+            .map_err(|_| UiProjectionError)?;
+        write!(&mut marker, "[omitted {}-byte value sha256:", value.len())
+            .map_err(|_| UiProjectionError)?;
+        for byte in fingerprint.as_ref() {
+            write!(&mut marker, "{byte:02x}").map_err(|_| UiProjectionError)?;
+        }
+        marker.push(']');
+        marker
+    } else {
+        try_copy(value)?
+    };
+    Ok(UiIdentity(Arc::new(UiIdentityInner {
+        display,
+        fingerprint: fingerprint_bytes,
+        original_bytes: value.len(),
+        omitted,
+    })))
+}
+
+fn try_ui_text(value: &str) -> Result<String, UiProjectionError> {
+    if value.len() <= MAX_UI_IDENTITY_BYTES {
+        return try_copy(value);
+    }
+    let mut marker = String::new();
+    marker
+        .try_reserve_exact(64)
+        .map_err(|_| UiProjectionError)?;
+    write!(&mut marker, "[omitted {}-byte text]", value.len()).map_err(|_| UiProjectionError)?;
+    Ok(marker)
 }
 
 fn concat_final_text(blocks: &[crate::model::ContentBlock]) -> Result<String, UiProjectionError> {
@@ -620,11 +1063,14 @@ fn concat_final_text(blocks: &[crate::model::ContentBlock]) -> Result<String, Ui
 mod tests {
     use serde_json::json;
 
-    use super::{CommittedUiEvent, CommittedUiKind};
+    use super::{
+        CommittedUiEvent, CommittedUiKind, MAX_UI_IDENTITY_BYTES, MAX_UI_OPAQUE_PAYLOAD_BYTES,
+        UiUserSource, opaque_payload, try_ui_identity, try_ui_text,
+    };
     use crate::session::codec::decode_event;
 
     #[test]
-    fn compaction_projection_exposes_only_the_event_type() {
+    fn compaction_projection_exposes_safe_counts_without_summary_payloads() {
         const SECRET: &str = "SECRET_COMPACTION_PAYLOAD_MUST_NOT_REACH_UI";
         let event = decode_event(
             json!({
@@ -649,10 +1095,207 @@ mod tests {
         let projection = CommittedUiEvent::from_event(&event).unwrap();
         assert!(matches!(
             projection.kind,
-            CommittedUiKind::TypeOnly {
-                event_type: "compaction/summary"
-            }
+            CommittedUiKind::CompactionSummarized {
+                shadowed_tokens: 1,
+                ref provider,
+                ref model,
+                ..
+            } if provider.as_str() == "deepseek" && model.as_str() == "deepseek-chat"
         ));
         assert!(!format!("{projection:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn direct_user_content_is_distinct_from_plugin_context() {
+        let human = decode_event(
+            json!({
+                "type": "user/message",
+                "seq": 0,
+                "time": 1,
+                "data": {
+                    "id": "human",
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "hello" },
+                        { "type": "future-block", "secret": "must-not-be-silently-rendered" }
+                    ],
+                    "source": { "kind": "user" }
+                },
+                "surfaceOp": "append"
+            }),
+            0,
+        )
+        .unwrap();
+        let context = decode_event(
+            json!({
+                "type": "user/message",
+                "seq": 1,
+                "time": 2,
+                "data": {
+                    "id": "checkpoint",
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "internal context" }],
+                    "source": {
+                        "kind": "plugin",
+                        "plugin": "compact",
+                        "form": "notice",
+                        "summary": "checkpoint"
+                    }
+                },
+                "surfaceOp": "append"
+            }),
+            1,
+        )
+        .unwrap();
+        let unusual_but_valid = decode_event(
+            json!({
+                "type": "user/message",
+                "seq": 2,
+                "time": 3,
+                "data": {
+                    "id": "model-sourced-user-role",
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "retained" }],
+                    "source": {
+                        "kind": "model",
+                        "provider": "provider",
+                        "model": "model"
+                    }
+                },
+                "surfaceOp": "append"
+            }),
+            2,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            CommittedUiEvent::from_event(&human).unwrap().kind,
+            CommittedUiKind::UserMessage {
+                source: UiUserSource::Human,
+                ref content,
+            } if content.as_str() == Some("hello") && content.omitted_parts() == 1
+        ));
+        assert!(matches!(
+            CommittedUiEvent::from_event(&context).unwrap().kind,
+            CommittedUiKind::UserMessage {
+                source: UiUserSource::Context { ref plugin, .. },
+                ..
+            } if plugin == "compact"
+        ));
+        assert!(matches!(
+            CommittedUiEvent::from_event(&unusual_but_valid)
+                .unwrap()
+                .kind,
+            CommittedUiKind::UserMessage {
+                source: UiUserSource::Other { ref kind },
+                ..
+            } if kind == "model"
+        ));
+    }
+
+    #[test]
+    fn opaque_ui_payload_is_exact_bounded_and_debug_redacted() {
+        const SECRET: &str = "UI_PAYLOAD_SECRET";
+        let exact_text = format!(
+            "{SECRET}{}",
+            "x".repeat(MAX_UI_OPAQUE_PAYLOAD_BYTES - SECRET.len())
+        );
+        let exact = opaque_payload(&exact_text).unwrap();
+        assert_eq!(
+            exact.as_str().map(str::len),
+            Some(MAX_UI_OPAQUE_PAYLOAD_BYTES)
+        );
+        assert!(!format!("{exact:?}").contains(SECRET));
+
+        let over = opaque_payload(&format!("{exact_text}x")).unwrap();
+        assert!(over.as_str().is_none());
+        assert!(over.was_omitted());
+        assert_eq!(over.original_bytes(), MAX_UI_OPAQUE_PAYLOAD_BYTES + 1);
+    }
+
+    #[test]
+    fn ui_identities_are_exact_at_the_limit_and_distinctly_fingerprinted_above_it() {
+        let exact = "x".repeat(MAX_UI_IDENTITY_BYTES);
+        assert_eq!(try_ui_identity(&exact).unwrap().as_str(), exact);
+
+        let first = format!("{}a", "x".repeat(MAX_UI_IDENTITY_BYTES));
+        let second = format!("{}b", "x".repeat(MAX_UI_IDENTITY_BYTES));
+        let projected_first = try_ui_identity(&first).unwrap();
+        let projected_second = try_ui_identity(&second).unwrap();
+        assert_ne!(projected_first, projected_second);
+        assert!(projected_first.as_str().len() < 128);
+        assert!(projected_first.as_str().contains("4097-byte value sha256:"));
+        assert!(!projected_first.as_str().contains(&first));
+
+        let literal_marker = try_ui_identity(projected_first.as_str()).unwrap();
+        assert_ne!(projected_first, literal_marker);
+    }
+
+    #[test]
+    fn oversized_human_readable_text_is_omitted_without_a_secret_fingerprint() {
+        let secret = format!("LOW_ENTROPY_SECRET{}", "x".repeat(MAX_UI_IDENTITY_BYTES));
+        let projected = try_ui_text(&secret).unwrap();
+        assert_eq!(projected, format!("[omitted {}-byte text]", secret.len()));
+        assert!(!projected.contains("sha256"));
+        assert!(!projected.contains("LOW_ENTROPY_SECRET"));
+    }
+
+    #[test]
+    fn prune_marker_and_surface_replacement_project_the_same_historical_target() {
+        let marker = decode_event(
+            json!({
+                "type": "compaction/prune",
+                "seq": 10,
+                "time": 1,
+                "data": {
+                    "shadowedRange": { "start": 9, "end": 9 },
+                    "shadowedSeqs": [9],
+                    "shadowedTokenCount": 24
+                }
+            }),
+            10,
+        )
+        .unwrap();
+        let replacement = decode_event(
+            json!({
+                "type": "tool/result",
+                "seq": 11,
+                "time": 2,
+                "data": {
+                    "turn": 1,
+                    "step": 1,
+                    "message": {
+                        "id": "result-1",
+                        "role": "user",
+                        "content": [{
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "content": [{ "type": "text", "text": "pruned" }],
+                            "isError": false
+                        }],
+                        "source": { "kind": "tool", "callId": "call-1" }
+                    }
+                },
+                "surfaceOp": { "op": "replace", "start": 9, "end": 9 },
+                "sourceEventSeqs": [9]
+            }),
+            11,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            CommittedUiEvent::from_event(&marker).unwrap().kind,
+            CommittedUiKind::CompactionPruneMarked {
+                target,
+                shadowed_tokens: 24,
+            } if target.get() == 9
+        ));
+        assert!(matches!(
+            CommittedUiEvent::from_event(&replacement).unwrap().kind,
+            CommittedUiKind::ToolResult {
+                surface_replacement_target: Some(target),
+                ..
+            } if target.get() == 9
+        ));
     }
 }

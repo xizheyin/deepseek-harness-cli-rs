@@ -4,8 +4,9 @@ use thiserror::Error;
 
 use crate::session::{
     ApprovalOutcome, CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap,
-    UiAssistantBlockKind, UiAssistantContent, UiTurnEndReason,
+    UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiTurnEndReason,
 };
+use crate::tui::projector::UiProjector;
 
 use super::{
     render::VisibleRenderer,
@@ -375,17 +376,41 @@ impl InteractivePresenter {
 
 pub(super) struct LiveRenderer {
     attempt: Option<AttemptState>,
+    semantic: UiProjector,
 }
 
 impl LiveRenderer {
     pub(super) fn new() -> Self {
-        Self { attempt: None }
+        Self {
+            attempt: None,
+            semantic: UiProjector::default(),
+        }
     }
 
     pub(super) fn consume(
         &mut self,
         event: CommittedUiEvent,
     ) -> Result<LiveUpdate, LiveRenderError> {
+        if self.semantic.observe(&event.kind).is_err() {
+            // Phase 11 semantic projection is shadowing the accepted Phase 9
+            // renderer until its own dock becomes authoritative. A display
+            // mismatch must not cancel otherwise valid Agent work.
+            self.semantic = UiProjector::default();
+        }
+        let semantic_status = self.semantic.status();
+        let _ = (
+            semantic_status.last_usage,
+            semantic_status.last_human_prompt_bytes,
+            semantic_status.last_human_omitted_parts,
+            semantic_status.retry_count,
+            semantic_status.omitted_tool_facts,
+            semantic_status.omitted_approval_facts,
+            semantic_status.last_prune_shadowed_tokens,
+            semantic_status.pending_prune_shadowed_tokens,
+            semantic_status.orphan_prune_markers,
+            semantic_status.conflicting_facts,
+            semantic_status.compaction_usage,
+        );
         let seq = event.seq;
         let _time = event.time;
         let mut lifecycle = LiveLifecycle::None;
@@ -413,6 +438,13 @@ impl LiveRenderer {
                 }
                 None
             }
+            CommittedUiKind::UserMessage { source, content } => {
+                let _ = (source, content);
+                // Canonical-mode Phase 9 input is still terminal-echoed. The
+                // long-lived Phase 11 composer will render this semantic fact
+                // after echo is disabled.
+                None
+            }
             CommittedUiKind::AssistantTextDelta {
                 turn,
                 step,
@@ -438,31 +470,61 @@ impl LiveRenderer {
                 )?;
                 LiveFrame::from_parts(single_untrusted(UiRole::Reasoning, text)?)
             }
+            CommittedUiKind::UsageSample { turn, step, usage } => {
+                let _ = (turn, step, usage);
+                None
+            }
             CommittedUiKind::AssistantMessage {
                 turn,
                 step,
                 content,
                 sources,
-            } => self.final_frame(turn, step, content, &sources)?,
+                provider,
+                model,
+                usage,
+            } => {
+                let _ = (provider, model, usage);
+                self.final_frame(turn, step, content, &sources)?
+            }
             CommittedUiKind::ToolRequested {
                 turn,
                 step,
                 call_id,
                 name,
-                arguments_preview,
-                arguments_truncated,
+                arguments,
             } => {
-                let _ = (turn, step, call_id, arguments_truncated);
+                let semantic = self.semantic.tools().iter().find(|activity| {
+                    activity.turn == turn && activity.step == step && activity.call_id == call_id
+                });
+                if let Some(semantic) = semantic {
+                    let _ = (
+                        &semantic.name,
+                        semantic.origin,
+                        &semantic.summary,
+                        semantic.state,
+                        semantic.is_error,
+                        &semantic.failure_code,
+                        semantic.payload_omitted,
+                        semantic.result_bytes,
+                        semantic.meta_bytes,
+                        semantic.committed_effect,
+                        semantic.started_process,
+                        semantic.shell_exit_code,
+                        &semantic.shell_signal,
+                        semantic.shell_timed_out,
+                    );
+                }
+                let _ = &arguments;
                 let mut parts = try_parts(5)?;
                 parts.push(LivePart::TrustedLine("[tool requested]\n"));
                 parts.push(LivePart::Untrusted {
                     role: UiRole::Tool,
-                    text: name,
+                    text: name.into_display(),
                 });
                 parts.push(LivePart::TrustedInline("\n"));
                 parts.push(LivePart::Untrusted {
                     role: UiRole::Arguments,
-                    text: arguments_preview,
+                    text: "arguments omitted".to_owned(),
                 });
                 parts.push(LivePart::TrustedInline("\n"));
                 LiveFrame::from_parts(parts)
@@ -473,8 +535,19 @@ impl LiveRenderer {
                 call_id,
                 is_error,
                 failure,
+                content,
+                meta,
+                surface_replacement_target,
             } => {
-                let _ = (turn, step, call_id);
+                let _ = (turn, step, call_id, content, meta);
+                if surface_replacement_target.is_some() {
+                    // A prune replacement rewrites old surface payload. It is
+                    // not a second tool execution and must not appear twice.
+                    return Ok(LiveUpdate {
+                        frame: None,
+                        lifecycle: LiveLifecycle::None,
+                    });
+                }
                 let mut parts = try_parts(5)?;
                 parts.push(LivePart::TrustedLine(if is_error {
                     "[tool result: error]\n"
@@ -495,6 +568,31 @@ impl LiveRenderer {
                 }
                 LiveFrame::from_parts(parts)
             }
+            CommittedUiKind::RequestContextChanged {
+                provider,
+                model,
+                context_window,
+            } => {
+                if let Some(context) = self.semantic.context() {
+                    let _ = (&context.provider, &context.model, context.window);
+                }
+                let _ = (provider, model, context_window);
+                None
+            }
+            CommittedUiKind::CompactionStarted { .. }
+            | CommittedUiKind::CompactionSummarized { .. }
+            | CommittedUiKind::CompactionEnded { .. }
+            | CommittedUiKind::CompactionPruneMarked { .. } => {
+                if let Some(compaction) = self.semantic.compaction() {
+                    let _ = (
+                        &compaction.id,
+                        compaction.phase,
+                        compaction.shadowed_tokens,
+                        &compaction.error_code,
+                    );
+                }
+                None
+            }
             CommittedUiKind::ApprovalAsked {
                 id,
                 tool_name,
@@ -502,15 +600,18 @@ impl LiveRenderer {
                 reason,
             } => {
                 lifecycle = LiveLifecycle::ApprovalAsked {
-                    id,
-                    tool_name,
-                    call_id,
+                    id: id.into_display(),
+                    tool_name: tool_name.into_display(),
+                    call_id: call_id.map(UiIdentity::into_display),
                     reason,
                 };
                 None
             }
             CommittedUiKind::ApprovalDecided { id, outcome } => {
-                lifecycle = LiveLifecycle::ApprovalDecided { id, outcome };
+                lifecycle = LiveLifecycle::ApprovalDecided {
+                    id: id.into_display(),
+                    outcome,
+                };
                 Some(LiveFrame::trusted(match outcome {
                     ApprovalOutcome::AllowedOnce => "[approval: allowed once]\n",
                     ApprovalOutcome::Rejected => "[approval: rejected]\n",
@@ -518,8 +619,24 @@ impl LiveRenderer {
                     ApprovalOutcome::Unavailable => "[approval: unavailable]\n",
                 })?)
             }
-            CommittedUiKind::RetryScheduled { retry_id, retry } => {
-                let _ = (retry_id, retry);
+            CommittedUiKind::RetryScheduled {
+                retry_id,
+                retry,
+                provider,
+                delay_ms,
+                max_retries,
+                failure_code,
+                failure_message,
+            } => {
+                let _ = (
+                    retry_id,
+                    retry,
+                    provider,
+                    delay_ms,
+                    max_retries,
+                    failure_code,
+                    failure_message,
+                );
                 self.attempt = None;
                 Some(LiveFrame::trusted("[model retry scheduled]\n")?)
             }
@@ -697,7 +814,10 @@ fn role_for(kind: UiAssistantBlockKind) -> UiRole {
 fn turn_end_frame(reason: UiTurnEndReason) -> Result<LiveFrame, LiveRenderError> {
     let frame = match reason {
         UiTurnEndReason::Completed => LiveFrame::trusted("[done]\n")?,
-        UiTurnEndReason::Aborted => LiveFrame::trusted("[stopped]\n")?,
+        UiTurnEndReason::Aborted { cause } => {
+            let _ = cause;
+            LiveFrame::trusted("[stopped]\n")?
+        }
         UiTurnEndReason::Blocked => LiveFrame::trusted("[blocked]\n")?,
         UiTurnEndReason::MaxTokens => LiveFrame::trusted("[maximum tokens reached]\n")?,
         UiTurnEndReason::Interrupted => LiveFrame::trusted("[interrupted]\n")?,
@@ -863,9 +983,10 @@ enum Comparison {
 mod tests {
     use crate::session::{
         CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap, StepId, TurnId,
-        UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent, UiToolFailure, UiTurnEndReason,
-        UnixMillis,
+        UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiOpaquePayload,
+        UiToolFailure, UiTurnEndReason, UnixMillis,
     };
+    use crate::tui::projector::UiProjector;
 
     use super::{
         AttemptState, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame, LiveRenderer,
@@ -878,6 +999,10 @@ mod tests {
             time: UnixMillis::new(1).unwrap(),
             kind,
         }
+    }
+
+    fn identity(value: &str) -> UiIdentity {
+        UiIdentity::from_text_for_test(value)
     }
 
     fn render(
@@ -917,23 +1042,62 @@ mod tests {
     }
 
     #[test]
-    fn compaction_type_only_events_are_silent_and_do_not_change_lifecycle() {
+    fn semantic_compaction_events_remain_silent_in_the_phase_nine_renderer() {
         let mut renderer = LiveRenderer::new();
-        for (seq, event_type) in [
-            "compaction/start",
-            "compaction/summary",
-            "compaction/end",
-            "compaction/prune",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let update = renderer
-                .consume(event(seq as u64, CommittedUiKind::TypeOnly { event_type }))
-                .unwrap();
+        let events = [
+            CommittedUiKind::CompactionStarted {
+                id: identity("compact-1"),
+                turn: None,
+                trigger: None,
+                shadowed_nodes: Some(3),
+            },
+            CommittedUiKind::CompactionSummarized {
+                id: identity("compact-1"),
+                shadowed_tokens: 42,
+                provider: identity("mock"),
+                model: identity("summary"),
+                usage: None,
+            },
+            CommittedUiKind::CompactionEnded {
+                id: identity("compact-1"),
+                turn: None,
+                error: None,
+            },
+            CommittedUiKind::CompactionPruneMarked {
+                target: EventSeq::new(9).unwrap(),
+                shadowed_tokens: 7,
+            },
+        ];
+        for (seq, kind) in events.into_iter().enumerate() {
+            let update = renderer.consume(event(seq as u64, kind)).unwrap();
             assert!(update.frame.is_none());
             assert!(matches!(update.lifecycle, super::LiveLifecycle::None));
         }
+        assert_eq!(
+            renderer.semantic.status().pending_prune_shadowed_tokens,
+            Some(7)
+        );
+        let replacement = renderer
+            .consume(event(
+                4,
+                CommittedUiKind::ToolResult {
+                    turn: TurnId::new(1).unwrap(),
+                    step: StepId::new(1).unwrap(),
+                    call_id: identity("historical-call"),
+                    is_error: false,
+                    failure: None,
+                    content: UiOpaquePayload::from_text_for_test("[]"),
+                    meta: UiOpaquePayload::from_text_for_test("{}"),
+                    surface_replacement_target: Some(EventSeq::new(9).unwrap()),
+                },
+            ))
+            .unwrap();
+        assert!(replacement.frame.is_none());
+        assert!(matches!(replacement.lifecycle, super::LiveLifecycle::None));
+        assert_eq!(
+            renderer.semantic.status().last_prune_shadowed_tokens,
+            Some(7)
+        );
     }
 
     #[test]
@@ -1034,6 +1198,9 @@ mod tests {
                         text: "hello".to_owned(),
                     }]),
                     sources: SourceSeqBitmap::from_sources(&[EventSeq::new(0).unwrap()]).unwrap(),
+                    provider: identity("mock"),
+                    model: identity("mock-model"),
+                    usage: None,
                 },
             ),
             &mut output,
@@ -1082,6 +1249,9 @@ mod tests {
                         text: "new\r\u{202e}".to_owned(),
                     }]),
                     sources: SourceSeqBitmap::from_sources(&[EventSeq::new(0).unwrap()]).unwrap(),
+                    provider: identity("mock"),
+                    model: identity("mock-model"),
+                    usage: None,
                 },
             ),
             &mut output,
@@ -1144,6 +1314,9 @@ mod tests {
                         EventSeq::new(1).unwrap(),
                     ])
                     .unwrap(),
+                    provider: identity("mock"),
+                    model: identity("mock-model"),
+                    usage: None,
                 },
             ),
             &mut output,
@@ -1212,6 +1385,7 @@ mod tests {
 
         let mut renderer = LiveRenderer {
             attempt: Some(blocks),
+            semantic: UiProjector::default(),
         };
         let mut presenter = InteractivePresenter::new();
         let mut output = String::new();
@@ -1229,6 +1403,9 @@ mod tests {
                         text: "authoritative".to_owned(),
                     }]),
                     sources: SourceSeqBitmap::from_sources(&[]).unwrap(),
+                    provider: identity("mock"),
+                    model: identity("mock-model"),
+                    usage: None,
                 },
             ),
             &mut output,
@@ -1257,12 +1434,15 @@ mod tests {
                 CommittedUiKind::ToolResult {
                     turn,
                     step,
-                    call_id: "call-1".to_owned(),
+                    call_id: identity("call-1"),
                     is_error: true,
                     failure: Some(UiToolFailure {
                         name: "NAME\n".to_owned(),
                         code: "CODE\nTAIL".to_owned(),
                     }),
+                    content: UiOpaquePayload::from_text_for_test("[]"),
+                    meta: UiOpaquePayload::from_text_for_test(""),
+                    surface_replacement_target: None,
                 },
             ),
             &mut output,
@@ -1312,10 +1492,9 @@ mod tests {
                 CommittedUiKind::ToolRequested {
                     turn,
                     step,
-                    call_id: "call-1".to_owned(),
-                    name: "read\nspoof".to_owned(),
-                    arguments_preview: "arguments omitted".to_owned(),
-                    arguments_truncated: true,
+                    call_id: identity("call-1"),
+                    name: identity("read\nspoof"),
+                    arguments: UiOpaquePayload::from_text_for_test("{}"),
                 },
             ),
             &mut output,
