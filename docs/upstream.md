@@ -1181,6 +1181,65 @@ user-approved v0.1 path intentionally omits provider-overflow replay, multiple
 summary transactions, cold resident-credit parity, and exhaustive persistence
 compatibility.
 
+## Phase 10 inspection
+
+Phase 10 was researched against the same pinned commit before implementation.
+The fixed upstream does not define an NDJSON subprocess-tool ABI. It installs
+profile dependencies and loads in-process Cordis bundle patches; tool producers
+register a `ToolDefinition` in `ToolRuntime`. The following paths establish that
+boundary and the narrower call/approval/result semantics Rust will preserve:
+
+- `docs/architecture.md`, `docs/subsystems/tools.md`,
+  `docs/tool-execution-pipeline.md`, and `docs/cookbook/adding-a-tool.md`:
+  in-process services, registered tool definitions, schema/output contracts,
+  pre/guard/execute/post/result order, and model-visible schema projection;
+- `apps/cli/src/{args,bin,plugin,profile-boot}.ts` and
+  `apps/cli/tests/{args.spec,built-bin.e2e}.ts`: the official profile/npm plugin
+  launcher rather than an external stdio runtime;
+- `packages/core/tools/src/{index,schema,json-schema}.ts` and
+  `packages/core/tools/tests/{tools,schema,json-schema,execution-mode,invariant}.spec.ts`:
+  registration, supported JSON Schema validation, cancellation signals,
+  execution normalization, and result invariants;
+- `packages/core/agent-loop/src/tool-calls.ts` and
+  `packages/interaction/user-approval/src/{index,invariant}.ts`: committed call,
+  optional ask/decision, body, normalized result, and cancellation order;
+- `packages/subprocess/subprocess/src/{index,types,invariant}.ts`, its service
+  tests, and
+  `packages/subprocess/subprocess-local/src/{index,spawn,invariant,process-inspector}.ts`
+  plus local spawn/process-exit/process-inspector tests: owned child execution
+  and cleanup facts available to the official runtime, but not a tool-plugin
+  transport.
+
+Rust Phase 10 therefore plans the subprocess configuration, protocol, and
+lifecycle as an intentional product difference; the compatibility row remains
+`planned` until production and comparison tests exist. The comparison scope is
+only the observable shared order: assistant call -> committed Session
+`tool/call` -> optional approval -> execution -> normalized `tool/result`.
+Rust's earlier plugin-argument validation is a documented difference. The
+complete design, limits, user impact, and planned tests are in
+`docs/design/subprocess-tool-plugins.md`.
+
+The focused fixed-checkout research gate was run without changing the upstream
+tree:
+
+```console
+pnpm exec vitest run \
+  packages/core/tools/tests/tools.spec.ts \
+  packages/core/tools/tests/schema.spec.ts \
+  packages/core/tools/tests/json-schema.spec.ts \
+  packages/core/tools/tests/execution-mode.spec.ts \
+  packages/core/tools/tests/invariant.spec.ts \
+  packages/subprocess/subprocess/tests/service.spec.ts \
+  packages/subprocess/subprocess-local/tests/local.spec.ts \
+  packages/subprocess/subprocess-local/tests/spawn.spec.ts \
+  packages/subprocess/subprocess-local/tests/process-exit.spec.ts \
+  --configLoader runner
+```
+
+Vitest 4.1.8 reported 9 files and 291 tests passed. This validates the cited
+in-process registry/schema and subprocess lifecycle facts; it does not create or
+imply an upstream NDJSON-plugin protocol.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

@@ -173,9 +173,31 @@ For both jobs, `Run repository checks` and
 32111380055 and 32112313525 exposed the macOS PTY fixture race and are retained
 as superseded failure evidence, not counted as acceptance.
 
+The later Phase 9 status commit exposed two more test-harness timing assumptions
+without changing the accepted product behavior. Commit `d95a6f7` kept the fake
+Provider's five-second first-connect guard but gave follow-up requests a looser,
+still bounded deadline so a large durable tool round is judged by its owning
+journey timeout. Commit `51996b2` removed wall-clock sleeps from the real-PTY
+arrow test; deterministic selector unit tests continue to cover byte-fragmented
+escape sequences, while the PTY test covers the complete key and requires Enter
+before the file changes.
+
+GitHub Actions [CI run 32117922771](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/32117922771)
+then completed successfully for `51996b2`:
+
+- [macOS job 95651544017](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/32117922771/job/95651544017),
+  `2026-08-18T08:44:31Z`–`2026-08-18T08:49:29Z`;
+- [Ubuntu job 95651543997](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/32117922771/job/95651543997),
+  `2026-08-18T08:44:31Z`–`2026-08-18T08:48:53Z`.
+
+Both repository checks and both installed release journeys concluded `success`.
+Runs 32115127657 and 32116731276 remain superseded failure evidence for the two
+fixture assumptions rather than green acceptance evidence.
+
 ## Publication gate
 
-The candidate checkpoints were pushed without force. No tag, GitHub Release,
-crate publication, Homebrew formula, or external binary artifact was created.
-The separate Phase 9 status commit must also pass the same macOS/Ubuntu workflow
-before Phase 10 production implementation proceeds.
+The candidate and status/fix checkpoints were pushed without force. No tag,
+GitHub Release, crate publication, Homebrew formula, or external binary artifact
+was created. The separate Phase 9 status/fix chain now passes the same
+macOS/Ubuntu workflow, so Phase 10 production implementation may proceed from
+`51996b2`.
