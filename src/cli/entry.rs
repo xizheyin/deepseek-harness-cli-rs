@@ -34,7 +34,7 @@ Options:\n\
   -p, --prompt <TEXT>      Run one prompt and exit\n\
   -m, --model <MODEL>      DeepSeek model (new: deepseek-v4-flash; resume: stored model)\n\
   -w, --workspace <PATH>   Workspace (new: current; resume: optional identity check)\n\
-      --no-color           Force plain output (plain is also the Phase 7 default)\n\
+      --no-color           Disable color and dynamic terminal styling\n\
       --list-sessions      List persisted session headers\n\
       --resume <SESSION_ID> Resume one persisted session\n\
   -h, --help               Print help\n\
@@ -95,8 +95,9 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         model,
         workspace,
         resume,
-        no_color: _,
+        no_color,
     } = options;
+    let color = color_enabled(no_color);
     let runtime = build_runtime()?;
     let mut signals = runtime
         .block_on(async { SignalStreams::install() })
@@ -213,7 +214,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             .block_on(script_driver::run_one_turn(agent, prompt, &mut signals))
             .map_err(EntryError::script),
         (LaunchSurface::Interactive(terminal), AgentAssembly::Interactive(assembly)) => runtime
-            .block_on(interactive::run(assembly, terminal, &mut signals))
+            .block_on(interactive::run(assembly, terminal, &mut signals, color))
             .map_err(EntryError::interactive),
         (surface, assembly) => {
             let mut agent = match assembly {
@@ -239,6 +240,22 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             Err(EntryError::agent())
         }
     }
+}
+
+fn color_enabled(no_color: bool) -> bool {
+    color_enabled_from(
+        no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var_os("TERM").is_some_and(|term| term == "dumb"),
+    )
+}
+
+const fn color_enabled_from(
+    no_color: bool,
+    no_color_environment: bool,
+    dumb_terminal: bool,
+) -> bool {
+    !no_color && !no_color_environment && !dumb_terminal
 }
 
 enum LaunchSurface {
@@ -453,7 +470,9 @@ impl EntryError {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{EntryError, HELP, ResumeSignalAction, resume_signal_action, run};
+    use super::{
+        EntryError, HELP, ResumeSignalAction, color_enabled_from, resume_signal_action, run,
+    };
     use crate::cli::{
         interactive::InteractiveError,
         signal::{DriverMode, UiSignal},
@@ -468,6 +487,14 @@ mod tests {
         assert!(HELP.contains("resume: stored model"));
         assert!(HELP.contains("resume: optional identity check"));
         assert_eq!(run([OsString::from("--version")]).unwrap(), 0);
+    }
+
+    #[test]
+    fn color_requires_an_interactive_capable_environment_and_no_opt_out() {
+        assert!(color_enabled_from(false, false, false));
+        assert!(!color_enabled_from(true, false, false));
+        assert!(!color_enabled_from(false, true, false));
+        assert!(!color_enabled_from(false, false, true));
     }
 
     #[test]

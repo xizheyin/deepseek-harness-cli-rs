@@ -257,6 +257,68 @@ fn interactive_dsh_streams_before_completion_and_exits_cleanly() {
 }
 
 #[test]
+fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
+    let server = SequenceSseServer::start(vec![text_sse("styled answer")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect(b"\x1b[1;36mdsh-rs\x1b[0m");
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"show the styled interface\r");
+    dsh.expect(b"\x1b[36m");
+    dsh.expect(b"\x1b[1;36m\xe2\x97\x86 dsh\x1b[0m");
+    dsh.expect(b"styled answer");
+    dsh.expect(b"\x1b[32m\xe2\x9c\x93\x1b[0m Done");
+    dsh.expect_occurrences("❯".as_bytes(), 2);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(transcript.contains(&0x1b));
+    assert!(
+        !transcript
+            .windows(b"assistant |".len())
+            .any(|bytes| bytes == b"assistant |")
+    );
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-styled-patch",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("styled patch finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"show the styled approval selector\r");
+    dsh.approval_ready();
+    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Reject \x1b[0m");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"\x1b[A");
+    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Allow once \x1b[0m");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"\r");
+    dsh.expect(b"\x1b[32m\xe2\x9c\x93\x1b[0m Allowed once");
+    dsh.expect(b"styled patch finished");
+    dsh.expect_occurrences("❯".as_bytes(), 2);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert!(transcript.contains(&0x1b));
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
 fn interactive_help_quit_and_idle_ctrl_d_are_real_terminal_commands() {
     let server = SequenceSseServer::start(Vec::new());
     let workspace = TestWorkspace::new();
@@ -831,7 +893,7 @@ fn approval_and_suspend_resume_leave_the_real_terminal_state_unchanged() {
             "apply_patch",
             serde_json::json!({ "patch": patch }),
         ),
-        text_sse("rejection kept terminal state"),
+        text_sse("answer after selector suspension"),
     ]);
     let workspace = TestWorkspace::new();
     let target = workspace.0.join("note.txt");
@@ -841,21 +903,61 @@ fn approval_and_suspend_resume_leave_the_real_terminal_state_unchanged() {
     dsh.expect(b"dsh > ");
     let initial = dsh.terminal_state();
     dsh.write(b"test approval terminal state\r");
-    let _challenge = dsh.approval_challenge();
-    assert_eq!(dsh.terminal_state(), initial);
-    dsh.write(b"reject\r");
-    dsh.expect(b"assistant | rejection kept terminal state");
-    dsh.expect_occurrences(b"dsh > ", 2);
-    assert_eq!(dsh.terminal_state(), initial);
-
+    dsh.approval_ready();
+    assert_ne!(dsh.terminal_state(), initial);
     dsh.signal(Signal::TSTP);
     dsh.wait_until_stopped();
     assert_eq!(dsh.terminal_state(), initial);
     dsh.signal(Signal::CONT);
-    dsh.expect_occurrences(b"dsh > ", 3);
+    dsh.expect_occurrences(b"dsh > ", 2);
     assert_eq!(dsh.terminal_state(), initial);
 
+    dsh.write(b"continue after selector suspension\r");
+    dsh.expect(b"assistant | answer after selector suspension");
+    dsh.expect_occurrences(b"dsh > ", 3);
+
     let (status, _) = dsh.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn zero_width_terminal_uses_the_compact_selector_instead_of_failing() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-zero-width",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("zero width approval completed"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.resize(24, 0);
+    dsh.write(b"exercise a zero width terminal\r");
+    dsh.approval_ready();
+    dsh.expect(b"arrows \xc2\xb7 Enter confirm \xc2\xb7 Esc cancel");
+    dsh.write(b"\x1b[A");
+    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Allow once \x1b[0m");
+    dsh.write(b"\x1b[B");
+    dsh.expect(b"\x1b[1;30;43m \xe2\x80\xba Reject \x1b[0m");
+    assert!(
+        !dsh.snapshot()
+            .windows(b"\x1b[5A".len())
+            .any(|window| window == b"\x1b[5A"),
+        "a narrow or unknown terminal must append redraws instead of guessing wrapped rows"
+    );
+    dsh.write(b"\r");
+    dsh.expect(b"zero width approval completed");
+    dsh.expect_occurrences("❯".as_bytes(), 2);
+    let (status, _) = dsh.exit_cleanly();
+
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
     assert_eq!(server.finish().len(), 2);
@@ -877,8 +979,8 @@ fn ctrl_z_cleans_an_approved_shell_group_before_bash_fg_resumes_dsh() {
     let dsh_group = terminal.start_dsh_job();
 
     terminal.write(b"run the job-control cleanup fixture\r");
-    let challenge = terminal.approval_challenge();
-    terminal.write(format!("allow {challenge}\r").as_bytes());
+    terminal.approval_ready();
+    terminal.write(b"y\r");
     terminal.expect(b"[approval: allowed once]");
     wait_for_file(&workspace.0.join("shell-started"), Duration::from_secs(5));
     let approved_group = terminal.remember_approved_group();
@@ -957,8 +1059,8 @@ fn terminating_signals_override_a_pending_ctrl_z_after_shell_cleanup() {
         let dsh_group = terminal.start_dsh_job();
 
         terminal.write(b"run the terminating-signal fixture\r");
-        let challenge = terminal.approval_challenge();
-        terminal.write(format!("allow {challenge}\r").as_bytes());
+        terminal.approval_ready();
+        terminal.write(b"y\r");
         wait_for_file(&workspace.0.join("shell-started"), Duration::from_secs(5));
         terminal.remember_approved_group();
         terminal.write(&[0x1a]);
@@ -996,7 +1098,7 @@ fn terminating_signals_override_a_pending_ctrl_z_after_shell_cleanup() {
 }
 
 #[test]
-fn exact_approval_challenge_allows_one_patch_after_the_preview() {
+fn short_approval_answer_allows_one_patch_after_the_preview() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let server = SequenceSseServer::start(vec![
         tool_sse(
@@ -1015,13 +1117,13 @@ fn exact_approval_challenge_allows_one_patch_after_the_preview() {
     dsh.write(b"change note\r");
     dsh.expect(b"[approval requested]");
     dsh.expect(b"--- a/note.txt");
-    let challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     assert_eq!(
         std::fs::read_to_string(&target).unwrap(),
         "old\n",
         "the file must not change before approval"
     );
-    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.write(b"y\r");
     dsh.expect(b"[approval: allowed once]");
     dsh.expect(b"[tool result: success]");
     dsh.expect(b"assistant | patch finished");
@@ -1033,6 +1135,106 @@ fn exact_approval_challenge_allows_one_patch_after_the_preview() {
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("call-patch"));
+}
+
+#[test]
+fn fragmented_arrow_selection_requires_enter_before_it_applies_a_patch() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-arrow-patch",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("arrow selection finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"change note with the selector\r");
+    dsh.approval_ready();
+    dsh.write(b"\x1b");
+    std::thread::sleep(Duration::from_millis(5));
+    dsh.write(b"[");
+    std::thread::sleep(Duration::from_millis(5));
+    dsh.write(b"A");
+    dsh.expect(b"[x] Allow once");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"\r");
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"assistant | arrow selection finished");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn escape_cancels_the_selector_without_applying_a_patch() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-escape-patch",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("escape cancellation recorded"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"cancel this patch from the selector\r");
+    dsh.approval_ready();
+    dsh.write(b"\x1b");
+    dsh.expect(b"[approval: cancelled]");
+    dsh.expect(b"assistant | escape cancellation recorded");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn bracketed_paste_sequence_rearms_before_a_real_selector_choice() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-pasted-patch",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("pasted input never authorized"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"reject bracketed paste authority\r");
+    dsh.approval_ready();
+    dsh.write(b"\x1b[200~y\r\x1b[201~");
+    dsh.approval_ready_occurrence(2);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"y\r");
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"assistant | pasted input never authorized");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]
@@ -1062,9 +1264,9 @@ fn complete_and_partial_input_before_a_fresh_approval_cannot_authorize() {
     dsh.write(b"y\rallow stale-partial");
     server.release();
 
-    let challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
-    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.write(b"y\r");
     dsh.expect(b"[approval: allowed once]");
     dsh.expect(b"assistant | fenced patch finished");
     dsh.expect_occurrences(b"dsh > ", 2);
@@ -1082,7 +1284,7 @@ fn complete_and_partial_input_before_a_fresh_approval_cannot_authorize() {
 }
 
 #[test]
-fn continuous_stale_approval_input_and_non_lf_allow_remain_fail_closed() {
+fn continuous_stale_input_and_selection_without_enter_remain_fail_closed() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let tool = tool_sse(
         "call-stale-flood",
@@ -1120,21 +1322,12 @@ fn continuous_stale_approval_input_and_non_lf_allow_remain_fail_closed() {
     server.release();
     flood.join().expect("stale input writer should join");
 
-    let challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
-    let ready_before = dsh
-        .snapshot()
-        .windows(b"[approval input ready]".len())
-        .filter(|window| *window == b"[approval input ready]")
-        .count();
-    dsh.write(format!("allow {challenge}").as_bytes());
-    dsh.write(&[0x04]);
-    dsh.expect_occurrences(b"[approval input ready]", ready_before + 1);
-    let repeated_challenge = dsh.approval_challenge();
-    assert_eq!(repeated_challenge, challenge);
+    dsh.write(b"y");
+    dsh.expect(b"[x] Allow once");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
-
-    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.write(b"\r");
     dsh.expect(b"[approval: allowed once]");
     dsh.expect(b"assistant | stale input never authorized the patch");
     dsh.expect_occurrences(b"dsh > ", 2);
@@ -1190,14 +1383,14 @@ fn approval_preview_output_failure_is_bounded_and_never_changes_the_file() {
     assert!(elapsed < Duration::from_secs(7), "elapsed={elapsed:?}");
     assert!(
         !transcript
-            .windows(b"dsh approval > allow ".len())
-            .any(|bytes| bytes == b"dsh approval > allow "),
-        "the transcript must not claim a challenge became answerable"
+            .windows(b"[approval required]".len())
+            .any(|bytes| bytes == b"[approval required]"),
+        "the transcript must not claim the selector became answerable"
     );
 }
 
 #[test]
-fn rejecting_a_patch_keeps_the_file_unchanged_and_the_session_continues() {
+fn default_enter_rejects_a_patch_and_the_session_continues() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let server = SequenceSseServer::start(vec![
         tool_sse(
@@ -1215,8 +1408,8 @@ fn rejecting_a_patch_keeps_the_file_unchanged_and_the_session_continues() {
     dsh.expect(b"dsh > ");
     dsh.write(b"change note\r");
     dsh.expect(b"[approval requested]");
-    let _challenge = dsh.approval_challenge();
-    dsh.write(b"reject\r");
+    dsh.approval_ready();
+    dsh.write(b"\r");
     dsh.expect(b"[approval: rejected]");
     dsh.expect(b"[tool result: error]");
     dsh.expect(b"assistant | rejection recorded");
@@ -1249,7 +1442,7 @@ fn ctrl_c_at_patch_approval_cancels_without_a_write_and_a_later_turn_works() {
 
     dsh.expect(b"dsh > ");
     dsh.write(b"change note\r");
-    let _challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     dsh.write(&[0x03]);
     dsh.expect(b"stopped; skipped");
     dsh.expect_occurrences(b"dsh > ", 2);
@@ -1282,7 +1475,7 @@ fn ctrl_d_at_patch_approval_cancels_without_a_write_and_exits_zero() {
 
     dsh.expect(b"dsh > ");
     dsh.write(b"change note\r");
-    let _challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     dsh.write(&[0x04]);
     let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
     let requests = server.finish();
@@ -1293,37 +1486,39 @@ fn ctrl_d_at_patch_approval_cancels_without_a_write_and_exits_zero() {
 }
 
 #[test]
-fn hangup_at_patch_approval_exits_129_without_a_write() {
+fn terminating_signals_at_patch_approval_restore_the_terminal_without_a_write() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
-    let server = SequenceSseServer::start(vec![tool_sse(
-        "call-hangup-approval",
-        "apply_patch",
-        serde_json::json!({ "patch": patch }),
-    )]);
-    let workspace = TestWorkspace::new();
-    let target = workspace.0.join("note.txt");
-    std::fs::write(&target, "old\n").expect("test file should be created");
-    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+    for (signal, expected_exit) in [(Signal::HUP, 129), (Signal::QUIT, 131), (Signal::TERM, 143)] {
+        let server = SequenceSseServer::start(vec![tool_sse(
+            "call-terminating-approval",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        )]);
+        let workspace = TestWorkspace::new();
+        let target = workspace.0.join("note.txt");
+        std::fs::write(&target, "old\n").expect("test file should be created");
+        let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
 
-    dsh.expect(b"dsh > ");
-    dsh.write(b"request a patch, then lose the terminal\r");
-    let _challenge = dsh.approval_challenge();
-    dsh.signal(Signal::HUP);
-    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
-    let requests = server.finish();
+        dsh.expect(b"dsh > ");
+        dsh.write(b"request a patch, then terminate the terminal turn\r");
+        dsh.approval_ready();
+        dsh.signal(signal);
+        let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+        let requests = server.finish();
 
-    assert_eq!(status.code(), Some(129));
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
-    assert_eq!(requests.len(), 1);
-    assert!(
-        !transcript
-            .windows(b"[approval: allowed once]".len())
-            .any(|window| window == b"[approval: allowed once]")
-    );
+        assert_eq!(status.code(), Some(expected_exit));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !transcript
+                .windows(b"[approval: allowed once]".len())
+                .any(|window| window == b"[approval: allowed once]")
+        );
+    }
 }
 
 #[test]
-fn foreground_shell_runs_only_after_the_exact_terminal_approval() {
+fn foreground_shell_runs_only_after_the_confirmed_terminal_approval() {
     let server = SequenceSseServer::start(vec![
         tool_sse(
             "call-shell",
@@ -1344,9 +1539,9 @@ fn foreground_shell_runs_only_after_the_exact_terminal_approval() {
     dsh.write(b"run the safe shell command\r");
     dsh.expect(b"[tool requested]");
     dsh.expect(b"tool | bash");
-    let challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     assert!(!target.exists());
-    dsh.write(format!("allow {challenge}\r").as_bytes());
+    dsh.write(b"y\r");
     dsh.expect(b"[approval: allowed once]");
     dsh.expect(b"[tool result: success]");
     dsh.expect(b"assistant | shell finished");
@@ -1423,6 +1618,39 @@ fn model_terminal_controls_are_rendered_as_visible_plain_text() {
 }
 
 #[test]
+fn styled_terminal_never_treats_model_controls_as_product_ansi() {
+    let malicious = "safe\u{1b}]52;c;clipboard\u{7}\u{202e}end";
+    let server = SequenceSseServer::start(vec![text_sse(malicious)]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"render hostile model text safely\r");
+    dsh.expect(b"safe\\u{1b}]52;c;clipboard\\u{7}\\u{202e}end");
+    dsh.expect_occurrences("❯".as_bytes(), 2);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(
+        transcript.contains(&0x1b),
+        "product styling should be present"
+    );
+    assert!(
+        !transcript
+            .windows(b"\x1b]52".len())
+            .any(|window| window == b"\x1b]52"),
+        "model OSC bytes must never reach the terminal"
+    );
+    assert!(
+        !transcript
+            .windows("\u{202e}".len())
+            .any(|window| window == "\u{202e}".as_bytes()),
+        "model bidi controls must remain visible escapes"
+    );
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
 fn approval_preview_and_path_bidi_are_visible_text_not_terminal_controls() {
     let unsafe_name = "note\u{202e}.txt";
     let unsafe_line = "safe\u{202e}end";
@@ -1441,7 +1669,7 @@ fn approval_preview_and_path_bidi_are_visible_text_not_terminal_controls() {
 
     dsh.expect(b"dsh > ");
     dsh.write(b"show a control-safe patch preview\r");
-    let _challenge = dsh.approval_challenge();
+    dsh.approval_ready();
     let transcript = dsh.snapshot();
     assert!(
         transcript
@@ -1460,7 +1688,7 @@ fn approval_preview_and_path_bidi_are_visible_text_not_terminal_controls() {
             .any(|window| window == "\u{202e}".as_bytes())
     );
 
-    dsh.write(b"reject\r");
+    dsh.write(b"n\r");
     dsh.expect(b"assistant | unsafe preview rejected");
     dsh.expect_occurrences(b"dsh > ", 2);
     let (status, transcript) = dsh.exit_cleanly();

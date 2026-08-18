@@ -48,6 +48,29 @@ barriers, repair code, and limits remain in place. The tradeoff is explicit:
 `SIGKILL`, power loss, disk failure, or filesystem failure may lose the final
 session tail or make that session impossible to resume.
 
+## Phase 9 terminal experience gate (2026-08-18)
+
+The user explicitly requires a polished Claude Code-style terminal experience,
+not merely a technically functional line protocol. Phase 9 therefore also
+requires a real, tested interaction pass before v0.1 can be called ready:
+
+- permission prompts use a compact selection UI with Allow once, Reject, and
+  Cancel; a human must never need to copy a random identifier;
+- the selected action is visually clear, Enter confirms, Escape cancels, and
+  Ctrl+C still cancels the current turn without leaking a side effect;
+- file approvals present a readable diff, while Shell approvals present the
+  exact command, working directory, and important environment changes;
+- streaming text, working/tool state, errors, and the next input prompt have a
+  consistent hierarchy; product-owned color may enhance a terminal, but
+  `--no-color` and non-TTY output remain readable;
+- terminal mode is restored after approval, cancellation, suspension, EOF,
+  output failure, and every supported exit signal;
+- real PTY tests cover keyboard selection, stale pasted input, cancellation,
+  cleanup, and terminal restoration on macOS and Ubuntu.
+
+The short `y`/`n`/`c` line answers added during Phase 8 are an immediate
+usability repair, not completion of this Phase 9 gate.
+
 ## Phase 10 boundary
 
 Phase 10 starts only after Phase 9 is complete. It adds explicitly configured local tool-plugin executables, not Cordis/npm compatibility or a general extension framework. The first protocol stays deliberately small: bounded versioned NDJSON over stdin/stdout, targeting only `hello`, `call`, `cancel`, and `result`; stderr is bounded diagnostics. Plugin tools still pass through dsh's existing schema validation, approval, append-only intent/result recording, cancellation, timeout, and owned process cleanup.

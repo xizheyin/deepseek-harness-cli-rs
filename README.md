@@ -73,8 +73,9 @@ cargo run --locked -- --workspace .
 | <kbd>Ctrl</kbd> + <kbd>D</kbd> | 安全结束会话 |
 | <kbd>Ctrl</kbd> + <kbd>Z</kbd> | 先清理当前回合再暂停；回到 Shell 后可用 `fg` 恢复 |
 
-文件修改或 Shell 执行前会显示完整预览，并要求输入终端上显示的
-`allow <一次性编号>`；也可以输入 `reject` 或 `cancel`。
+文件修改或 Shell 执行前会显示完整预览和三项选择器。用方向键、`h/j/k/l`、
+<kbd>Tab</kbd> 或 `y/n/c` 移动选择，按 <kbd>Enter</kbd> 确认；默认选中
+**Reject**，按 <kbd>Esc</kbd> 取消。
 
 ### 一次性脚本调用
 

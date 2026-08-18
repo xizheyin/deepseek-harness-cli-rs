@@ -155,7 +155,10 @@ pub(super) fn parse_approval_answer(
     challenge: uuid::Uuid,
 ) -> ApprovalAnswer {
     let challenge = challenge.to_string();
-    if terminated_by_lf && record.strip_prefix("allow ") == Some(challenge.as_str()) {
+    if terminated_by_lf
+        && (matches!(record, "y" | "yes" | "allow")
+            || record.strip_prefix("allow ") == Some(challenge.as_str()))
+    {
         return ApprovalAnswer::Decide(ApprovalOutcome::AllowedOnce);
     }
     if matches!(record, "n" | "no" | "reject")
@@ -342,16 +345,20 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_lf_terminated_challenge_can_allow() {
+    fn short_or_challenged_allow_must_be_lf_terminated() {
         let challenge = uuid::Uuid::parse_str("12345678-1234-4234-9234-123456789abc").unwrap();
         let allow = format!("allow {challenge}");
-        assert_eq!(
-            parse_approval_answer(&allow, true, challenge),
-            ApprovalAnswer::Decide(ApprovalOutcome::AllowedOnce)
-        );
+        for valid in ["y", "yes", "allow", allow.as_str()] {
+            assert_eq!(
+                parse_approval_answer(valid, true, challenge),
+                ApprovalAnswer::Decide(ApprovalOutcome::AllowedOnce)
+            );
+            assert_eq!(
+                parse_approval_answer(valid, false, challenge),
+                ApprovalAnswer::Retry
+            );
+        }
         for invalid in [
-            "y",
-            "yes",
             " allow 12345678-1234-4234-9234-123456789abc",
             "allow 12345678-1234-4234-9234-123456789ab",
             "allow 12345678-1234-4234-9234-123456789abc ",
@@ -361,10 +368,6 @@ mod tests {
                 ApprovalAnswer::Retry
             );
         }
-        assert_eq!(
-            parse_approval_answer(&allow, false, challenge),
-            ApprovalAnswer::Retry
-        );
     }
 
     #[test]

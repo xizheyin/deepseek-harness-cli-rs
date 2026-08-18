@@ -140,6 +140,11 @@ impl VisibleRenderer {
         self.at_line_start = false;
     }
 
+    pub(super) fn force_line_start(&mut self, at_line_start: bool) {
+        self.scratch.clear();
+        self.at_line_start = at_line_start;
+    }
+
     fn append_piece<E>(
         &mut self,
         piece: &str,

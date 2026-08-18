@@ -7,23 +7,15 @@ use crate::session::{
     UiAssistantBlockKind, UiAssistantContent, UiTurnEndReason,
 };
 
-use super::render::VisibleRenderer;
+use super::{
+    render::VisibleRenderer,
+    theme::{UiRole, UiTheme},
+};
 
 const MAX_ATTEMPT_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ATTEMPT_BLOCKS: usize = 128;
 const FRAME_SOURCE_CHUNK_BYTES: usize = 512;
 pub(super) const FRAME_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
-
-const ASSISTANT_ROLE: &str = "assistant | ";
-const REASONING_ROLE: &str = "reasoning | ";
-const TOOL_ROLE: &str = "tool | ";
-const ARGUMENTS_ROLE: &str = "arguments | ";
-const CALL_ROLE: &str = "call | ";
-const REASON_ROLE: &str = "reason | ";
-const PREVIEW_ROLE: &str = "preview | ";
-const APPROVAL_ROLE: &str = "dsh approval > ";
-const DSH_ROLE: &str = "dsh | ";
-const ERROR_ROLE: &str = "error | ";
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("CLI_OUTPUT_FAILED")]
@@ -69,8 +61,9 @@ impl fmt::Debug for LiveFrame {
 #[derive(Debug)]
 enum LivePart {
     TrustedLine(&'static str),
+    TrustedOwned(String),
     TrustedInline(&'static str),
-    Untrusted { role: &'static str, text: String },
+    Untrusted { role: UiRole, text: String },
 }
 
 impl LiveFrame {
@@ -100,7 +93,7 @@ impl LiveFrame {
             .map_err(|_| LiveRenderError)?;
         let mut parts = try_parts(1)?;
         parts.push(LivePart::Untrusted {
-            role: DSH_ROLE,
+            role: UiRole::Dsh,
             text,
         });
         Ok(Self { parts })
@@ -120,7 +113,7 @@ impl LiveFrame {
         writeln!(&mut text, "stopped; skipped {skipped} updates").map_err(|_| LiveRenderError)?;
         let mut parts = try_parts(1)?;
         parts.push(LivePart::Untrusted {
-            role: DSH_ROLE,
+            role: UiRole::Dsh,
             text,
         });
         Ok(Self { parts })
@@ -139,28 +132,23 @@ impl LiveFrame {
         } else {
             "[approval requested]\n"
         }));
-        push_untrusted_line(&mut parts, TOOL_ROLE, tool_name)?;
+        push_untrusted_line(&mut parts, UiRole::Tool, tool_name)?;
         if let Some(call_id) = call_id {
-            push_untrusted_line(&mut parts, CALL_ROLE, call_id)?;
+            push_untrusted_line(&mut parts, UiRole::Call, call_id)?;
         }
         if let Some(reason) = reason {
-            push_untrusted_line(&mut parts, REASON_ROLE, reason)?;
+            push_untrusted_line(&mut parts, UiRole::Reason, reason)?;
         }
-        push_untrusted_line(&mut parts, PREVIEW_ROLE, preview)?;
+        push_untrusted_line(&mut parts, UiRole::Preview, preview)?;
         Ok(Self { parts })
     }
 
-    pub(super) fn approval_ready(challenge: uuid::Uuid) -> Result<Self, LiveRenderError> {
-        let mut answer = String::new();
-        answer.try_reserve_exact(96).map_err(|_| LiveRenderError)?;
-        writeln!(&mut answer, "allow {challenge} | reject | cancel")
-            .map_err(|_| LiveRenderError)?;
-        let mut parts = try_parts(2)?;
-        parts.push(LivePart::TrustedLine("[approval input ready]\n"));
-        parts.push(LivePart::Untrusted {
-            role: APPROVAL_ROLE,
-            text: answer,
-        });
+    pub(super) fn approval_selector(output: String) -> Result<Self, LiveRenderError> {
+        if output.is_empty() || output.len() > FRAME_OUTPUT_CHUNK_BYTES {
+            return Err(LiveRenderError);
+        }
+        let mut parts = try_parts(1)?;
+        parts.push(LivePart::TrustedOwned(output));
         Ok(Self { parts })
     }
 }
@@ -218,6 +206,13 @@ impl PendingLiveFrame {
                     self.part_index += 1;
                     self.text_offset = 0;
                 }
+                LivePart::TrustedOwned(text) => {
+                    presenter.render_trusted_owned(text, |chunk| {
+                        append_output(&mut self.output, chunk)
+                    })?;
+                    self.part_index += 1;
+                    self.text_offset = 0;
+                }
                 LivePart::TrustedInline(text) => {
                     presenter.render_trusted_inline(text, |chunk| {
                         append_output(&mut self.output, chunk)
@@ -236,7 +231,7 @@ impl PendingLiveFrame {
                     if end == start && start != text.len() {
                         return Err(LiveRenderError);
                     }
-                    presenter.render_untrusted(role, &text[start..end], |chunk| {
+                    presenter.render_untrusted(*role, &text[start..end], |chunk| {
                         append_output(&mut self.output, chunk)
                     })?;
                     self.text_offset = end;
@@ -268,14 +263,21 @@ fn append_output(output: &mut String, chunk: &str) -> Result<(), LiveRenderError
 
 pub(super) struct InteractivePresenter {
     visible: VisibleRenderer,
-    active_role: Option<&'static str>,
+    active_role: Option<UiRole>,
+    theme: UiTheme,
 }
 
 impl InteractivePresenter {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_color(false)
+    }
+
+    pub(super) fn with_color(color: bool) -> Self {
         Self {
             visible: VisibleRenderer::new(),
             active_role: None,
+            theme: UiTheme::from_color_enabled(color),
         }
     }
 
@@ -288,9 +290,10 @@ impl InteractivePresenter {
         for part in &frame.parts {
             match part {
                 LivePart::TrustedLine(text) => self.render_trusted_line(text, &mut emit)?,
+                LivePart::TrustedOwned(text) => self.render_trusted_owned(text, &mut emit)?,
                 LivePart::TrustedInline(text) => self.render_trusted_inline(text, &mut emit)?,
                 LivePart::Untrusted { role, text } => {
-                    self.render_untrusted(role, text, &mut emit)?
+                    self.render_untrusted(*role, text, &mut emit)?
                 }
             }
         }
@@ -303,7 +306,8 @@ impl InteractivePresenter {
         mut emit: impl FnMut(&str) -> Result<(), E>,
     ) -> Result<(), E> {
         self.visible.ensure_line_start(&mut emit)?;
-        self.visible.render_trusted(text, &mut emit)?;
+        self.visible
+            .render_trusted(self.theme.trusted_line(text), &mut emit)?;
         self.active_role = None;
         Ok(())
     }
@@ -325,16 +329,31 @@ impl InteractivePresenter {
         Ok(())
     }
 
+    fn render_trusted_owned<E>(
+        &mut self,
+        text: &str,
+        mut emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.visible.ensure_line_start(&mut emit)?;
+        if !text.is_empty() {
+            emit(text)?;
+        }
+        self.visible.force_line_start(text.ends_with('\n'));
+        self.active_role = None;
+        Ok(())
+    }
+
     fn render_untrusted<E>(
         &mut self,
-        role: &'static str,
+        role: UiRole,
         text: &str,
         mut emit: impl FnMut(&str) -> Result<(), E>,
     ) -> Result<(), E> {
         if self.active_role != Some(role) {
             self.visible.ensure_line_start(&mut emit)?;
         }
-        self.visible.render_fragment(text, Some(role), &mut emit)?;
+        self.visible
+            .render_fragment(text, Some(self.theme.role_prefix(role)), &mut emit)?;
         self.active_role = Some(role);
         Ok(())
     }
@@ -401,7 +420,7 @@ impl LiveRenderer {
                 text,
             } => {
                 self.retain_delta(turn, step, index, UiAssistantBlockKind::Text, seq, &text)?;
-                LiveFrame::from_parts(single_untrusted(ASSISTANT_ROLE, text)?)
+                LiveFrame::from_parts(single_untrusted(UiRole::Assistant, text)?)
             }
             CommittedUiKind::AssistantReasoningDelta {
                 turn,
@@ -417,7 +436,7 @@ impl LiveRenderer {
                     seq,
                     &text,
                 )?;
-                LiveFrame::from_parts(single_untrusted(REASONING_ROLE, text)?)
+                LiveFrame::from_parts(single_untrusted(UiRole::Reasoning, text)?)
             }
             CommittedUiKind::AssistantMessage {
                 turn,
@@ -437,12 +456,12 @@ impl LiveRenderer {
                 let mut parts = try_parts(5)?;
                 parts.push(LivePart::TrustedLine("[tool requested]\n"));
                 parts.push(LivePart::Untrusted {
-                    role: TOOL_ROLE,
+                    role: UiRole::Tool,
                     text: name,
                 });
                 parts.push(LivePart::TrustedInline("\n"));
                 parts.push(LivePart::Untrusted {
-                    role: ARGUMENTS_ROLE,
+                    role: UiRole::Arguments,
                     text: arguments_preview,
                 });
                 parts.push(LivePart::TrustedInline("\n"));
@@ -464,12 +483,12 @@ impl LiveRenderer {
                 }));
                 if let Some(failure) = failure {
                     parts.push(LivePart::Untrusted {
-                        role: ERROR_ROLE,
+                        role: UiRole::Error,
                         text: failure.name,
                     });
                     parts.push(LivePart::TrustedInline(" / "));
                     parts.push(LivePart::Untrusted {
-                        role: ERROR_ROLE,
+                        role: UiRole::Error,
                         text: failure.code,
                     });
                     parts.push(LivePart::TrustedInline("\n"));
@@ -558,7 +577,7 @@ impl LiveRenderer {
                 ));
                 if !text.is_empty() {
                     parts.push(LivePart::Untrusted {
-                        role: ASSISTANT_ROLE,
+                        role: UiRole::Assistant,
                         text,
                     });
                 }
@@ -640,7 +659,7 @@ impl LiveRenderer {
     }
 }
 
-fn single_untrusted(role: &'static str, text: String) -> Result<Vec<LivePart>, LiveRenderError> {
+fn single_untrusted(role: UiRole, text: String) -> Result<Vec<LivePart>, LiveRenderError> {
     let mut parts = try_parts(1)?;
     parts.push(LivePart::Untrusted { role, text });
     Ok(parts)
@@ -648,7 +667,7 @@ fn single_untrusted(role: &'static str, text: String) -> Result<Vec<LivePart>, L
 
 fn push_untrusted_line(
     parts: &mut Vec<LivePart>,
-    role: &'static str,
+    role: UiRole,
     value: &str,
 ) -> Result<(), LiveRenderError> {
     let mut text = String::new();
@@ -668,10 +687,10 @@ fn try_parts(capacity: usize) -> Result<Vec<LivePart>, LiveRenderError> {
     Ok(parts)
 }
 
-fn role_for(kind: UiAssistantBlockKind) -> &'static str {
+fn role_for(kind: UiAssistantBlockKind) -> UiRole {
     match kind {
-        UiAssistantBlockKind::Text => ASSISTANT_ROLE,
-        UiAssistantBlockKind::Reasoning => REASONING_ROLE,
+        UiAssistantBlockKind::Text => UiRole::Assistant,
+        UiAssistantBlockKind::Reasoning => UiRole::Reasoning,
     }
 }
 
@@ -686,12 +705,12 @@ fn turn_end_frame(reason: UiTurnEndReason) -> Result<LiveFrame, LiveRenderError>
             let mut parts = try_parts(5)?;
             parts.push(LivePart::TrustedLine("[turn error]\n"));
             parts.push(LivePart::Untrusted {
-                role: ERROR_ROLE,
+                role: UiRole::Error,
                 text: code,
             });
             parts.push(LivePart::TrustedInline(": "));
             parts.push(LivePart::Untrusted {
-                role: ERROR_ROLE,
+                role: UiRole::Error,
                 text: message,
             });
             parts.push(LivePart::TrustedInline("\n"));
@@ -702,7 +721,7 @@ fn turn_end_frame(reason: UiTurnEndReason) -> Result<LiveFrame, LiveRenderError>
             parts.push(LivePart::TrustedLine("[turn ended]\n"));
             if let Some(kind) = kind {
                 parts.push(LivePart::Untrusted {
-                    role: ERROR_ROLE,
+                    role: UiRole::Error,
                     text: kind,
                 });
                 parts.push(LivePart::TrustedInline("\n"));
@@ -849,8 +868,8 @@ mod tests {
     };
 
     use super::{
-        AttemptState, InteractivePresenter, LiveFrame, LiveRenderer, MAX_ATTEMPT_BLOCKS,
-        MAX_ATTEMPT_TEXT_BYTES,
+        AttemptState, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame, LiveRenderer,
+        MAX_ATTEMPT_BLOCKS, MAX_ATTEMPT_TEXT_BYTES,
     };
 
     fn event(seq: u64, kind: CommittedUiKind) -> CommittedUiEvent {
@@ -945,8 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_frame_streams_the_complete_preview_challenge_and_ready_marker() {
-        let challenge = uuid::Uuid::parse_str("00112233-4455-4677-8899-aabbccddeeff").unwrap();
+    fn approval_frame_streams_the_complete_preview_and_trusted_selector() {
         let frame = LiveFrame::approval(
             "apply_patch",
             Some("call-patch"),
@@ -966,21 +984,19 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("[approval requested]\n"));
         assert!(output.contains("preview | --- a/note.txt\n"));
-        assert!(!output.contains(challenge.to_string().as_str()));
-        let mut ready_output = String::new();
+        let mut selector_output = String::new();
         InteractivePresenter::new()
-            .render(&LiveFrame::approval_ready(challenge).unwrap(), |chunk| {
-                ready_output.push_str(chunk);
-                Ok::<_, std::convert::Infallible>(())
-            })
-            .unwrap();
-        assert_eq!(
-            ready_output,
-            concat!(
-                "[approval input ready]\n",
-                "dsh approval > allow 00112233-4455-4677-8899-aabbccddeeff | reject | cancel\n"
+            .render(
+                &LiveFrame::approval_selector("[approval selector]\n".to_owned()).unwrap(),
+                |chunk| {
+                    selector_output.push_str(chunk);
+                    Ok::<_, std::convert::Infallible>(())
+                },
             )
-        );
+            .unwrap();
+        assert_eq!(selector_output, "[approval selector]\n");
+        let oversized = "x".repeat(FRAME_OUTPUT_CHUNK_BYTES + 1);
+        assert!(LiveFrame::approval_selector(oversized).is_err());
     }
 
     #[test]

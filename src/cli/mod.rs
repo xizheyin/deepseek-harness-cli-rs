@@ -2,6 +2,7 @@
 
 mod approval;
 mod approval_join;
+mod approval_selector;
 mod args;
 mod assembly;
 mod entry;
@@ -20,5 +21,6 @@ mod shutdown;
 mod signal;
 mod storage_failure;
 mod terminal;
+mod theme;
 
 pub use entry::entry;

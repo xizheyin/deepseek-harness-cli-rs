@@ -384,7 +384,7 @@ facts:
   `EXTPROC` is a hard rejection because it can bypass canonical and
   special-character processing even while `ICANON` remains set;
 - target-exposed input/output case conversion (`IUCLC`, `XCASE`, and `OLCUC` on
-  Linux) is disabled so the challenge bytes written and later read are exact;
+  Linux) is disabled so selector and prompt bytes are read exactly;
 - `VINTR`, `VEOF`, `VSUSP`, and `VQUIT` are exactly Ctrl+C (`0x03`), Ctrl+D
   (`0x04`), Ctrl+Z (`0x1a`), and Ctrl+\\ (`0x1c`);
 - custom `VEOL` and `VEOL2` delimiters equal the `_PC_VDISABLE` value reported
@@ -410,8 +410,8 @@ boundary and never count as sanitized application output.
 One application task owns every read. It uses `readable().await` followed by
 `try_io` and a fixed 8 KiB scratch buffer. It never uses `BufReader`, `LinesCodec`,
 or another buffer with an implicit growth policy. A terminal prompt is limited
-to 1,000 UTF-8 bytes; an approval record is limited to 64 bytes so it can carry
-the full fresh authorization challenge described below. This product chooses a
+to 1,000 UTF-8 bytes; an approval record is limited to 64 bytes, enough for the
+bounded selector words and internal correlation parser seam. This product chooses a
 useful bound for the two claimed platforms rather than shrinking to POSIX's
 portable 255-byte minimum: the runtime probe must prove the concrete terminal
 can deliver the entire admitted line plus its newline. Exact, one-over, and
@@ -456,22 +456,21 @@ Continuous busy-state draining is not sufficient for approval safety: a partial
 answer typed before the question could otherwise complete after the question.
 An **approval** transition therefore performs this exact fence:
 
-1. discard the local partial buffer and continuously read-and-discard input while
-   this state is not accepting;
-2. write every byte of the complete prompt or approval preview, **without the
-   challenge**, into the terminal driver through the bounded nonblocking writer;
+1. discard the local partial buffer while this state is not accepting;
+2. write every byte of the complete prompt and approval preview through the
+   bounded nonblocking writer;
 3. revalidate terminal ownership, call `tcflush(IFlush)` on the input
    descriptor, and reset the local parser;
-4. write one bounded ready frame containing the trusted
-   `[approval input ready]` marker and the first disclosure of the fresh UUID
-   challenge;
-5. revalidate terminal ownership again and only after the complete ready frame
-   succeeds mark the new input state as accepting.
+4. require 100 ms with no input; bytes arriving during this arming period are
+   discarded and restart the quiet deadline;
+5. flush once more, switch only approval input to cbreak/no-echo with
+   `tcsetattr(TCSANOW)`, and write the complete bounded selector;
+6. flush bytes typed before the selector finished, then mark it accepting.
 
-The complete fresh-challenge line is the observable automation and human
-boundary. Bytes read before it completes are discarded rather than retained as
-a partial record. Because the challenge is not disclosed until after the input
-flush, stale input cannot contain the authorizing value without guessing it.
+The complete selector is the observable human boundary. Bytes read before it
+completes are discarded rather than retained as a partial record. The quiet
+arming period and Reject-by-default selection prevent a continuous paste or
+stale Enter from turning a predictable shortcut into permission.
 
 The ordinary idle prompt has no direct authority to perform a side effect. Its
 fence instead resets the local parser and flushes old kernel input **before** it
@@ -479,29 +478,27 @@ writes `dsh > `, then accepts input immediately after the complete prompt write.
 This makes the displayed prompt a truthful readiness boundary: an immediate
 human keystroke or deterministic PTY write after seeing it is not erased by a
 later flush. A continuously pretyped ordinary prompt may still become a model
-turn, but it cannot pass the separate fresh-challenge approval fence.
+turn, but it cannot pass the separate approval fence.
 
 `tcflush` is not an atomic boundary with a human or another writer: a continuous
-pretyped stream can still place bytes after the flush. Therefore the fence is
-necessary but not sufficient for Allow. Each approval also receives one new,
-previously unused UI-owned UUID-v4 challenge, taken from the startup CSPRNG pool
-only after the matching committed `approval/asked` fact and request envelope
-have joined. `Uuid::Builder::from_random_bytes` only sets the version/variant on
-those already-filled bytes and performs no fallible entropy lookup. Pool
-exhaustion is impossible before the Session's 4,096-event ceiling; it still
-fails closed as `Unavailable` rather than exposing an unchallenged fallback.
-The only authorizing record is the exact ASCII line
-`allow <full-uuid>` received with LF after the fence. A guessed stale
-authorization therefore requires predicting the fresh 122-bit value; `y`,
-`yes`, prefixes, wildcard-like text, and no-LF VEOF records never Allow. Reject
-and Cancel remain safe simple choices.
+pretyped stream can still place bytes after the flush. Therefore the quiet
+arming stage is also required before selector shortcuts. Each approval still
+receives one new internal UUID-v4 nonce from the startup CSPRNG pool after the
+matching committed `approval/asked` fact and request envelope have joined. It is
+an internal correlation/parser fact, not a displayed user command. After the
+selector is accepting, `y`, `yes`, or `allow` moves to Allowed once; Enter still
+has to confirm the visible selection. Prefixes, wildcard-like text, unknown
+terminal sequences, and no-LF VEOF records never Allow. A process that can
+observe the complete selector and deliberately send later keys controls the same
+trusted terminal as the user; dsh does not claim to defend against a hostile
+terminal owner.
 
 The input flush after the preview can discard an extremely fast legitimate
 keystroke, but it cannot by itself grant authority. `dsh` does not call an
 uncancellable `tcdrain`: complete write acceptance by the tty driver is the
 linear boundary, while pixels physically appearing on a remote/stalled terminal
 remain a device/system limit. If preview output, input flush, terminal
-validation, or challenge generation fails, the approval fails closed. The same
+validation, or selector preparation fails, the approval fails closed. The same
 fence runs after Ctrl+C and before returning to the idle prompt, which also
 handles hosts that set `NOFLSH`.
 
@@ -602,28 +599,21 @@ Agent's 256 tool calls and 256 KiB of validated ID text are retained for this
 join state, then released before the next turn.
 
 After the join, the UI writes the complete role-framed sanitized reason and
-preview, performs the input flush, then writes the ready frame that first
-discloses the freshly generated full UUID challenge before it accepts:
-
-- exact `allow <full-uuid>` with LF: `AllowedOnce`;
-- `n`, `no`, `reject`, or `reject <full-uuid>`: `Rejected`;
-- `c`, `cancel`, or `cancel <full-uuid>`: `Cancelled`;
-- a valid record without LF: Reject/Cancel may be honored, but Allow is refused;
-- anything else: retain this request's challenge, completely write the retry
-  prompt and challenge again, then perform a fresh input fence.
-
-No answer or challenge persists beyond one request. The keywords are disabled
-as soon as a response is sent; the UI waits for the committed decision and
-later tool result instead of implying that the side effect already completed.
+preview, runs the quiet fence, then writes the three-choice selector. Arrows,
+Tab, `h/j/k/l`, and `y/n/c` move the highlight; Enter confirms; Escape cancels;
+unknown or pasted control sequences fail closed and restart the fence. No answer
+persists beyond one request. Selection is disabled as soon as a response is
+sent; the UI waits for the committed decision and later tool result instead of
+implying that the side effect already completed.
 
 ## Live projection and rendering
 
 The terminal renderer consumes append-origin `CommittedUiEvent`s in sequence.
 Every untrusted line is nested inside an unmistakable product-owned frame such
-as `assistant |`, `reasoning |`, `tool |`, or `preview |`; UI prompts and
-approval challenges use a separate `dsh >` / `dsh approval >` frame. Model text
-can spell the word “Approve”, but it cannot create the accepting state or the
-fresh challenge. The renderer keeps only bounded per-attempt text state and at
+as `assistant |`, `reasoning |`, `tool |`, or `preview |`; UI prompts and the
+approval selector use separate trusted frames. Model text can spell the word
+“Approve”, but it cannot create the accepting state. The renderer keeps only
+bounded per-attempt text state and at
 most the Agent's declared tool-call map: 4 MiB and 128 blocks for one DeepSeek
 attempt, 64 calls in one step, and 256 calls in one turn. Retry and step closure
 release their comparison/map state before another attempt/step is admitted.
@@ -677,7 +667,7 @@ forever. When `run_turn` becomes Ready on an ordinary completion, one additional
 five-second absolute **final-drain deadline** covers all remaining frames through
 the matching `turn/end`; it is never restarted per queued event. Expiry or
 output error cancels an active turn. An approval is never answerable until its
-entire preview and challenge have been written.
+entire preview and selector have been written.
 
 Any locally latched INT/TSTP/EOF/termination/output-failure intent immediately
 drops the partly written nonessential frame, stops generating presentation
@@ -938,7 +928,7 @@ Session; the CLI reports it and exits because Phase 8 repair does not exist yet.
   delivery full/closed, matching asked fence, allow/reject/cancel,
   asked-without-envelope decided-unavailable, invalid-answer re-prompt/re-fence,
   decided/turn-end observed before a late broker envelope,
-  exact challenged Allow, bare `y` refusal,
+  internal correlated-record parsing, short `y` selection after the fresh fence,
   complete/partial/continuous stale input, no-LF Allow refusal, late Allow vs
   cancellation, output failure, and EOF;
 - fake-source signal state transitions for idle/active/approval/script INT, TERM,
@@ -986,8 +976,8 @@ Default PTY tests cover:
 - TSTP cleanup interrupted by TERM/HUP/QUIT follows the termination exit rather
   than stopping; `bg` resumes only long enough to self-stop without touching the
   tty; script TSTP exits 148 after foreground resume;
-- stale complete, partial, and continuous pretyped `y`/fake challenges before
-  approval never authorize; only the freshly displayed full challenge does;
+- stale complete, partial, and continuous pretyped input before approval never
+  authorizes; only a post-fence selection followed by Enter can allow;
 - exact/+1 canonical line behavior, nonempty Ctrl+D, and huge-paste
   non-submission plus Ctrl+C recovery on macOS and Ubuntu;
 - the complete `tcgetattr`-derived terminal-state snapshot is unchanged after
@@ -1074,3 +1064,82 @@ to describe only the behavior proven through that exact executable path.
 Phase 8 will own durable JSONL storage, resume, interrupted-tail repair,
 compaction production, history discovery, and long-session lifecycle. Phase 7
 must not create an ad-hoc transcript that Phase 8 later has to reinterpret.
+
+## Phase 9 inline TUI refinement
+
+Phase 9 keeps the committed-event ownership and bounded writer above, but
+replaces the developer-oriented plain presentation with a scrollback-first
+inline TUI. It deliberately does not enter an alternate screen: prompts,
+assistant text, tool activity, diffs, and errors remain ordinary terminal
+history that a user can scroll, select, and copy.
+
+The styled interactive path uses only product-owned ANSI SGR and bounded cursor
+movement. Model text, tool arguments, paths, diffs, errors, and every other
+untrusted field still pass through `VisibleRenderer`; they can never supply an
+escape sequence. `--no-color`, `TERM=dumb`, and non-TTY/script output contain no
+product ANSI and retain complete readable labels. This refinement uses the
+existing `rustix` terminal capability rather than adding a full-screen TUI
+framework.
+
+### Visual hierarchy
+
+- `dsh-rs` owns one compact startup line and a visually distinct input marker;
+- reasoning is subdued, final assistant text is primary, and repeated streamed
+  chunks keep one stable role rather than printing a new banner per fragment;
+- tool request, result, retry, cancellation, and error states have distinct
+  semantic tones plus text labels, so color is never the only signal;
+- approval keeps the complete sanitized reason and preview above the selector.
+  File changes therefore retain the canonical diff, while `bash` retains the
+  exact command, workdir, timeout, and disclosed environment policy produced by
+  the tool layer;
+- the layout avoids terminal-width-dependent boxes, so narrow terminals wrap
+  content without corrupting cursor accounting.
+
+### Approval selector and terminal ownership
+
+Ordinary prompts remain canonical line input. Only after the committed
+`approval/asked` fact, broker envelope, preview, input flush, and quiet arming
+fence have joined does the terminal enter a small **cbreak** selector mode:
+
+1. capture the exact validated canonical `Termios` value;
+2. disable `ICANON` and input echo, retain `ISIG`, `ICRNL`, output processing,
+   and the canonical signal characters, and set `VMIN=1`/`VTIME=0`;
+3. render three vertical choices with **Reject selected by default**;
+4. Up/Left/`k`/`h` select the previous item; Down/Right/`j`/`l`/Tab select the
+   next item; `y`, `n`, and `c` move to Allow once, Reject, and Cancel;
+5. Enter confirms the visible selection. Escape selects Cancel after the short
+   escape-sequence disambiguation deadline;
+6. restore the exact captured canonical attributes **before** delivering the
+   decision, suspending, exiting, or publishing a terminal/output failure.
+
+An arrow escape sequence may be split across kernel reads. The selector owns a
+small bounded decoder and a short pending-Escape deadline: a complete CSI arrow
+moves selection, while an isolated Escape becomes Cancel. Unknown sequences and
+oversized input fail closed and redraw the safe default. A stale
+Enter can only confirm Reject, never Allow.
+
+The mode owner is explicit rather than a detached task. Normal completion calls
+fallible restore and verifies the original terminal facts; a scoped Drop guard
+performs a best-effort restore only as a panic/unwind backstop. Ctrl+C and
+Ctrl+Z remain kernel signals because `ISIG` stays enabled. The dispatcher first
+restores canonical mode, then follows the existing cancel/cleanup/suspend
+ordering. HUP, QUIT, TERM, EOF, output failure, observer failure, and a dropped
+approval owner follow the same restore-before-exit rule.
+
+### Phase 9 evidence and README screenshots
+
+Default PTY tests add fragmented arrow input, default-Enter Reject, explicit
+Allow, Escape/Cancel, Ctrl+C, selector-active Ctrl+Z and termination, EOF, stale
+paste, unknown sequence, output failure, zero-width fallback, and a harness-wide
+exact before/after `Termios` assertion. Styled tests also prove that only
+product-owned bytes contain ANSI and that `--no-color` contains none. The
+output-failure fixture enters before cbreak; restore on an active output failure
+is additionally reviewed through the owned state machine rather than presented
+as a separate PTY observation.
+
+README images are captured from the release-built real `dsh` binary against a
+bounded loopback DeepSeek SSE fixture in a temporary workspace. The fixture
+drives two deterministic scenes: streamed code exploration/tool status and an
+`apply_patch` diff with the keyboard selector. The capture command, terminal
+size, fake-key policy, and expected transcript are recorded in the Phase 9
+validation document. Generated art is never presented as a product screenshot.

@@ -8,12 +8,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::AgentLoop,
-    session::{CommittedUiReceiver, StoreError, TurnEndReason, TurnId},
+    session::{ApprovalOutcome, CommittedUiReceiver, StoreError, TurnEndReason, TurnId},
 };
 
 use super::{
-    approval::{ApprovalAnswer, ApprovalEnvelope, ApprovalEnvelopeReceiver, parse_approval_answer},
+    approval::{ApprovalEnvelope, ApprovalEnvelopeReceiver},
     approval_join::{ApprovalJoin, ApprovalJoinError, ApprovalResetMode},
+    approval_selector::{ApprovalSelector, ESCAPE_SEQUENCE_WAIT, SelectorUpdate},
     assembly::InteractiveAssembly,
     identity::prepare_user_turn,
     input::{
@@ -24,10 +25,11 @@ use super::{
     shutdown,
     signal::{DriverMode, SignalLatch, SignalStreams, UiSignal, self_suspend},
     storage_failure,
-    terminal::{AsyncTerminal, TERMINAL_READ_BYTES, TerminalError},
+    terminal::{ApprovalTerminalMode, AsyncTerminal, TERMINAL_READ_BYTES, TerminalError},
 };
 
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
+const APPROVAL_INPUT_QUIET: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum InteractiveError {
@@ -71,8 +73,8 @@ enum StopIntent {
 enum AfterFrame {
     #[default]
     None,
-    ApprovalFence(uuid::Uuid),
-    ApprovalReady,
+    ApprovalFence,
+    ApprovalAccepting,
     TurnEnd,
 }
 
@@ -93,6 +95,7 @@ pub(super) async fn run(
     assembly: InteractiveAssembly,
     terminal: AsyncTerminal,
     signals: &mut SignalStreams,
+    color: bool,
 ) -> Result<u8, InteractiveError> {
     let InteractiveAssembly {
         mut agent,
@@ -103,7 +106,7 @@ pub(super) async fn run(
         resumed,
     } = assembly;
     let mut live = LiveRenderer::new();
-    let mut presenter = InteractivePresenter::new();
+    let mut presenter = InteractivePresenter::with_color(color);
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
     let mut scratch = [0_u8; TERMINAL_READ_BYTES];
 
@@ -230,6 +233,7 @@ pub(super) async fn run(
                             parser: &mut parser,
                             scratch: &mut scratch,
                             prompt,
+                            color,
                         })
                         .await?
                         {
@@ -290,6 +294,227 @@ struct ActiveTurn<'a> {
     parser: &'a mut CanonicalRecordParser,
     scratch: &'a mut [u8; TERMINAL_READ_BYTES],
     prompt: String,
+    color: bool,
+}
+
+enum ApprovalUiState<'a> {
+    Inactive,
+    Arming {
+        deadline: Instant,
+    },
+    Rendering {
+        mode: ApprovalTerminalMode<'a>,
+        selector: ApprovalSelector,
+        compact: bool,
+    },
+    Accepting {
+        mode: ApprovalTerminalMode<'a>,
+        selector: ApprovalSelector,
+        compact: bool,
+        escape_deadline: Option<Instant>,
+    },
+}
+
+enum ApprovalUiUpdate {
+    None,
+    Redraw(String),
+    Decide(ApprovalOutcome),
+    Eof,
+    Invalid,
+}
+
+impl<'a> ApprovalUiState<'a> {
+    const fn new() -> Self {
+        Self::Inactive
+    }
+
+    const fn is_inactive(&self) -> bool {
+        matches!(self, Self::Inactive)
+    }
+
+    const fn is_accepting(&self) -> bool {
+        matches!(self, Self::Accepting { .. })
+    }
+
+    const fn suppresses_read_while_pending(&self) -> bool {
+        matches!(self, Self::Rendering { .. } | Self::Accepting { .. })
+    }
+
+    const fn arm_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Arming { deadline } => Some(*deadline),
+            _ => None,
+        }
+    }
+
+    const fn escape_deadline(&self) -> Option<Instant> {
+        match self {
+            Self::Accepting {
+                escape_deadline, ..
+            } => *escape_deadline,
+            _ => None,
+        }
+    }
+
+    fn begin_arming(&mut self) -> Result<(), InteractiveError> {
+        if !self.is_inactive() {
+            return Err(InteractiveError::Agent);
+        }
+        *self = Self::Arming {
+            deadline: Instant::now() + APPROVAL_INPUT_QUIET,
+        };
+        Ok(())
+    }
+
+    fn observe_unaccepted_input(&mut self) {
+        if let Self::Arming { deadline } = self {
+            *deadline = Instant::now() + APPROVAL_INPUT_QUIET;
+        }
+    }
+
+    fn begin_rendering(
+        &mut self,
+        terminal: &'a AsyncTerminal,
+        color: bool,
+    ) -> Result<String, InteractiveError> {
+        if !matches!(self, Self::Arming { .. }) {
+            return Err(InteractiveError::Agent);
+        }
+        terminal.flush_input()?;
+        let compact = terminal.columns().is_none_or(|columns| columns < 48);
+        let mode = terminal.enter_approval_mode()?;
+        let selector = ApprovalSelector::new();
+        let output = selector
+            .render(color, compact, false)
+            .map_err(|_| InteractiveError::Output)?;
+        *self = Self::Rendering {
+            mode,
+            selector,
+            compact,
+        };
+        Ok(output)
+    }
+
+    fn accept_rendered(&mut self, terminal: &AsyncTerminal) -> Result<(), InteractiveError> {
+        let state = std::mem::replace(self, Self::Inactive);
+        let Self::Rendering {
+            mode,
+            selector,
+            compact,
+        } = state
+        else {
+            *self = state;
+            return Err(InteractiveError::Agent);
+        };
+        terminal.flush_input()?;
+        *self = Self::Accepting {
+            mode,
+            selector,
+            compact,
+            escape_deadline: None,
+        };
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        challenge: uuid::Uuid,
+        color: bool,
+    ) -> Result<ApprovalUiUpdate, InteractiveError> {
+        let state = std::mem::replace(self, Self::Inactive);
+        let Self::Accepting {
+            mode,
+            mut selector,
+            compact,
+            ..
+        } = state
+        else {
+            *self = state;
+            return Ok(ApprovalUiUpdate::None);
+        };
+        let update = selector.feed(bytes, challenge);
+        match update {
+            SelectorUpdate::None => {
+                let escape_deadline = selector
+                    .escape_is_pending()
+                    .then(|| Instant::now() + ESCAPE_SEQUENCE_WAIT);
+                *self = Self::Accepting {
+                    mode,
+                    selector,
+                    compact,
+                    escape_deadline,
+                };
+                Ok(ApprovalUiUpdate::None)
+            }
+            SelectorUpdate::Redraw => {
+                let output = selector
+                    .render(color, compact, color && !compact)
+                    .map_err(|_| InteractiveError::Output)?;
+                *self = Self::Accepting {
+                    mode,
+                    selector,
+                    compact,
+                    escape_deadline: None,
+                };
+                Ok(ApprovalUiUpdate::Redraw(output))
+            }
+            SelectorUpdate::Decide(outcome) => {
+                mode.restore()?;
+                Ok(ApprovalUiUpdate::Decide(outcome))
+            }
+            SelectorUpdate::Eof => {
+                mode.restore()?;
+                Ok(ApprovalUiUpdate::Eof)
+            }
+            SelectorUpdate::Invalid => {
+                mode.restore()?;
+                Ok(ApprovalUiUpdate::Invalid)
+            }
+        }
+    }
+
+    fn expire_escape(&mut self) -> Result<ApprovalUiUpdate, InteractiveError> {
+        let state = std::mem::replace(self, Self::Inactive);
+        let Self::Accepting {
+            mode,
+            mut selector,
+            compact,
+            ..
+        } = state
+        else {
+            *self = state;
+            return Ok(ApprovalUiUpdate::None);
+        };
+        match selector.expire_escape() {
+            SelectorUpdate::Decide(outcome) => {
+                mode.restore()?;
+                Ok(ApprovalUiUpdate::Decide(outcome))
+            }
+            SelectorUpdate::None => {
+                *self = Self::Accepting {
+                    mode,
+                    selector,
+                    compact,
+                    escape_deadline: None,
+                };
+                Ok(ApprovalUiUpdate::None)
+            }
+            SelectorUpdate::Redraw | SelectorUpdate::Eof | SelectorUpdate::Invalid => {
+                Err(InteractiveError::Agent)
+            }
+        }
+    }
+
+    fn restore(&mut self) -> Result<(), InteractiveError> {
+        let state = std::mem::replace(self, Self::Inactive);
+        match state {
+            Self::Rendering { mode, .. } | Self::Accepting { mode, .. } => {
+                mode.restore().map_err(Into::into)
+            }
+            Self::Inactive | Self::Arming { .. } => Ok(()),
+        }
+    }
 }
 
 async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, InteractiveError> {
@@ -303,7 +528,7 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
     let mut pending = None;
     let mut frame_deadline = None;
     let mut after_frame = AfterFrame::None;
-    let mut approval_accepting = false;
+    let mut approval_ui = ApprovalUiState::new();
     let mut turn_end_seen = false;
     let mut turn_end_rendered = false;
     let mut stop = None;
@@ -319,6 +544,10 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                 discard_pending(&mut pending, active.presenter);
             }
             if stop.is_some() {
+                if let Err(error) = approval_ui.restore() {
+                    observe_failure(&mut stop, error);
+                    cancellation.cancel();
+                }
                 tokio::select! {
                     biased;
                     result = &mut future => break result,
@@ -334,7 +563,7 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                 &mut pending,
                 &mut frame_deadline,
                 &mut after_frame,
-                &mut approval_accepting,
+                &mut approval_ui,
                 &mut turn_end_rendered,
                 active.presenter,
                 active.terminal,
@@ -349,11 +578,11 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                 );
                 continue;
             }
-            if pending.is_none() && active.joins.question().is_some() && !approval_accepting {
-                let enqueue = approval_frame(active.joins, false).and_then(|(frame, challenge)| {
+            if pending.is_none() && active.joins.question().is_some() && approval_ui.is_inactive() {
+                let enqueue = approval_frame(active.joins, false).and_then(|frame| {
                     enqueue_frame(
                         frame,
-                        AfterFrame::ApprovalFence(challenge),
+                        AfterFrame::ApprovalFence,
                         &mut pending,
                         &mut frame_deadline,
                         &mut after_frame,
@@ -387,6 +616,9 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                 active.scratch,
                 pending.as_ref(),
                 frame_deadline,
+                approval_ui.arm_deadline(),
+                approval_ui.escape_deadline(),
+                !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
             tokio::select! {
@@ -407,6 +639,59 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                             active.presenter,
                             InteractiveError::Output,
                         ),
+                        UiWork::ApprovalArmed => {
+                            let prepared = approval_ui
+                                .begin_rendering(active.terminal, active.color)
+                                .and_then(|output| {
+                                    LiveFrame::approval_selector(output)
+                                        .map_err(|_| InteractiveError::Output)
+                                })
+                                .and_then(|frame| {
+                                    enqueue_frame(
+                                        frame,
+                                        AfterFrame::ApprovalAccepting,
+                                        &mut pending,
+                                        &mut frame_deadline,
+                                        &mut after_frame,
+                                    )
+                                });
+                            if let Err(error) = prepared {
+                                latch_active_failure(
+                                    &mut stop,
+                                    &cancellation,
+                                    &mut pending,
+                                    active.presenter,
+                                    error,
+                                );
+                            }
+                        }
+                        UiWork::EscapeExpired => {
+                            let handled = approval_ui.expire_escape().and_then(|update| {
+                                apply_approval_update(
+                                    update,
+                                    active.joins,
+                                    active.parser,
+                                    &mut pending,
+                                    &mut frame_deadline,
+                                    &mut after_frame,
+                                )
+                            });
+                            match handled {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    stop = Some(StopIntent::Eof);
+                                    cancellation.cancel();
+                                    discard_pending(&mut pending, active.presenter);
+                                }
+                                Err(error) => latch_active_failure(
+                                    &mut stop,
+                                    &cancellation,
+                                    &mut pending,
+                                    active.presenter,
+                                    error,
+                                ),
+                            }
+                        }
                         UiWork::Write(write) => match write {
                         Ok(count) => {
                             let advanced = pending
@@ -461,7 +746,7 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                                         pending: &mut pending,
                                         frame_deadline: &mut frame_deadline,
                                         after_frame: &mut after_frame,
-                                        approval_accepting: &mut approval_accepting,
+                                        approval_ui: &mut approval_ui,
                                         turn_end_seen: &mut turn_end_seen,
                                     },
                                 )
@@ -489,23 +774,45 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                             if stop.is_some() {
                                 cancellation.cancel();
                                 discard_pending(&mut pending, active.presenter);
-                            } else if let Err(error) = process_busy_input(
-                                &active.scratch[..count],
-                                count < TERMINAL_READ_BYTES,
-                                active.parser,
-                                active.joins,
-                                &mut approval_accepting,
-                                &mut pending,
-                                &mut frame_deadline,
-                                &mut after_frame,
-                            ) {
-                                latch_active_failure(
-                                    &mut stop,
-                                    &cancellation,
-                                    &mut pending,
-                                    active.presenter,
-                                    error,
-                                );
+                            } else if approval_ui.is_accepting() {
+                                let handled = active
+                                    .joins
+                                    .question()
+                                    .ok_or(InteractiveError::Agent)
+                                    .and_then(|question| {
+                                        approval_ui.feed(
+                                            &active.scratch[..count],
+                                            question.challenge(),
+                                            active.color,
+                                        )
+                                    })
+                                    .and_then(|update| {
+                                        apply_approval_update(
+                                            update,
+                                            active.joins,
+                                            active.parser,
+                                            &mut pending,
+                                            &mut frame_deadline,
+                                            &mut after_frame,
+                                        )
+                                    });
+                                match handled {
+                                    Ok(false) => {}
+                                    Ok(true) => {
+                                        stop = Some(StopIntent::Eof);
+                                        cancellation.cancel();
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
+                                    Err(error) => latch_active_failure(
+                                        &mut stop,
+                                        &cancellation,
+                                        &mut pending,
+                                        active.presenter,
+                                        error,
+                                    ),
+                                }
+                            } else {
+                                approval_ui.observe_unaccepted_input();
                             }
                         }
                         Err(_) => {
@@ -524,6 +831,9 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
     drain_active_signals(active.signals, &mut stop);
     if latch_observer_fault(active.events, &mut stop, &cancellation) {
         discard_pending(&mut pending, active.presenter);
+    }
+    if let Err(error) = approval_ui.restore() {
+        observe_failure(&mut stop, error);
     }
     let session_capacity_exhausted = match &result {
         Ok(outcome) => turn_exhausted_session_capacity(outcome.reason()),
@@ -558,7 +868,7 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                 &mut pending,
                 &mut frame_deadline,
                 &mut after_frame,
-                &mut approval_accepting,
+                &mut approval_ui,
                 &mut turn_end_rendered,
                 active.presenter,
                 active.terminal,
@@ -584,6 +894,9 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                 active.scratch,
                 pending.as_ref(),
                 frame_deadline,
+                approval_ui.arm_deadline(),
+                approval_ui.escape_deadline(),
+                !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
             tokio::select! {
@@ -602,6 +915,50 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                         UiWork::FrameExpired => {
                             observe_failure(&mut stop, InteractiveError::Output);
                             discard_pending(&mut pending, active.presenter);
+                        }
+                        UiWork::ApprovalArmed => {
+                            let prepared = approval_ui
+                                .begin_rendering(active.terminal, active.color)
+                                .and_then(|output| {
+                                    LiveFrame::approval_selector(output)
+                                        .map_err(|_| InteractiveError::Output)
+                                })
+                                .and_then(|frame| {
+                                    enqueue_frame(
+                                        frame,
+                                        AfterFrame::ApprovalAccepting,
+                                        &mut pending,
+                                        &mut frame_deadline,
+                                        &mut after_frame,
+                                    )
+                                });
+                            if let Err(error) = prepared {
+                                observe_failure(&mut stop, error);
+                                discard_pending(&mut pending, active.presenter);
+                            }
+                        }
+                        UiWork::EscapeExpired => {
+                            let handled = approval_ui.expire_escape().and_then(|update| {
+                                apply_approval_update(
+                                    update,
+                                    active.joins,
+                                    active.parser,
+                                    &mut pending,
+                                    &mut frame_deadline,
+                                    &mut after_frame,
+                                )
+                            });
+                            match handled {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    stop = Some(StopIntent::Eof);
+                                    discard_pending(&mut pending, active.presenter);
+                                }
+                                Err(error) => {
+                                    observe_failure(&mut stop, error);
+                                    discard_pending(&mut pending, active.presenter);
+                                }
+                            }
                         }
                         UiWork::Write(write) => match write {
                             Ok(count) => {
@@ -644,7 +1001,7 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                                         pending: &mut pending,
                                         frame_deadline: &mut frame_deadline,
                                         after_frame: &mut after_frame,
-                                        approval_accepting: &mut approval_accepting,
+                                        approval_ui: &mut approval_ui,
                                         turn_end_seen: &mut turn_end_seen,
                                     },
                                 )
@@ -658,7 +1015,44 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
                             stop = Some(StopIntent::Eof);
                             discard_pending(&mut pending, active.presenter);
                         }
-                        UiWork::Read(Ok(_)) => {}
+                        UiWork::Read(Ok(count)) => {
+                            if approval_ui.is_accepting() {
+                                let handled = active
+                                    .joins
+                                    .question()
+                                    .ok_or(InteractiveError::Agent)
+                                    .and_then(|question| {
+                                        approval_ui.feed(
+                                            &active.scratch[..count],
+                                            question.challenge(),
+                                            active.color,
+                                        )
+                                    })
+                                    .and_then(|update| {
+                                        apply_approval_update(
+                                            update,
+                                            active.joins,
+                                            active.parser,
+                                            &mut pending,
+                                            &mut frame_deadline,
+                                            &mut after_frame,
+                                        )
+                                    });
+                                match handled {
+                                    Ok(false) => {}
+                                    Ok(true) => {
+                                        stop = Some(StopIntent::Eof);
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
+                                    Err(error) => {
+                                        observe_failure(&mut stop, error);
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
+                                }
+                            } else {
+                                approval_ui.observe_unaccepted_input();
+                            }
+                        }
                         UiWork::Read(Err(_)) => {
                             observe_failure(&mut stop, InteractiveError::TerminalUnavailable);
                             discard_pending(&mut pending, active.presenter);
@@ -672,6 +1066,9 @@ async fn run_turn(active: ActiveTurn<'_>) -> Result<TurnDisposition, Interactive
     drain_active_signals(active.signals, &mut stop);
     if latch_observer_fault(active.events, &mut stop, &cancellation) {
         discard_pending(&mut pending, active.presenter);
+    }
+    if let Err(error) = approval_ui.restore() {
+        observe_failure(&mut stop, error);
     }
 
     let mut skipped = 0_usize;
@@ -712,7 +1109,7 @@ fn process_event(
     expected_turn: TurnId,
     live: &mut LiveRenderer,
     joins: &mut ApprovalJoin,
-    targets: EventTargets<'_>,
+    targets: EventTargets<'_, '_>,
 ) -> Result<(), InteractiveError> {
     if event.seq.get() < expected_start.get() {
         return Err(InteractiveError::Agent);
@@ -728,7 +1125,7 @@ fn process_event(
             reason,
         } => joins.observe_asked(id, tool_name, call_id, reason)?,
         LiveLifecycle::ApprovalDecided { id, outcome } => {
-            *targets.approval_accepting = false;
+            targets.approval_ui.restore()?;
             joins.observe_decided(id, outcome)?;
         }
         LiveLifecycle::TurnEnded { turn } => {
@@ -752,74 +1149,57 @@ fn process_event(
     Ok(())
 }
 
-struct EventTargets<'a> {
+struct EventTargets<'a, 'terminal> {
     pending: &'a mut Option<PendingLiveFrame>,
     frame_deadline: &'a mut Option<Instant>,
     after_frame: &'a mut AfterFrame,
-    approval_accepting: &'a mut bool,
+    approval_ui: &'a mut ApprovalUiState<'terminal>,
     turn_end_seen: &'a mut bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_busy_input(
-    bytes: &[u8],
-    boundary: bool,
-    parser: &mut CanonicalRecordParser,
+fn apply_approval_update(
+    update: ApprovalUiUpdate,
     joins: &mut ApprovalJoin,
-    approval_accepting: &mut bool,
+    parser: &mut CanonicalRecordParser,
     pending: &mut Option<PendingLiveFrame>,
     frame_deadline: &mut Option<Instant>,
     after_frame: &mut AfterFrame,
-) -> Result<(), InteractiveError> {
-    let mut first = None;
-    if !*approval_accepting {
-        return Ok(());
-    }
-    parser.feed(bytes, boundary, |event| {
-        if first.is_none() {
-            first = Some(event);
-        }
-    });
-    let Some(event) = first else {
-        return Ok(());
-    };
-    let answer = match event {
-        InputRecordEvent::Record {
-            text,
-            terminated_by_lf,
-        } => {
-            let challenge = joins.question().ok_or(InteractiveError::Agent)?.challenge();
-            parse_approval_answer(&text, terminated_by_lf, challenge)
-        }
-        InputRecordEvent::TooLarge | InputRecordEvent::InvalidUtf8 => ApprovalAnswer::Retry,
-    };
-    match answer {
-        ApprovalAnswer::Decide(outcome) => {
-            joins.answer(outcome)?;
-            *approval_accepting = false;
-            parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
-        }
-        ApprovalAnswer::Retry => {
-            let (frame, challenge) = approval_frame(joins, true)?;
+) -> Result<bool, InteractiveError> {
+    match update {
+        ApprovalUiUpdate::None => {}
+        ApprovalUiUpdate::Redraw(output) => {
+            let frame =
+                LiveFrame::approval_selector(output).map_err(|_| InteractiveError::Output)?;
             enqueue_frame(
                 frame,
-                AfterFrame::ApprovalFence(challenge),
+                AfterFrame::None,
                 pending,
                 frame_deadline,
                 after_frame,
             )?;
-            *approval_accepting = false;
+        }
+        ApprovalUiUpdate::Decide(outcome) => {
+            joins.answer(outcome)?;
+            parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+        }
+        ApprovalUiUpdate::Eof => return Ok(true),
+        ApprovalUiUpdate::Invalid => {
+            let frame = approval_frame(joins, true)?;
+            enqueue_frame(
+                frame,
+                AfterFrame::ApprovalFence,
+                pending,
+                frame_deadline,
+                after_frame,
+            )?;
+            parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
-fn approval_frame(
-    joins: &ApprovalJoin,
-    retry: bool,
-) -> Result<(LiveFrame, uuid::Uuid), InteractiveError> {
+fn approval_frame(joins: &ApprovalJoin, retry: bool) -> Result<LiveFrame, InteractiveError> {
     let question = joins.question().ok_or(InteractiveError::Agent)?;
-    let challenge = question.challenge();
     let frame = LiveFrame::approval(
         question.tool_name(),
         question.call_id(),
@@ -828,7 +1208,7 @@ fn approval_frame(
         retry,
     )
     .map_err(|_| InteractiveError::Output)?;
-    Ok((frame, challenge))
+    Ok(frame)
 }
 
 fn enqueue_frame(
@@ -852,7 +1232,7 @@ fn complete_ready_frame(
     pending: &mut Option<PendingLiveFrame>,
     deadline: &mut Option<Instant>,
     after: &mut AfterFrame,
-    approval_accepting: &mut bool,
+    approval_ui: &mut ApprovalUiState<'_>,
     turn_end_rendered: &mut bool,
     presenter: &mut InteractivePresenter,
     terminal: &AsyncTerminal,
@@ -871,20 +1251,15 @@ fn complete_ready_frame(
     *deadline = None;
     match mem::take(after) {
         AfterFrame::None => {}
-        AfterFrame::ApprovalFence(challenge) => {
+        AfterFrame::ApprovalFence => {
             terminal.revalidate()?;
             terminal.flush_input()?;
             parser.reset(MAX_APPROVAL_RECORD_BYTES);
-            let ready =
-                LiveFrame::approval_ready(challenge).map_err(|_| InteractiveError::Output)?;
-            *pending = Some(ready.into_pending().map_err(|_| InteractiveError::Output)?);
-            *deadline = Some(Instant::now() + FRAME_DEADLINE);
-            *after = AfterFrame::ApprovalReady;
+            approval_ui.begin_arming()?;
         }
-        AfterFrame::ApprovalReady => {
-            terminal.revalidate()?;
+        AfterFrame::ApprovalAccepting => {
             parser.reset(MAX_APPROVAL_RECORD_BYTES);
-            *approval_accepting = true;
+            approval_ui.accept_rendered(terminal)?;
         }
         AfterFrame::TurnEnd => *turn_end_rendered = true,
     }
@@ -911,6 +1286,8 @@ fn latch_active_failure(
 
 enum UiWork {
     FrameExpired,
+    ApprovalArmed,
+    EscapeExpired,
     Write(std::io::Result<usize>),
     Envelope(Option<ApprovalEnvelope>),
     Event(Option<crate::session::CommittedUiEvent>),
@@ -925,14 +1302,22 @@ async fn next_ui_work(
     scratch: &mut [u8; TERMINAL_READ_BYTES],
     pending: Option<&PendingLiveFrame>,
     frame_deadline: Option<Instant>,
+    approval_arm_deadline: Option<Instant>,
+    escape_deadline: Option<Instant>,
+    read_enabled: bool,
     prefer_input: bool,
 ) -> UiWork {
     let deadline = frame_deadline.unwrap_or_else(Instant::now);
+    let arm_deadline = approval_arm_deadline.unwrap_or_else(Instant::now);
+    let escape_pending = escape_deadline.is_some();
+    let escape_deadline_at = escape_deadline.unwrap_or_else(Instant::now);
     if prefer_input {
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline), if pending.is_some() => UiWork::FrameExpired,
-            read = terminal.read_once(scratch) => UiWork::Read(read),
+            () = tokio::time::sleep_until(arm_deadline), if approval_arm_deadline.is_some() => UiWork::ApprovalArmed,
+            () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
+            read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
@@ -941,10 +1326,12 @@ async fn next_ui_work(
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline), if pending.is_some() => UiWork::FrameExpired,
+            () = tokio::time::sleep_until(arm_deadline), if approval_arm_deadline.is_some() => UiWork::ApprovalArmed,
+            () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
-            read = terminal.read_once(scratch) => UiWork::Read(read),
+            read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
         }
     }
 }
@@ -1195,15 +1582,16 @@ fn discard_ready_updates(events: &mut CommittedUiReceiver) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AfterFrame, InteractiveError, StopIntent, discard_ready_updates, latch_observer_fault,
-        observe_failure, observe_signal, process_busy_input, turn_exhausted_session_capacity,
+        AfterFrame, ApprovalUiUpdate, InteractiveError, StopIntent, apply_approval_update,
+        discard_ready_updates, latch_observer_fault, observe_failure, observe_signal,
+        turn_exhausted_session_capacity,
     };
     use crate::{
         agent::{ApprovalPrompt, ApprovalRequest},
         cli::{
             approval::{ApprovalChallengePool, ApprovalEnvelope},
             approval_join::ApprovalJoin,
-            input::{CanonicalRecordParser, MAX_APPROVAL_RECORD_BYTES},
+            input::CanonicalRecordParser,
             signal::UiSignal,
         },
         entropy::{EntropyError, EntropySource},
@@ -1239,42 +1627,8 @@ mod tests {
         assert_eq!(stop, Some(StopIntent::Exit(UiSignal::Quit)));
     }
 
-    #[test]
-    fn input_read_before_the_approval_ready_frame_cannot_cross_the_fence() {
-        let challenges =
-            ApprovalChallengePool::from_entropy(EntropySource::injected(fill)).unwrap();
-        let mut joins = ApprovalJoin::new(challenges).unwrap();
-        let mut parser = CanonicalRecordParser::new(64);
-        let mut accepting = false;
-        let mut pending = None;
-        let mut deadline = None;
-        let mut after = AfterFrame::None;
-
-        process_busy_input(
-            b"allow stale-partial",
-            true,
-            &mut parser,
-            &mut joins,
-            &mut accepting,
-            &mut pending,
-            &mut deadline,
-            &mut after,
-        )
-        .unwrap();
-
-        let mut records = Vec::new();
-        parser.feed(b"\n", true, |event| records.push(event));
-        assert!(matches!(
-            records.as_slice(),
-            [crate::cli::input::InputRecordEvent::Record {
-                text,
-                terminated_by_lf: true,
-            }] if text.is_empty()
-        ));
-    }
-
     #[tokio::test]
-    async fn hostile_approval_records_cannot_smuggle_an_allow_past_a_retry_fence() {
+    async fn invalid_selector_input_rearms_before_a_later_decision() {
         let challenges =
             ApprovalChallengePool::from_entropy(EntropySource::injected(fill)).unwrap();
         let mut joins = ApprovalJoin::new(challenges).unwrap();
@@ -1297,80 +1651,39 @@ mod tests {
                 Some("change one file".to_owned()),
             )
             .unwrap();
-        let challenge = joins.question().unwrap().challenge();
-        let exact = format!("allow {challenge}");
-        let mut parser = CanonicalRecordParser::new(MAX_APPROVAL_RECORD_BYTES);
-        let mut accepting = true;
+        let mut parser = CanonicalRecordParser::new(64);
         let mut pending = None;
         let mut deadline = None;
         let mut after = AfterFrame::None;
 
-        let batch = format!("invalid\n{exact}\n");
-        process_busy_input(
-            batch.as_bytes(),
-            true,
-            &mut parser,
+        apply_approval_update(
+            ApprovalUiUpdate::Invalid,
             &mut joins,
-            &mut accepting,
+            &mut parser,
             &mut pending,
             &mut deadline,
             &mut after,
         )
         .unwrap();
-        assert!(!accepting);
-        assert_eq!(after, AfterFrame::ApprovalFence(challenge));
+        assert!(pending.is_some());
+        assert_eq!(after, AfterFrame::ApprovalFence);
         assert!(matches!(
             receive.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
 
-        for hostile in [
-            exact.as_bytes().to_vec(),
-            vec![0xff, b'\n'],
-            vec![b'x'; MAX_APPROVAL_RECORD_BYTES + 1],
-        ] {
-            pending = None;
-            deadline = None;
-            after = AfterFrame::None;
-            accepting = true;
-            parser.reset(MAX_APPROVAL_RECORD_BYTES);
-            process_busy_input(
-                &hostile,
-                true,
-                &mut parser,
-                &mut joins,
-                &mut accepting,
-                &mut pending,
-                &mut deadline,
-                &mut after,
-            )
-            .unwrap();
-            assert!(!accepting);
-            assert_eq!(joins.question().unwrap().challenge(), challenge);
-            assert_eq!(after, AfterFrame::ApprovalFence(challenge));
-            assert!(matches!(
-                receive.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
-        }
-
         pending = None;
         deadline = None;
         after = AfterFrame::None;
-        accepting = true;
-        parser.reset(MAX_APPROVAL_RECORD_BYTES);
-        process_busy_input(
-            format!("{exact}\n").as_bytes(),
-            true,
-            &mut parser,
+        apply_approval_update(
+            ApprovalUiUpdate::Decide(ApprovalOutcome::AllowedOnce),
             &mut joins,
-            &mut accepting,
+            &mut parser,
             &mut pending,
             &mut deadline,
             &mut after,
         )
         .unwrap();
-        assert!(!accepting);
         assert!(pending.is_none());
         assert_eq!(after, AfterFrame::None);
         assert_eq!(receive.await.unwrap().outcome, ApprovalOutcome::AllowedOnce);

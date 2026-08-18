@@ -810,6 +810,15 @@ uses one prompt at a time and places the complete Phase 5 canonical diff directl
 inside the terminal approval question. Interactive Ctrl+C follows Web Stop's
 turn-level user cancellation, not the launcher's process-level SIGINT contract.
 
+On 2026-08-18 the local terminal UX was clarified without changing the upstream
+semantic oracle. After the quiet-input fence, a human uses a bounded inline
+Allow once / Reject / Cancel selector; arrows, `h/j/k/l`, Tab, and `y/n/c` move
+the selection, while Enter alone confirms it and Escape cancels. Reject is the
+safe default. Only this selector temporarily disables canonical input and echo,
+keeps `ISIG`, and restores the exact terminal settings before the decision is
+delivered. This is Rust product UX, not a new compatibility claim about the
+pinned Web or ACP presentation.
+
 The focused upstream test command was:
 
 ```console

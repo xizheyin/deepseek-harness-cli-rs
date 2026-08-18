@@ -84,6 +84,8 @@ pub struct PtyHarness {
     reader: Option<thread::JoinHandle<()>>,
     transcript: Arc<(Mutex<TranscriptState>, Condvar)>,
     reader_control: ReaderControl,
+    color: bool,
+    initial_terminal_state: String,
     _session_root: TestSessionRoot,
 }
 
@@ -134,11 +136,15 @@ impl Drop for TestSessionRoot {
 
 impl PtyHarness {
     pub fn spawn(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None)
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, false)
+    }
+
+    pub fn spawn_color(base_url: &str, workspace: &Path) -> Self {
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, true)
     }
 
     pub fn spawn_rolling(base_url: &str, workspace: &Path) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, true, None, None, None)
+        Self::spawn_with_transcript_mode(base_url, workspace, true, None, None, None, false)
     }
 
     pub fn spawn_with_disabled_terminal_mode(
@@ -146,7 +152,7 @@ impl PtyHarness {
         workspace: &Path,
         mode: DisabledTerminalMode,
     ) -> Self {
-        Self::spawn_with_transcript_mode(base_url, workspace, false, Some(mode), None, None)
+        Self::spawn_with_transcript_mode(base_url, workspace, false, Some(mode), None, None, false)
     }
 
     pub fn spawn_resume(
@@ -162,6 +168,7 @@ impl PtyHarness {
             None,
             Some(session_root),
             Some(session_id),
+            false,
         )
     }
 
@@ -172,6 +179,7 @@ impl PtyHarness {
         disabled_mode: Option<DisabledTerminalMode>,
         session_root: Option<TestSessionRoot>,
         resume_id: Option<&str>,
+        color: bool,
     ) -> Self {
         let (master, slave) = open_test_pty();
         let mut termios =
@@ -240,6 +248,11 @@ impl PtyHarness {
         }
         rustix::termios::tcsetattr(&slave, rustix::termios::OptionalActions::Now, &termios)
             .expect("PTY terminal settings should initialize deterministically");
+        let initial_terminal_state = format!(
+            "{:?}",
+            rustix::termios::tcgetattr(&master)
+                .expect("initialized PTY terminal settings should be readable")
+        );
         master
             .resize(Size::new(24, 120))
             .expect("PTY should resize");
@@ -260,7 +273,20 @@ impl PtyHarness {
         let session_root = session_root.unwrap_or_else(TestSessionRoot::new);
         let command = blocking::Command::new(env!("CARGO_BIN_EXE_dsh"));
         let command = if let Some(session_id) = resume_id {
-            command.args(["--resume", session_id, "--no-color"])
+            if color {
+                command.args(["--resume", session_id])
+            } else {
+                command.args(["--resume", session_id, "--no-color"])
+            }
+        } else if color {
+            command.args([
+                "--model",
+                "deepseek-chat",
+                "--workspace",
+                workspace
+                    .to_str()
+                    .expect("test workspace path should be Unicode"),
+            ])
         } else {
             command.args([
                 "--model",
@@ -272,24 +298,28 @@ impl PtyHarness {
                 "--no-color",
             ])
         };
-        let child = command
+        let command = command
             .current_dir(workspace)
             .env_clear()
             .env("DEEPSEEK_BASE_URL", base_url)
             .env("DEEPSEEK_API_KEY", TEST_API_KEY)
             .env("DSH_SESSION_ROOT", session_root.path())
             .env("HOME", workspace)
-            .env("PATH", "/usr/bin:/bin")
-            .env("TERM", "dumb")
-            .env("NO_COLOR", "1")
-            .spawn(slave)
-            .expect("dsh should spawn on the PTY");
+            .env("PATH", "/usr/bin:/bin");
+        let command = if color {
+            command.env("TERM", "xterm-256color")
+        } else {
+            command.env("TERM", "dumb").env("NO_COLOR", "1")
+        };
+        let child = command.spawn(slave).expect("dsh should spawn on the PTY");
         Self {
             master: Some(master),
             child: Some(child),
             reader: Some(reader),
             transcript,
             reader_control,
+            color,
+            initial_terminal_state,
             _session_root: session_root,
         }
     }
@@ -303,6 +333,14 @@ impl PtyHarness {
     pub fn signal(&mut self, signal: Signal) {
         let pid = Pid::from_child(self.child.as_ref().expect("PTY child should exist"));
         kill_process(pid, signal).expect("owned PTY child should accept the signal");
+    }
+
+    pub fn resize(&mut self, rows: u16, columns: u16) {
+        self.master
+            .as_ref()
+            .expect("PTY master should exist")
+            .resize(Size::new(rows, columns))
+            .expect("PTY should resize");
     }
 
     pub fn pause_reading(&mut self) {
@@ -453,22 +491,19 @@ impl PtyHarness {
             .clone()
     }
 
-    pub fn approval_challenge(&mut self) -> String {
-        self.expect(b"[approval input ready]");
-        self.expect(b"dsh approval > allow ");
-        let transcript = self.snapshot();
-        let transcript = String::from_utf8(transcript).expect("PTY transcript should be UTF-8");
-        let prefix = "dsh approval > allow ";
-        let start = transcript
-            .rfind(prefix)
-            .expect("approval challenge prefix should be visible")
-            + prefix.len();
-        let end = start + 36;
-        let challenge = transcript
-            .get(start..end)
-            .expect("approval challenge should contain a complete UUID");
-        uuid::Uuid::parse_str(challenge).expect("approval challenge should be a UUID");
-        challenge.to_owned()
+    pub fn approval_ready(&mut self) {
+        self.approval_ready_occurrence(1);
+    }
+
+    pub fn approval_ready_occurrence(&mut self, expected: usize) {
+        let title = if self.color {
+            b"Approval required".as_slice()
+        } else {
+            b"[approval required]".as_slice()
+        };
+        self.expect_occurrences(title, expected);
+        self.expect_occurrences(b"Enter confirm", expected);
+        wait_for_selector_mode(self.master.as_ref().expect("PTY master should exist"));
     }
 
     pub fn exit_cleanly(mut self) -> (ExitStatus, Vec<u8>) {
@@ -484,6 +519,11 @@ impl PtyHarness {
         .expect("dsh should exit within the bounded deadline");
         resume_reader_for_exit(&self.reader_control);
         wait_for_transcript_close(&self.transcript, Duration::from_secs(2));
+        assert_eq!(
+            self.terminal_state(),
+            self.initial_terminal_state,
+            "dsh must restore the exact PTY state before every exit"
+        );
         self.master.take();
         if let Some(reader) = self.reader.take() {
             reader.join().expect("PTY reader should join");
@@ -652,10 +692,10 @@ impl JobControlHarness {
         pid
     }
 
-    pub fn approval_challenge(&mut self) -> String {
-        self.expect(b"[approval input ready]");
-        self.expect(b"dsh approval > allow ");
-        approval_challenge_from_transcript(&self.snapshot())
+    pub fn approval_ready(&mut self) {
+        self.expect(b"[approval required]");
+        self.expect(b"Enter confirm");
+        wait_for_selector_mode(self.master.as_ref().expect("PTY master should exist"));
     }
 
     pub fn remember_approved_group(&mut self) -> Pid {
@@ -896,22 +936,6 @@ fn expect_transcript_after(
     }
 }
 
-fn approval_challenge_from_transcript(transcript: &[u8]) -> String {
-    let transcript =
-        String::from_utf8(transcript.to_vec()).expect("PTY transcript should be UTF-8");
-    let prefix = "dsh approval > allow ";
-    let start = transcript
-        .rfind(prefix)
-        .expect("approval challenge prefix should be visible")
-        + prefix.len();
-    let end = start + 36;
-    let challenge = transcript
-        .get(start..end)
-        .expect("approval challenge should contain a complete UUID");
-    uuid::Uuid::parse_str(challenge).expect("approval challenge should be a UUID");
-    challenge.to_owned()
-}
-
 fn read_pid_file(path: &Path) -> Pid {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -928,6 +952,28 @@ fn read_pid_file(path: &Path) -> Pid {
             "PID file did not appear: {path:?}"
         );
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_selector_mode(master: &blocking::Pty) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let termios = rustix::termios::tcgetattr(master)
+            .expect("PTY terminal settings should remain readable");
+        let canonical = termios
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON);
+        let echo = termios
+            .local_modes
+            .contains(rustix::termios::LocalModes::ECHO);
+        if !canonical && !echo {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "approval selector did not enter cbreak/no-echo mode"
+        );
+        thread::sleep(Duration::from_millis(5));
     }
 }
 

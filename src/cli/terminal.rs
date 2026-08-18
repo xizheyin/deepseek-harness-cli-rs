@@ -7,8 +7,8 @@ use std::{
 use rustix::{
     fs::{FileType, Mode, OFlags, fstat},
     termios::{
-        InputModes, LocalModes, OutputModes, QueueSelector, SpecialCodeIndex, Termios, isatty,
-        tcflush, tcgetattr, tcgetpgrp, tcgetsid,
+        InputModes, LocalModes, OptionalActions, OutputModes, QueueSelector, SpecialCodeIndex,
+        Termios, isatty, tcflush, tcgetattr, tcgetpgrp, tcgetsid, tcgetwinsize, tcsetattr,
     },
 };
 use thiserror::Error;
@@ -113,6 +113,31 @@ impl AsyncTerminal {
         tcflush(self.input.get_ref(), QueueSelector::IFlush).map_err(|_| TerminalError::Unsupported)
     }
 
+    /// Window size changes presentation only. Some otherwise usable terminals
+    /// report zero or reject this optional ioctl, so callers must fall back to
+    /// the compact layout rather than failing an approval.
+    pub(super) fn columns(&self) -> Option<u16> {
+        tcgetwinsize(self.output.get_ref())
+            .ok()
+            .map(|size| size.ws_col)
+            .filter(|columns| *columns != 0)
+    }
+
+    pub(super) fn enter_approval_mode(&self) -> Result<ApprovalTerminalMode<'_>, TerminalError> {
+        self.revalidate()?;
+        let original = tcgetattr(self.input.get_ref()).map_err(|_| TerminalError::Unsupported)?;
+        let selector = selector_termios(&original);
+        // Input has already been flushed by the approval fence. `Now` avoids
+        // TCSAFLUSH's implicit output drain, which could block an async runtime
+        // thread forever when the terminal stops consuming output.
+        tcsetattr(self.input.get_ref(), OptionalActions::Now, &selector)
+            .map_err(|_| TerminalError::Unsupported)?;
+        Ok(ApprovalTerminalMode {
+            terminal: self,
+            original: Some(original),
+        })
+    }
+
     pub(super) fn is_foreground(&self) -> Result<bool, TerminalError> {
         let expected_session =
             rustix::process::getsid(None).map_err(|_| TerminalError::Unsupported)?;
@@ -161,6 +186,55 @@ impl AsyncTerminal {
             }
         }
     }
+}
+
+/// Owns the one temporary terminal-mode change used by the approval selector.
+/// Normal control flow calls `restore`; Drop is only a panic/unwind backstop.
+pub(super) struct ApprovalTerminalMode<'a> {
+    terminal: &'a AsyncTerminal,
+    original: Option<Termios>,
+}
+
+impl ApprovalTerminalMode<'_> {
+    pub(super) fn restore(mut self) -> Result<(), TerminalError> {
+        let original = self.original.as_ref().ok_or(TerminalError::Unsupported)?;
+        tcsetattr(
+            self.terminal.input.get_ref(),
+            OptionalActions::Now,
+            original,
+        )
+        .map_err(|_| TerminalError::Unsupported)?;
+        self.original = None;
+        // Restore canonical mode first, then discard bytes typed against the
+        // old selector. A flush failure is reported, but it can no longer leave
+        // the terminal in cbreak/no-echo mode.
+        self.terminal.flush_input()?;
+        self.terminal.revalidate()
+    }
+}
+
+impl Drop for ApprovalTerminalMode<'_> {
+    fn drop(&mut self) {
+        let Some(original) = self.original.as_ref() else {
+            return;
+        };
+        let _ = tcsetattr(
+            self.terminal.input.get_ref(),
+            OptionalActions::Now,
+            original,
+        );
+    }
+}
+
+fn selector_termios(original: &Termios) -> Termios {
+    let mut selector = original.clone();
+    selector
+        .local_modes
+        .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHONL);
+    selector.local_modes.insert(LocalModes::ISIG);
+    selector.special_codes[SpecialCodeIndex::VMIN] = 1;
+    selector.special_codes[SpecialCodeIndex::VTIME] = 0;
+    selector
 }
 
 fn normalize_read(result: io::Result<usize>) -> io::Result<usize> {
