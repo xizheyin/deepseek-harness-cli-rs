@@ -32,13 +32,17 @@ fn open_test_pty() -> (blocking::Pty, blocking::Pts) {
 
 fn transient_pty_allocation_error(error: &pty_process::Error) -> bool {
     match error {
-        pty_process::Error::Rustix(error) => {
-            matches!(*error, rustix::io::Errno::NXIO | rustix::io::Errno::AGAIN)
-        }
-        pty_process::Error::Io(error) => {
-            matches!(error.raw_os_error(), Some(libc::ENXIO) | Some(libc::EAGAIN))
-        }
+        pty_process::Error::Rustix(error) => transient_pty_errno(error.raw_os_error()),
+        pty_process::Error::Io(error) => error.raw_os_error().is_some_and(transient_pty_errno),
     }
+}
+
+fn transient_pty_errno(raw: i32) -> bool {
+    // Darwin's `ptsname_r` can report a short-lived ENXIO as `-ENXIO` while
+    // parallel tests are allocating PTYs. It is the same retryable condition;
+    // normalize only the two allocation errors that this harness already
+    // treats as transient.
+    matches!(raw.unsigned_abs(), code if code == libc::ENXIO as u32 || code == libc::EAGAIN as u32)
 }
 
 struct TranscriptState {
@@ -1344,4 +1348,13 @@ fn fake_key_scanner_detects_a_value_split_across_reader_chunks() {
             .expect("transcript mutex should lock")
             .secret_seen
     );
+}
+
+#[test]
+fn transient_pty_errors_accept_darwins_signed_errno_form() {
+    assert!(transient_pty_errno(libc::ENXIO));
+    assert!(transient_pty_errno(-libc::ENXIO));
+    assert!(transient_pty_errno(libc::EAGAIN));
+    assert!(transient_pty_errno(-libc::EAGAIN));
+    assert!(!transient_pty_errno(libc::EIO));
 }
