@@ -9,13 +9,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent::AgentLoop,
     session::{
-        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, StoreError, TurnEndReason, TurnId,
-        UiUserSource,
+        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, StoreError, TurnEndReason,
+        TurnId, UiUserSource,
     },
     tui::{
         dock::{
-            DockApprovalSelection, DockError, DockFrame, DockInteraction, DockModel,
-            MIN_ENHANCED_COLUMNS, MIN_ENHANCED_ROWS,
+            DetailViewport, DockApprovalSelection, DockError, DockFrame, DockInteraction,
+            DockModel, MIN_ENHANCED_COLUMNS, MIN_ENHANCED_ROWS,
         },
         inline_screen::{
             InlineScreen, InlineScreenError, POISON_REATTACH_BYTES, POISON_TEARDOWN_BYTES,
@@ -23,6 +23,7 @@ use crate::{
         },
         input_memory::{InputMemory, InputMemoryError, LocalPromptId},
         key_decoder::{InputEvent, Key, KeyDecoder},
+        view::{ContextEstimate, ViewMode, ViewRequest, ViewState},
     },
 };
 
@@ -125,6 +126,20 @@ enum InlineIntent {
 struct PendingInlineOutput {
     write: PendingScreenWrite,
     intent: InlineIntent,
+    surface: SurfaceCommit,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SurfaceCommit {
+    request: ViewRequest,
+    offset: usize,
+    total_rows: usize,
+    page_rows: usize,
+}
+
+struct EnhancedSurface {
+    frame: DockFrame,
+    commit: SurfaceCommit,
 }
 
 impl PendingOutput {
@@ -219,7 +234,8 @@ async fn run_enhanced(
         session_id,
         resumed,
     } = assembly;
-    let mut live = LiveRenderer::new();
+    let mut live = LiveRenderer::for_session(resumed);
+    live.set_context_estimate(session_context_estimate(agent.session(), None, None));
     let mut presenter = InteractivePresenter::with_color(true);
     let mut enhanced_presenter = EnhancedPresenter::new();
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
@@ -292,16 +308,21 @@ async fn run_enhanced(
         return shutdown_after_enhanced_error(&mut agent, signals, InteractiveError::Agent).await;
     }
     let mut input = InputMemory::default();
+    let mut view = ViewState::default();
     let mut notice = None;
     let mut screen = InlineScreen::default();
     let initial_dock = render_enhanced_dock(
-        &input,
-        notice.as_deref(),
-        DockInteraction::Idle,
+        DockRenderModel {
+            input: &input,
+            notice: notice.as_deref(),
+            interaction: DockInteraction::Idle,
+            live: &live,
+        },
         &terminal,
         &mut last_size,
         signals,
         &mut screen,
+        &mut view,
     )
     .await;
     let mut pending_signal = match initial_dock {
@@ -313,6 +334,7 @@ async fn run_enhanced(
         }
     };
     let mut auto_queue_paused = false;
+    let mut input_escape_deadline = None;
 
     let result: Result<InteractiveExit, InteractiveError> = async {
         loop {
@@ -322,12 +344,17 @@ async fn run_enhanced(
                 EnhancedIdleEvent::AutoSubmit
             } else {
                 terminal.revalidate_application()?;
+                let escape_pending = input_escape_deadline.is_some();
+                let escape_deadline = input_escape_deadline.unwrap_or_else(Instant::now);
                 tokio::select! {
                     biased;
                     signal = signals.next_interactive() => match signal {
                         InteractiveSignal::Stop(signal) => EnhancedIdleEvent::Signal(signal),
                         InteractiveSignal::Resize => EnhancedIdleEvent::Resize,
                     },
+                    () = tokio::time::sleep_until(escape_deadline), if escape_pending => {
+                        EnhancedIdleEvent::EscapeExpired
+                    }
                     read = terminal.read_once(&mut scratch) => {
                         let count = read.map_err(|_| InteractiveError::TerminalUnavailable)?;
                         if count == 0 {
@@ -341,6 +368,7 @@ async fn run_enhanced(
             let action = match event {
                 EnhancedIdleEvent::Signal(UiSignal::Interrupt) => {
                     decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+                    input_escape_deadline = None;
                     if input.composer().is_empty() {
                         break Ok(InteractiveExit::Ordinary(0));
                     }
@@ -349,14 +377,20 @@ async fn run_enhanced(
                     EnhancedInputAction::Redraw
                 }
                 EnhancedIdleEvent::Signal(UiSignal::Suspend) => {
+                    input_escape_deadline = None;
                     pending_signal = suspend_enhanced(
                         &mut terminal,
                         signals,
                         &mut decoder,
-                        &input,
-                        notice.as_deref(),
+                        DockRenderModel {
+                            input: &input,
+                            notice: notice.as_deref(),
+                            interaction: DockInteraction::Idle,
+                            live: &live,
+                        },
                         &mut screen,
                         &mut last_size,
+                        &mut view,
                     )
                     .await?;
                     continue;
@@ -366,16 +400,29 @@ async fn run_enhanced(
                 ) => break Ok(InteractiveExit::Signal(signal)),
                 EnhancedIdleEvent::Eof => break Ok(InteractiveExit::Ordinary(0)),
                 EnhancedIdleEvent::Resize => EnhancedInputAction::Redraw,
-                EnhancedIdleEvent::AutoSubmit => EnhancedInputAction::Submit,
-                EnhancedIdleEvent::Bytes(count) => {
-                    auto_queue_paused = false;
-                    apply_enhanced_input(
+                EnhancedIdleEvent::EscapeExpired => {
+                    input_escape_deadline = None;
+                    expire_enhanced_escape(
                         &mut decoder,
-                        &scratch[..count],
                         &mut input,
+                        &mut view,
                         last_size,
                         &mut notice,
                     )?
+                }
+                EnhancedIdleEvent::AutoSubmit => EnhancedInputAction::Submit,
+                EnhancedIdleEvent::Bytes(count) => {
+                    auto_queue_paused = false;
+                    let action = apply_enhanced_input(
+                        &mut decoder,
+                        &scratch[..count],
+                        &mut input,
+                        &mut view,
+                        last_size,
+                        &mut notice,
+                    )?;
+                    refresh_decoder_escape_deadline(&decoder, &mut input_escape_deadline);
+                    action
                 }
             };
 
@@ -405,8 +452,27 @@ async fn run_enhanced(
                         EnhancedSubmission::Empty => notice = None,
                         EnhancedSubmission::Help => {
                             notice = Some(
-                                "/help | /exit | /quit | Enter send | Ctrl+J newline".to_owned(),
+                                "/inspect | /review | /focus | /help | /exit | Ctrl+O inspect"
+                                    .to_owned(),
                             );
+                        }
+                        EnhancedSubmission::Inspect => {
+                            let _ = view
+                                .request_mode(ViewMode::Inspect)
+                                .map_err(|_| InteractiveError::Output)?;
+                            notice = None;
+                        }
+                        EnhancedSubmission::Review => {
+                            let _ = view
+                                .request_mode(ViewMode::Review)
+                                .map_err(|_| InteractiveError::Output)?;
+                            notice = None;
+                        }
+                        EnhancedSubmission::Focus => {
+                            let _ = view
+                                .request_mode(ViewMode::Focus)
+                                .map_err(|_| InteractiveError::Output)?;
+                            notice = None;
                         }
                         EnhancedSubmission::Exit => break Ok(InteractiveExit::Ordinary(0)),
                         EnhancedSubmission::Prompt => {
@@ -418,11 +484,17 @@ async fn run_enhanced(
                             let mut active_dock = ActiveDock {
                                 screen: &mut screen,
                                 last_size: &mut last_size,
+                                view: &mut view,
                             };
+                            let _ = active_dock
+                                .view
+                                .request_mode(ViewMode::Focus)
+                                .map_err(|_| InteractiveError::Output)?;
                             if let Some(signal) = render_active_dock(
                                 &input,
                                 notice.as_deref(),
                                 DockInteraction::Running,
+                                &live,
                                 active_terminal,
                                 signals,
                                 &mut active_dock,
@@ -487,10 +559,15 @@ async fn run_enhanced(
                                         &mut terminal,
                                         signals,
                                         &mut decoder,
-                                        &input,
-                                        notice.as_deref(),
+                                        DockRenderModel {
+                                            input: &input,
+                                            notice: notice.as_deref(),
+                                            interaction: DockInteraction::Idle,
+                                            live: &live,
+                                        },
                                         &mut screen,
                                         &mut last_size,
+                                        &mut view,
                                     )
                                     .await?;
                                     continue;
@@ -505,13 +582,17 @@ async fn run_enhanced(
             }
 
             pending_signal = render_enhanced_dock(
-                &input,
-                notice.as_deref(),
-                DockInteraction::Idle,
+                DockRenderModel {
+                    input: &input,
+                    notice: notice.as_deref(),
+                    interaction: DockInteraction::Idle,
+                    live: &live,
+                },
                 &terminal,
                 &mut last_size,
                 signals,
                 &mut screen,
+                &mut view,
             )
             .await?;
             if action == EnhancedInputAction::PasteFence && pending_signal.is_none() {
@@ -524,15 +605,20 @@ async fn run_enhanced(
                 {
                     PasteFenceOutcome::Ready => {
                         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+                        input_escape_deadline = None;
                         notice = Some("Paste ready · Enter sends".to_owned());
                         pending_signal = render_enhanced_dock(
-                            &input,
-                            notice.as_deref(),
-                            DockInteraction::Idle,
+                            DockRenderModel {
+                                input: &input,
+                                notice: notice.as_deref(),
+                                interaction: DockInteraction::Idle,
+                                live: &live,
+                            },
                             &terminal,
                             &mut last_size,
                             signals,
                             &mut screen,
+                            &mut view,
                         )
                         .await?;
                     }
@@ -765,6 +851,7 @@ async fn shutdown_after_enhanced_error(
 enum EnhancedIdleEvent {
     Signal(UiSignal),
     Resize,
+    EscapeExpired,
     Eof,
     AutoSubmit,
     Bytes(usize),
@@ -798,6 +885,9 @@ enum PasteFenceOutcome {
 enum EnhancedSubmission {
     Empty,
     Help,
+    Inspect,
+    Review,
+    Focus,
     Exit,
     Prompt,
 }
@@ -806,6 +896,9 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
     match prompt.trim_matches(|character: char| character.is_ascii_whitespace()) {
         "" => EnhancedSubmission::Empty,
         "/help" => EnhancedSubmission::Help,
+        "/inspect" => EnhancedSubmission::Inspect,
+        "/review" => EnhancedSubmission::Review,
+        "/focus" => EnhancedSubmission::Focus,
         "/exit" | "/quit" => EnhancedSubmission::Exit,
         _ => EnhancedSubmission::Prompt,
     }
@@ -815,9 +908,17 @@ fn apply_enhanced_input(
     decoder: &mut KeyDecoder,
     bytes: &[u8],
     input: &mut InputMemory,
+    view: &mut ViewState,
     size: super::terminal::TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
+    if view.requested() != view.committed() {
+        decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+        return Ok(EnhancedInputAction::Redraw);
+    }
+    if view.committed().mode() != ViewMode::Focus {
+        return apply_detail_input(decoder, bytes, view, notice);
+    }
     let mut action = EnhancedInputAction::None;
     let width = usize::from(size.columns.saturating_sub(3)).max(1);
     let _ = decoder.feed(bytes, |decoded| {
@@ -846,6 +947,10 @@ fn apply_enhanced_input(
                 *notice = Some(error.to_string());
                 Ok(EnhancedInputAction::Redraw)
             }
+            InputEvent::Key(Key::Inspect) => view
+                .toggle_inspect()
+                .map(|()| EnhancedInputAction::Redraw)
+                .map_err(|_| InputMemoryError::InvalidState),
             InputEvent::Key(key) => apply_enhanced_key(key, input, width, notice),
         };
         match update {
@@ -854,6 +959,7 @@ fn apply_enhanced_input(
                 action = next;
                 if rejected
                     || completed_paste
+                    || view.requested() != view.committed()
                     || matches!(
                         next,
                         EnhancedInputAction::Submit | EnhancedInputAction::Exit
@@ -874,6 +980,127 @@ fn apply_enhanced_input(
     Ok(action)
 }
 
+fn apply_detail_input(
+    decoder: &mut KeyDecoder,
+    bytes: &[u8],
+    view: &mut ViewState,
+    notice: &mut Option<String>,
+) -> Result<EnhancedInputAction, InteractiveError> {
+    let mut action = EnhancedInputAction::None;
+    let _ = decoder.feed(bytes, |decoded| {
+        let completed = matches!(
+            &decoded.event,
+            InputEvent::Paste(_) | InputEvent::PasteRejected(_) | InputEvent::Rejected(_)
+        );
+        let next = match decoded.event {
+            InputEvent::PasteStarted => Ok(EnhancedInputAction::None),
+            InputEvent::Paste(_) | InputEvent::PasteRejected(_) | InputEvent::Rejected(_) => {
+                Ok(EnhancedInputAction::Redraw)
+            }
+            InputEvent::Key(key) => apply_detail_key(key, view),
+        };
+        match next {
+            Ok(EnhancedInputAction::None) => ControlFlow::Continue(()),
+            Ok(next) => {
+                action = next;
+                *notice = None;
+                if completed || view.requested() != view.committed() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+            Err(()) => {
+                action = EnhancedInputAction::Redraw;
+                *notice = Some("View navigation limit reached".to_owned());
+                ControlFlow::Break(())
+            }
+        }
+    });
+    Ok(action)
+}
+
+fn apply_detail_key(key: Key, view: &mut ViewState) -> Result<EnhancedInputAction, ()> {
+    let changed = match key {
+        Key::Inspect | Key::Escape | Key::Eof | Key::Char('q') => {
+            view.request_mode(ViewMode::Focus).map_err(|_| ())?
+        }
+        Key::Tab | Key::BackTab => {
+            view.switch_detail().map_err(|_| ())?;
+            true
+        }
+        Key::Up => view.scroll_lines(-1).map_err(|_| ())?,
+        Key::Down => view.scroll_lines(1).map_err(|_| ())?,
+        Key::PageUp => view.scroll_page(false).map_err(|_| ())?,
+        Key::PageDown => view.scroll_page(true).map_err(|_| ())?,
+        Key::Home => view.request_offset(0).map_err(|_| ())?,
+        Key::End => view.scroll_end().map_err(|_| ())?,
+        Key::Left => view.request_mode(ViewMode::Inspect).map_err(|_| ())?,
+        Key::Right => view.request_mode(ViewMode::Review).map_err(|_| ())?,
+        Key::Enter
+        | Key::Newline
+        | Key::Char(_)
+        | Key::Backspace
+        | Key::Delete
+        | Key::WordErase
+        | Key::ClearBefore
+        | Key::ClearAfter
+        | Key::Yank
+        | Key::Undo
+        | Key::ReverseSearch => false,
+    };
+    Ok(if changed {
+        EnhancedInputAction::Redraw
+    } else {
+        EnhancedInputAction::None
+    })
+}
+
+fn refresh_decoder_escape_deadline(decoder: &KeyDecoder, deadline: &mut Option<Instant>) {
+    if decoder.escape_pending() {
+        if deadline.is_none() {
+            *deadline = Some(Instant::now() + ESCAPE_SEQUENCE_WAIT);
+        }
+    } else {
+        *deadline = None;
+    }
+}
+
+fn expire_enhanced_escape(
+    decoder: &mut KeyDecoder,
+    input: &mut InputMemory,
+    view: &mut ViewState,
+    size: TerminalSize,
+    notice: &mut Option<String>,
+) -> Result<EnhancedInputAction, InteractiveError> {
+    if view.requested() != view.committed() {
+        decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+        return Ok(EnhancedInputAction::Redraw);
+    }
+    let Some(decoded) = decoder.expire_escape() else {
+        return Ok(EnhancedInputAction::None);
+    };
+    match decoded.event {
+        InputEvent::Key(key) if view.committed().mode() == ViewMode::Focus => apply_enhanced_key(
+            key,
+            input,
+            usize::from(size.columns.saturating_sub(3)).max(1),
+            notice,
+        )
+        .map_err(InteractiveError::from),
+        InputEvent::Key(key) => apply_detail_key(key, view)
+            .map_err(|()| InteractiveError::Agent)
+            .inspect(|_| *notice = None),
+        InputEvent::Rejected(error) => {
+            *notice = Some(error.to_string());
+            Ok(EnhancedInputAction::Redraw)
+        }
+        InputEvent::PasteStarted | InputEvent::Paste(_) | InputEvent::PasteRejected(_) => {
+            Err(InteractiveError::Agent)
+        }
+    }
+}
+
 fn apply_enhanced_key(
     key: Key,
     input: &mut InputMemory,
@@ -885,7 +1112,10 @@ fn apply_enhanced_key(
         Key::Enter => return Ok(EnhancedInputAction::Submit),
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
-            *notice = Some("/help · /exit · Enter send · Ctrl+J newline".to_owned());
+            *notice = Some(
+                "/inspect · /review · /focus · /help · /exit · Enter send · Ctrl+J newline"
+                    .to_owned(),
+            );
             return Ok(EnhancedInputAction::Redraw);
         }
         Key::Char(character) => input.insert_char(character)?,
@@ -913,6 +1143,7 @@ fn apply_enhanced_key(
             });
             return Ok(EnhancedInputAction::Redraw);
         }
+        Key::Inspect | Key::PageUp | Key::PageDown => return Ok(EnhancedInputAction::None),
         Key::Escape => {
             *notice = None;
             return Ok(EnhancedInputAction::Redraw);
@@ -940,13 +1171,12 @@ fn apply_enhanced_key(
 }
 
 async fn render_enhanced_dock(
-    input: &InputMemory,
-    notice: Option<&str>,
-    interaction: DockInteraction,
+    model: DockRenderModel<'_>,
     terminal: &TerminalSession,
     last_size: &mut TerminalSize,
     signals: &mut SignalStreams,
     screen: &mut InlineScreen,
+    view: &mut ViewState,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     loop {
         if screen.is_poisoned() {
@@ -958,18 +1188,19 @@ async fn render_enhanced_dock(
         }
         let size = terminal.size().unwrap_or(*last_size);
         let resized = size != *last_size;
-        let frame = enhanced_dock_frame(input, notice, interaction, size)?;
-        let write = if screen.is_detached() {
-            screen.stage_attach(screen_size(size), &frame, true)
-        } else if resized {
-            screen.stage_resize(screen_size(size), &frame, true)
-        } else {
-            screen.stage_dock(&frame, true)
-        }
-        .map_err(map_inline_screen_error)?;
+        let surface = enhanced_surface_frame(
+            model.input,
+            model.notice,
+            model.interaction,
+            size,
+            view,
+            model.live,
+        )?;
+        let write = stage_surface(screen, size, resized, &surface.frame)?;
         match write_screen_transaction(terminal.output_terminal(), signals, screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 *last_size = size;
+                commit_surface(view, surface.commit);
                 return Ok(None);
             }
             ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
@@ -989,6 +1220,7 @@ async fn render_active_dock(
     input: &InputMemory,
     notice: Option<&str>,
     interaction: DockInteraction,
+    live: &LiveRenderer,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
     dock: &mut ActiveDock<'_>,
@@ -1001,18 +1233,12 @@ async fn render_active_dock(
         }
         let size = terminal.size().unwrap_or(*dock.last_size);
         let resized = size != *dock.last_size;
-        let frame = enhanced_dock_frame(input, notice, interaction, size)?;
-        let write = if dock.screen.is_detached() {
-            dock.screen.stage_attach(screen_size(size), &frame, true)
-        } else if resized {
-            dock.screen.stage_resize(screen_size(size), &frame, true)
-        } else {
-            dock.screen.stage_dock(&frame, true)
-        }
-        .map_err(map_inline_screen_error)?;
+        let surface = enhanced_surface_frame(input, notice, interaction, size, dock.view, live)?;
+        let write = stage_surface(dock.screen, size, resized, &surface.frame)?;
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 *dock.last_size = size;
+                commit_surface(dock.view, surface.commit);
                 return Ok(None);
             }
             ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
@@ -1054,6 +1280,103 @@ fn enhanced_dock_frame(
         size.columns,
     )
     .map_err(map_dock_error)
+}
+
+fn enhanced_surface_frame(
+    input: &InputMemory,
+    notice: Option<&str>,
+    interaction: DockInteraction,
+    size: TerminalSize,
+    view: &mut ViewState,
+    live: &LiveRenderer,
+) -> Result<EnhancedSurface, InteractiveError> {
+    if !matches!(
+        interaction,
+        DockInteraction::Idle | DockInteraction::Running
+    ) || size.columns < MIN_ENHANCED_COLUMNS
+        || size.rows < MIN_ENHANCED_ROWS
+    {
+        let _ = view
+            .request_mode(ViewMode::Focus)
+            .map_err(|_| InteractiveError::Output)?;
+    }
+    let request = view.requested();
+    enhanced_surface_frame_for_request(input, notice, interaction, size, request, live)
+}
+
+fn enhanced_surface_frame_for_request(
+    input: &InputMemory,
+    notice: Option<&str>,
+    interaction: DockInteraction,
+    size: TerminalSize,
+    request: ViewRequest,
+    live: &LiveRenderer,
+) -> Result<EnhancedSurface, InteractiveError> {
+    match request.mode() {
+        ViewMode::Focus => Ok(EnhancedSurface {
+            frame: enhanced_dock_frame(input, notice, interaction, size)?,
+            commit: SurfaceCommit {
+                request,
+                offset: 0,
+                total_rows: 0,
+                page_rows: 0,
+            },
+        }),
+        ViewMode::Inspect | ViewMode::Review => {
+            let document = if request.mode() == ViewMode::Inspect {
+                live.inspect_document()
+            } else {
+                live.review_document()
+            }
+            .map_err(|_| InteractiveError::Output)?;
+            if document.mode() != request.mode() {
+                return Err(InteractiveError::Output);
+            }
+            let (frame, viewport) =
+                DockFrame::layout_detail(&document, request.offset(), size.rows, size.columns)
+                    .map_err(map_dock_error)?;
+            Ok(EnhancedSurface {
+                frame,
+                commit: surface_commit(request, viewport),
+            })
+        }
+    }
+}
+
+fn surface_commit(request: ViewRequest, viewport: DetailViewport) -> SurfaceCommit {
+    SurfaceCommit {
+        request,
+        offset: viewport.offset,
+        total_rows: viewport.total_rows,
+        page_rows: viewport.page_rows,
+    }
+}
+
+fn commit_surface(view: &mut ViewState, commit: SurfaceCommit) {
+    let _ = view.commit(
+        commit.request,
+        commit.offset,
+        commit.total_rows,
+        commit.page_rows,
+    );
+}
+
+fn stage_surface(
+    screen: &InlineScreen,
+    size: TerminalSize,
+    resized: bool,
+    frame: &DockFrame,
+) -> Result<PendingScreenWrite, InteractiveError> {
+    let write = if screen.is_detached() {
+        screen.stage_attach(screen_size(size), frame, true)
+    } else if resized {
+        screen.stage_resize(screen_size(size), frame, true)
+    } else if screen.dock_rows() != Some(frame.rows().map_err(map_dock_error)?) {
+        screen.stage_reanchor_bottom(frame, true)
+    } else {
+        screen.stage_dock(frame, true)
+    };
+    write.map_err(map_inline_screen_error)
 }
 
 fn map_inline_screen_error(error: InlineScreenError) -> InteractiveError {
@@ -1176,14 +1499,36 @@ fn copy_enhanced_prompt(prompt: &str) -> Result<String, InteractiveError> {
     Ok(copy)
 }
 
+fn session_context_estimate(
+    session: &crate::session::Session,
+    sampled_after_turn: Option<TurnId>,
+    expected_next_seq: Option<EventSeq>,
+) -> Option<ContextEstimate> {
+    let at_next_seq = session.next_seq()?;
+    if expected_next_seq.is_some_and(|expected| expected != at_next_seq) {
+        return None;
+    }
+    let used_tokens = session.context_total_tokens().ok()?;
+    let context = session.request_context();
+    ContextEstimate::new(
+        at_next_seq,
+        context.and_then(|context| context.provider()),
+        context.and_then(|context| context.model()),
+        used_tokens,
+        context.and_then(|context| context.context_window().map(|value| value.get())),
+        sampled_after_turn,
+    )
+    .ok()
+}
+
 async fn suspend_enhanced(
     terminal: &mut TerminalSession,
     signals: &mut SignalStreams,
     decoder: &mut KeyDecoder,
-    input: &InputMemory,
-    notice: Option<&str>,
+    model: DockRenderModel<'_>,
     screen: &mut InlineScreen,
     last_size: &mut TerminalSize,
+    view: &mut ViewState,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     if !screen.is_detached() && !screen.is_poisoned() {
         let write = screen.stage_detach().map_err(map_inline_screen_error)?;
@@ -1236,16 +1581,7 @@ async fn suspend_enhanced(
                     return Ok(Some(signal));
                 }
             }
-            return render_enhanced_dock(
-                input,
-                notice,
-                DockInteraction::Idle,
-                terminal,
-                last_size,
-                signals,
-                screen,
-            )
-            .await;
+            return render_enhanced_dock(model, terminal, last_size, signals, screen, view).await;
         }
     }
 }
@@ -1264,7 +1600,8 @@ async fn run_linear(
         session_id,
         resumed,
     } = assembly;
-    let mut live = LiveRenderer::new();
+    let mut live = LiveRenderer::for_session(resumed);
+    live.set_context_estimate(session_context_estimate(agent.session(), None, None));
     let mut presenter = InteractivePresenter::with_color(color);
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
     let mut scratch = [0_u8; TERMINAL_READ_BYTES];
@@ -1377,6 +1714,28 @@ async fn run_linear(
                             }
                         }
                     }
+                    IdleInput::Inspect | IdleInput::Review => {
+                        let document = if matches!(
+                            classify_idle_record(&text, terminated_by_lf),
+                            IdleInput::Inspect
+                        ) {
+                            live.inspect_document()
+                        } else {
+                            live.review_document()
+                        }
+                        .map_err(|_| InteractiveError::Output)?;
+                        let frame = LiveFrame::detail_document(&document)
+                            .map_err(|_| InteractiveError::Output)?;
+                        if let Some(signal) =
+                            write_frame(frame, &mut presenter, &terminal, signals).await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
                     IdleInput::Exit => return Ok(InteractiveExit::Ordinary(0)),
                     IdleInput::Submit(prompt) => {
                         parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
@@ -1480,6 +1839,15 @@ struct ActiveTurn<'a> {
 struct ActiveDock<'a> {
     screen: &'a mut InlineScreen,
     last_size: &'a mut TerminalSize,
+    view: &'a mut ViewState,
+}
+
+#[derive(Clone, Copy)]
+struct DockRenderModel<'a> {
+    input: &'a InputMemory,
+    notice: Option<&'a str>,
+    interaction: DockInteraction,
+    live: &'a LiveRenderer,
 }
 
 enum ApprovalUiState<'a> {
@@ -1773,6 +2141,7 @@ async fn next_turn_signal(signals: &mut SignalStreams, enhanced: bool) -> Intera
 
 async fn redraw_active_after_resize(
     enhanced: bool,
+    live: &LiveRenderer,
     input: Option<&InputMemory>,
     notice: Option<&str>,
     terminal: &AsyncTerminal,
@@ -1786,6 +2155,7 @@ async fn redraw_active_after_resize(
         input.ok_or(InteractiveError::Agent)?,
         notice,
         DockInteraction::Running,
+        live,
         terminal,
         signals,
         dock.ok_or(InteractiveError::Agent)?,
@@ -1833,6 +2203,7 @@ async fn reconcile_active_geometry(
     input: Option<&InputMemory>,
     notice: Option<&str>,
     interaction: DockInteraction,
+    live: &LiveRenderer,
     dock: Option<&mut ActiveDock<'_>>,
     pending: &mut Option<PendingOutput>,
     presenter: Option<&mut EnhancedPresenter>,
@@ -1853,6 +2224,7 @@ async fn reconcile_active_geometry(
         input.ok_or(InteractiveError::Agent)?,
         notice,
         interaction,
+        live,
         terminal,
         signals,
         dock,
@@ -1886,6 +2258,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
     let mut stop = None;
     let mut prefer_input = true;
     let mut dock_redraw_requested = false;
+    let mut input_escape_deadline = None;
 
     let result = {
         let future = active
@@ -1918,6 +2291,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 active.queued_input.as_deref(),
                 active.queue_notice.as_deref().and_then(Option::as_deref),
                 approval_ui.dock_interaction(),
+                active.live,
                 active.active_dock.as_mut(),
                 &mut pending,
                 active.enhanced_presenter.as_deref_mut(),
@@ -1950,6 +2324,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 &mut approval_ui,
                 &mut turn_end_rendered,
                 active.presenter,
+                active.live,
                 active.terminal,
                 active.parser,
                 active.enhanced,
@@ -1970,6 +2345,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             if pending.is_none() && mem::take(&mut dock_redraw_requested) {
                 match redraw_active_after_resize(
                     active.enhanced,
+                    active.live,
                     active.queued_input.as_deref(),
                     active.queue_notice.as_deref().and_then(Option::as_deref),
                     active.terminal,
@@ -1993,6 +2369,51 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 }
             }
             if pending.is_none() && active.joins.question().is_some() && approval_ui.is_inactive() {
+                if active.enhanced {
+                    active
+                        .enhanced_decoder
+                        .as_deref_mut()
+                        .ok_or(InteractiveError::Agent)?
+                        .reset_epoch()
+                        .map_err(|_| InteractiveError::Agent)?;
+                    input_escape_deadline = None;
+                    let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
+                    let _ = dock
+                        .view
+                        .request_mode(ViewMode::Focus)
+                        .map_err(|_| InteractiveError::Output)?;
+                    match render_active_dock(
+                        active
+                            .queued_input
+                            .as_deref()
+                            .ok_or(InteractiveError::Agent)?,
+                        active.queue_notice.as_deref().and_then(Option::as_deref),
+                        DockInteraction::Running,
+                        active.live,
+                        active.terminal,
+                        active.signals,
+                        dock,
+                    )
+                    .await
+                    {
+                        Ok(Some(signal)) => {
+                            observe_signal(&mut stop, signal);
+                            cancellation.cancel();
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            latch_active_failure(
+                                &mut stop,
+                                &cancellation,
+                                &mut pending,
+                                active.presenter,
+                                error,
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let enqueue = approval_frame(active.joins, false).and_then(|frame| {
                     enqueue_frame(
                         frame,
@@ -2032,6 +2453,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 frame_deadline,
                 approval_ui.arm_deadline(),
                 approval_ui.escape_deadline(),
+                input_escape_deadline,
                 !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
@@ -2054,6 +2476,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                     .as_deref()
                                     .and_then(Option::as_deref),
                                 approval_ui.dock_interaction(),
+                                active.live,
                                 active.active_dock.as_mut(),
                                 &mut pending,
                                 active.enhanced_presenter.as_deref_mut(),
@@ -2141,6 +2564,28 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 ),
                             }
                         }
+                        UiWork::InputEscapeExpired => {
+                            input_escape_deadline = None;
+                            match handle_active_escape_expiry(
+                                active.terminal,
+                                active.enhanced_decoder.as_deref_mut(),
+                                active.queued_input.as_deref_mut(),
+                                active.active_dock.as_mut().map(|dock| &mut *dock.view),
+                                active.queue_notice.as_deref_mut(),
+                            )? {
+                                ActiveInputOutcome::Continue => {}
+                                ActiveInputOutcome::Redraw => dock_redraw_requested = true,
+                                ActiveInputOutcome::PasteFence | ActiveInputOutcome::Eof => {
+                                    latch_active_failure(
+                                        &mut stop,
+                                        &cancellation,
+                                        &mut pending,
+                                        active.presenter,
+                                        InteractiveError::Agent,
+                                    );
+                                }
+                            }
+                        }
                         UiWork::Write(write) => match write {
                         Ok(count) => {
                             let advanced = pending
@@ -2198,6 +2643,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         prompt_committed: active.prompt_committed,
                                         expected_prompt: &active.prompt,
                                         render_committed_prompt: active.enhanced,
+                                        detail_view_requested: active.active_dock.as_ref().is_some_and(
+                                            |dock| dock.view.requested().mode() != ViewMode::Focus,
+                                        ),
                                         dock_notice: active.queue_notice.as_deref_mut(),
                                         dock_redraw_requested: active
                                             .enhanced
@@ -2271,13 +2719,18 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             } else if approval_ui.is_inactive() {
                                 let input_outcome = handle_active_input(
                                     active.terminal,
-                                    active.parser,
                                     active.enhanced_decoder.as_deref_mut(),
                                     active.queued_input.as_deref_mut(),
+                                    active.active_dock.as_mut().map(|dock| &mut *dock.view),
                                     active.queue_notice.as_deref_mut(),
                                     &active.scratch[..count],
-                                    count < TERMINAL_READ_BYTES,
                                 )?;
+                                if let Some(decoder) = active.enhanced_decoder.as_deref() {
+                                    refresh_decoder_escape_deadline(
+                                        decoder,
+                                        &mut input_escape_deadline,
+                                    );
+                                }
                                 match input_outcome {
                                     ActiveInputOutcome::Continue => {}
                                     ActiveInputOutcome::Eof => {
@@ -2302,6 +2755,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                     .as_deref()
                                                     .and_then(Option::as_deref),
                                                 DockInteraction::Running,
+                                                active.live,
                                                 active.terminal,
                                                 active.signals,
                                                 dock,
@@ -2341,6 +2795,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                         .ok_or(InteractiveError::Agent)?
                                                         .reset_epoch()
                                                         .map_err(|_| InteractiveError::Agent)?;
+                                                    input_escape_deadline = None;
                                                     *active
                                                         .queue_notice
                                                         .as_deref_mut()
@@ -2427,6 +2882,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 active.queued_input.as_deref(),
                 active.queue_notice.as_deref().and_then(Option::as_deref),
                 approval_ui.dock_interaction(),
+                active.live,
                 active.active_dock.as_mut(),
                 &mut pending,
                 active.enhanced_presenter.as_deref_mut(),
@@ -2452,6 +2908,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 &mut approval_ui,
                 &mut turn_end_rendered,
                 active.presenter,
+                active.live,
                 active.terminal,
                 active.parser,
                 active.enhanced,
@@ -2467,6 +2924,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             if pending.is_none() && mem::take(&mut dock_redraw_requested) {
                 match redraw_active_after_resize(
                     active.enhanced,
+                    active.live,
                     active.queued_input.as_deref(),
                     active.queue_notice.as_deref().and_then(Option::as_deref),
                     active.terminal,
@@ -2501,6 +2959,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 frame_deadline,
                 approval_ui.arm_deadline(),
                 approval_ui.escape_deadline(),
+                input_escape_deadline,
                 !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
@@ -2522,6 +2981,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                     .as_deref()
                                     .and_then(Option::as_deref),
                                 approval_ui.dock_interaction(),
+                                active.live,
                                 active.active_dock.as_mut(),
                                 &mut pending,
                                 active.enhanced_presenter.as_deref_mut(),
@@ -2596,6 +3056,23 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 }
                             }
                         }
+                        UiWork::InputEscapeExpired => {
+                            input_escape_deadline = None;
+                            match handle_active_escape_expiry(
+                                active.terminal,
+                                active.enhanced_decoder.as_deref_mut(),
+                                active.queued_input.as_deref_mut(),
+                                active.active_dock.as_mut().map(|dock| &mut *dock.view),
+                                active.queue_notice.as_deref_mut(),
+                            )? {
+                                ActiveInputOutcome::Continue => {}
+                                ActiveInputOutcome::Redraw => dock_redraw_requested = true,
+                                ActiveInputOutcome::PasteFence | ActiveInputOutcome::Eof => {
+                                    observe_failure(&mut stop, InteractiveError::Agent);
+                                    discard_pending(&mut pending, active.presenter);
+                                }
+                            }
+                        }
                         UiWork::Write(write) => match write {
                             Ok(count) => {
                                 let advanced = pending
@@ -2640,6 +3117,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         prompt_committed: active.prompt_committed,
                                         expected_prompt: &active.prompt,
                                         render_committed_prompt: active.enhanced,
+                                        detail_view_requested: active.active_dock.as_ref().is_some_and(
+                                            |dock| dock.view.requested().mode() != ViewMode::Focus,
+                                        ),
                                         dock_notice: active.queue_notice.as_deref_mut(),
                                         dock_redraw_requested: active
                                             .enhanced
@@ -2696,13 +3176,18 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             } else if approval_ui.is_inactive() {
                                 let input_outcome = handle_active_input(
                                     active.terminal,
-                                    active.parser,
                                     active.enhanced_decoder.as_deref_mut(),
                                     active.queued_input.as_deref_mut(),
+                                    active.active_dock.as_mut().map(|dock| &mut *dock.view),
                                     active.queue_notice.as_deref_mut(),
                                     &active.scratch[..count],
-                                    count < TERMINAL_READ_BYTES,
                                 )?;
+                                if let Some(decoder) = active.enhanced_decoder.as_deref() {
+                                    refresh_decoder_escape_deadline(
+                                        decoder,
+                                        &mut input_escape_deadline,
+                                    );
+                                }
                                 match input_outcome {
                                     ActiveInputOutcome::Continue => {}
                                     ActiveInputOutcome::Eof => {
@@ -2726,6 +3211,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                     .as_deref()
                                                     .and_then(Option::as_deref),
                                                 DockInteraction::Running,
+                                                active.live,
                                                 active.terminal,
                                                 active.signals,
                                                 dock,
@@ -2764,6 +3250,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                         .ok_or(InteractiveError::Agent)?
                                                         .reset_epoch()
                                                         .map_err(|_| InteractiveError::Agent)?;
+                                                    input_escape_deadline = None;
                                                     *active
                                                         .queue_notice
                                                         .as_deref_mut()
@@ -2811,16 +3298,40 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
         observe_failure(&mut stop, error);
     }
 
+    if stop.is_none() {
+        if let Ok(outcome) = &result {
+            let expected_next_seq = outcome
+                .turn_end_seq()
+                .get()
+                .checked_add(1)
+                .and_then(|value| EventSeq::new(value).ok());
+            active
+                .live
+                .set_context_estimate(expected_next_seq.and_then(|expected| {
+                    session_context_estimate(
+                        active.agent.session(),
+                        Some(outcome.turn()),
+                        Some(expected),
+                    )
+                }));
+            active.live.freeze_joined_review(outcome);
+        }
+    }
+
     if active.enhanced && stop.is_none() {
         if let Ok(outcome) = &result {
             match active.live.receipt_frame(outcome) {
                 Ok(frame) => match write_enhanced_terminal_frame(
                     frame,
-                    active
-                        .queued_input
-                        .as_deref()
-                        .ok_or(InteractiveError::Agent)?,
-                    active.queue_notice.as_deref().and_then(Option::as_deref),
+                    DockRenderModel {
+                        input: active
+                            .queued_input
+                            .as_deref()
+                            .ok_or(InteractiveError::Agent)?,
+                        notice: active.queue_notice.as_deref().and_then(Option::as_deref),
+                        interaction: DockInteraction::Running,
+                        live: active.live,
+                    },
                     active
                         .enhanced_presenter
                         .as_deref_mut()
@@ -2862,6 +3373,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
         skipped,
         turn_end_rendered,
         active.presenter,
+        active.live,
         active.terminal,
         active.signals,
         active.enhanced,
@@ -2895,21 +3407,21 @@ enum ActiveInputOutcome {
 
 fn handle_active_input(
     terminal: &AsyncTerminal,
-    _parser: &mut CanonicalRecordParser,
     decoder: Option<&mut KeyDecoder>,
     input: Option<&mut InputMemory>,
+    view: Option<&mut ViewState>,
     notice: Option<&mut Option<String>>,
     bytes: &[u8],
-    _boundary: bool,
 ) -> Result<ActiveInputOutcome, InteractiveError> {
-    let (Some(decoder), Some(input), Some(notice)) = (decoder, input, notice) else {
+    let (Some(decoder), Some(input), Some(view), Some(notice)) = (decoder, input, view, notice)
+    else {
         return Ok(ActiveInputOutcome::Continue);
     };
     let size = terminal.size().unwrap_or(TerminalSize {
         rows: MIN_ENHANCED_ROWS,
         columns: MIN_ENHANCED_COLUMNS,
     });
-    match apply_enhanced_input(decoder, bytes, input, size, notice)? {
+    match apply_enhanced_input(decoder, bytes, input, view, size, notice)? {
         EnhancedInputAction::None => Ok(ActiveInputOutcome::Continue),
         EnhancedInputAction::Redraw => Ok(ActiveInputOutcome::Redraw),
         EnhancedInputAction::PasteFence => Ok(ActiveInputOutcome::PasteFence),
@@ -2918,8 +3430,26 @@ fn handle_active_input(
             match classify_enhanced_submission(input.composer().text()) {
                 EnhancedSubmission::Exit => return Ok(ActiveInputOutcome::Eof),
                 EnhancedSubmission::Help => {
-                    *notice =
-                        Some("/help | /exit | /quit | Enter queue | Ctrl+J newline".to_owned());
+                    *notice = Some(
+                        "/inspect | /review | /focus | /help | /exit | Enter queue | Ctrl+J newline"
+                            .to_owned(),
+                    );
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Inspect
+                | EnhancedSubmission::Review
+                | EnhancedSubmission::Focus => {
+                    let mode = match classify_enhanced_submission(input.composer().text()) {
+                        EnhancedSubmission::Inspect => ViewMode::Inspect,
+                        EnhancedSubmission::Review => ViewMode::Review,
+                        EnhancedSubmission::Focus => ViewMode::Focus,
+                        _ => return Err(InteractiveError::Agent),
+                    };
+                    let _ = input.take_draft_for_turn()?;
+                    let _ = view
+                        .request_mode(mode)
+                        .map_err(|_| InteractiveError::Output)?;
+                    *notice = None;
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -2941,6 +3471,29 @@ fn handle_active_input(
             }
             Ok(ActiveInputOutcome::Redraw)
         }
+    }
+}
+
+fn handle_active_escape_expiry(
+    terminal: &AsyncTerminal,
+    decoder: Option<&mut KeyDecoder>,
+    input: Option<&mut InputMemory>,
+    view: Option<&mut ViewState>,
+    notice: Option<&mut Option<String>>,
+) -> Result<ActiveInputOutcome, InteractiveError> {
+    let (Some(decoder), Some(input), Some(view), Some(notice)) = (decoder, input, view, notice)
+    else {
+        return Ok(ActiveInputOutcome::Continue);
+    };
+    let size = terminal.size().unwrap_or(TerminalSize {
+        rows: MIN_ENHANCED_ROWS,
+        columns: MIN_ENHANCED_COLUMNS,
+    });
+    match expire_enhanced_escape(decoder, input, view, size, notice)? {
+        EnhancedInputAction::None => Ok(ActiveInputOutcome::Continue),
+        EnhancedInputAction::Redraw => Ok(ActiveInputOutcome::Redraw),
+        EnhancedInputAction::PasteFence => Ok(ActiveInputOutcome::PasteFence),
+        EnhancedInputAction::Exit | EnhancedInputAction::Submit => Err(InteractiveError::Agent),
     }
 }
 
@@ -3013,6 +3566,11 @@ fn process_event(
                 }
             }
         }
+        if targets.detail_view_requested {
+            if let Some(redraw) = targets.dock_redraw_requested.as_deref_mut() {
+                *redraw = true;
+            }
+        }
     }
     let product_frame = update.take_frame(targets.render_committed_prompt);
     let frame = match (committed_prompt, product_frame) {
@@ -3043,6 +3601,7 @@ struct EventTargets<'a, 'terminal> {
     prompt_committed: &'a mut bool,
     expected_prompt: &'a str,
     render_committed_prompt: bool,
+    detail_view_requested: bool,
     dock_notice: Option<&'a mut Option<String>>,
     dock_redraw_requested: Option<&'a mut bool>,
 }
@@ -3210,6 +3769,7 @@ fn complete_ready_frame(
     approval_ui: &mut ApprovalUiState<'_>,
     turn_end_rendered: &mut bool,
     presenter: &mut InteractivePresenter,
+    live: &LiveRenderer,
     terminal: &AsyncTerminal,
     parser: &mut CanonicalRecordParser,
     enhanced: bool,
@@ -3248,14 +3808,22 @@ fn complete_ready_frame(
             if size != *dock.last_size {
                 return Err(InteractiveError::TerminalUnsupported);
             }
-            let dock_frame = enhanced_dock_frame(input, notice, DockInteraction::Running, size)?;
+            let surface = enhanced_surface_frame_for_request(
+                input,
+                notice,
+                DockInteraction::Running,
+                size,
+                dock.view.committed(),
+                live,
+            )?;
             let write = dock
                 .screen
-                .stage_transcript(presentation.chunk(), &dock_frame, true)
+                .stage_transcript(presentation.chunk(), &surface.frame, true)
                 .map_err(map_inline_screen_error)?;
             Ok(PendingOutput::Inline(PendingInlineOutput {
                 write,
                 intent: InlineIntent::Transcript(presentation),
+                surface: surface.commit,
             }))
         })();
         match staged {
@@ -3274,14 +3842,12 @@ fn complete_ready_frame(
         if size != *dock.last_size {
             return Err(InteractiveError::TerminalUnsupported);
         }
-        let dock_frame = enhanced_dock_frame(input, notice, interaction, size)?;
-        let write = dock
-            .screen
-            .stage_dock(&dock_frame, true)
-            .map_err(map_inline_screen_error)?;
+        let surface = enhanced_surface_frame(input, notice, interaction, size, dock.view, live)?;
+        let write = stage_surface(dock.screen, size, false, &surface.frame)?;
         *pending = Some(PendingOutput::Inline(PendingInlineOutput {
             write,
             intent: InlineIntent::Dock(interaction),
+            surface: surface.commit,
         }));
     }
     let Some(frame) = pending.as_mut() else {
@@ -3316,6 +3882,7 @@ fn complete_ready_frame(
             dock.screen
                 .commit(output.write)
                 .map_err(map_inline_screen_error)?;
+            commit_surface(dock.view, output.surface);
             if let InlineIntent::Transcript(presentation) = output.intent {
                 transcript_presenter
                     .take()
@@ -3369,6 +3936,7 @@ enum UiWork {
     FrameExpired,
     ApprovalArmed,
     EscapeExpired,
+    InputEscapeExpired,
     Write(std::io::Result<usize>),
     Envelope(Option<ApprovalEnvelope>),
     Event(Option<crate::session::CommittedUiEvent>),
@@ -3385,6 +3953,7 @@ async fn next_ui_work(
     frame_deadline: Option<Instant>,
     approval_arm_deadline: Option<Instant>,
     escape_deadline: Option<Instant>,
+    input_escape_deadline: Option<Instant>,
     read_enabled: bool,
     prefer_input: bool,
 ) -> UiWork {
@@ -3392,12 +3961,15 @@ async fn next_ui_work(
     let arm_deadline = approval_arm_deadline.unwrap_or_else(Instant::now);
     let escape_pending = escape_deadline.is_some();
     let escape_deadline_at = escape_deadline.unwrap_or_else(Instant::now);
+    let input_escape_pending = input_escape_deadline.is_some();
+    let input_escape_deadline_at = input_escape_deadline.unwrap_or_else(Instant::now);
     if prefer_input {
         tokio::select! {
             biased;
             () = tokio::time::sleep_until(deadline), if pending.is_some() => UiWork::FrameExpired,
             () = tokio::time::sleep_until(arm_deadline), if approval_arm_deadline.is_some() => UiWork::ApprovalArmed,
             () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
+            () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
             read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
@@ -3409,6 +3981,7 @@ async fn next_ui_work(
             () = tokio::time::sleep_until(deadline), if pending.is_some() => UiWork::FrameExpired,
             () = tokio::time::sleep_until(arm_deadline), if approval_arm_deadline.is_some() => UiWork::ApprovalArmed,
             () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
+            () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
@@ -3562,6 +4135,7 @@ async fn finish_turn_disposition(
     skipped: usize,
     turn_end_rendered: bool,
     presenter: &mut InteractivePresenter,
+    live: &LiveRenderer,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
     defer_suspend: bool,
@@ -3578,8 +4152,12 @@ async fn finish_turn_disposition(
                 let signal = if defer_suspend {
                     write_enhanced_terminal_frame(
                         frame,
-                        input.ok_or(InteractiveError::Agent)?,
-                        notice,
+                        DockRenderModel {
+                            input: input.ok_or(InteractiveError::Agent)?,
+                            notice,
+                            interaction: DockInteraction::Running,
+                            live,
+                        },
                         enhanced_presenter.ok_or(InteractiveError::Agent)?,
                         terminal,
                         signals,
@@ -3611,8 +4189,7 @@ async fn finish_turn_disposition(
 
 async fn write_enhanced_terminal_frame(
     frame: LiveFrame,
-    input: &InputMemory,
-    notice: Option<&str>,
+    model: DockRenderModel<'_>,
     presenter: &mut EnhancedPresenter,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
@@ -3632,9 +4209,10 @@ async fn write_enhanced_terminal_frame(
         let size = terminal.size().unwrap_or(*dock.last_size);
         if dock.screen.is_detached() || size != *dock.last_size {
             if let Some(signal) = render_active_dock(
-                input,
-                notice,
-                DockInteraction::Running,
+                model.input,
+                model.notice,
+                model.interaction,
+                model.live,
                 terminal,
                 signals,
                 dock,
@@ -3653,13 +4231,21 @@ async fn write_enhanced_terminal_frame(
         if size != *dock.last_size {
             continue;
         }
-        let dock_frame = enhanced_dock_frame(input, notice, DockInteraction::Running, size)?;
+        let surface = enhanced_surface_frame_for_request(
+            model.input,
+            model.notice,
+            model.interaction,
+            size,
+            dock.view.committed(),
+            model.live,
+        )?;
         let write = dock
             .screen
-            .stage_transcript(presentation.chunk(), &dock_frame, true)
+            .stage_transcript(presentation.chunk(), &surface.frame, true)
             .map_err(map_inline_screen_error)?;
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
+                commit_surface(dock.view, surface.commit);
                 presenter.commit(presentation);
                 return Ok(None);
             }
@@ -3768,10 +4354,11 @@ fn discard_ready_updates_after_stop(
 mod tests {
     use super::{
         AfterFrame, ApprovalUiUpdate, InlineIntent, InteractiveError, InteractiveExit,
-        InteractivePresentation, PendingInlineOutput, PendingOutput, StopIntent,
-        apply_approval_update, discard_ready_updates_after_stop, latch_observer_fault,
-        observe_enhanced_cleanup_signal, observe_failure, observe_signal,
-        prepare_pending_for_resize, presentation_uses_enhanced, turn_exhausted_session_capacity,
+        InteractivePresentation, PendingInlineOutput, PendingOutput, StopIntent, SurfaceCommit,
+        apply_approval_update, apply_enhanced_input, discard_ready_updates_after_stop,
+        expire_enhanced_escape, latch_observer_fault, observe_enhanced_cleanup_signal,
+        observe_failure, observe_signal, prepare_pending_for_resize, presentation_uses_enhanced,
+        session_context_estimate, turn_exhausted_session_capacity,
     };
     use crate::{
         agent::{ApprovalPrompt, ApprovalRequest},
@@ -3783,15 +4370,17 @@ mod tests {
             terminal::TerminalSize,
         },
         entropy::{EntropyError, EntropySource},
-        model::{CallId, ContentBlock, LlmFailure, Message, MessageSource},
+        model::{CallId, ContentBlock, LlmFailure, Message, MessageSource, NonNegativeSafeInteger},
         session::{
-            ApprovalOutcome, ApprovalRequestId, EventKind, MAX_SESSION_EVENTS, NewEvent, Session,
-            SurfaceIntent, TurnEndReason,
+            ApprovalOutcome, ApprovalRequestId, EventKind, MAX_SESSION_EVENTS, NewEvent,
+            RequestContext, Session, SurfaceIntent, TurnEndReason,
         },
         tui::{
             dock::{DockApprovalSelection, DockInteraction},
             inline_screen::InlineScreen,
             input_memory::InputMemory,
+            key_decoder::KeyDecoder,
+            view::{ViewMode, ViewState},
         },
     };
     use tokio::sync::oneshot;
@@ -3850,6 +4439,111 @@ mod tests {
     }
 
     #[test]
+    fn view_transitions_discard_same_read_submission_and_wait_for_screen_commit() {
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        input.insert_text("SAFE_DRAFT").unwrap();
+        let mut view = ViewState::default();
+        let mut notice = None;
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+
+        let action = apply_enhanced_input(
+            &mut decoder,
+            b"\x0f\r",
+            &mut input,
+            &mut view,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(action, super::EnhancedInputAction::Redraw);
+        assert_eq!(view.requested().mode(), ViewMode::Inspect);
+        assert_eq!(view.committed().mode(), ViewMode::Focus);
+        assert_eq!(input.composer().text(), "SAFE_DRAFT");
+        assert_eq!(input.queue().len(), 0);
+
+        let transition_input = apply_enhanced_input(
+            &mut decoder,
+            b"hidden\r",
+            &mut input,
+            &mut view,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(transition_input, super::EnhancedInputAction::Redraw);
+        assert_eq!(input.composer().text(), "SAFE_DRAFT");
+        assert_eq!(input.queue().len(), 0);
+
+        let inspect = view.requested();
+        assert!(view.commit(inspect, 0, 100, 10));
+        let page = apply_enhanced_input(
+            &mut decoder,
+            b"\x1b[6~\r",
+            &mut input,
+            &mut view,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(page, super::EnhancedInputAction::Redraw);
+        assert_eq!(view.requested().offset(), 10);
+        assert_eq!(input.composer().text(), "SAFE_DRAFT");
+    }
+
+    #[test]
+    fn detail_escape_requires_a_fresh_input_after_returning_to_focus() {
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        input.insert_text("SAFE_DRAFT").unwrap();
+        let mut view = ViewState::default();
+        view.request_mode(ViewMode::Inspect).unwrap();
+        assert!(view.commit(view.requested(), 0, 20, 10));
+        let mut notice = None;
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\x1b",
+                &mut input,
+                &mut view,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::None
+        );
+        assert!(decoder.escape_pending());
+        assert_eq!(
+            expire_enhanced_escape(&mut decoder, &mut input, &mut view, size, &mut notice).unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert_eq!(view.requested().mode(), ViewMode::Focus);
+        assert_eq!(view.committed().mode(), ViewMode::Inspect);
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\r",
+                &mut input,
+                &mut view,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert_eq!(input.composer().text(), "SAFE_DRAFT");
+        assert_eq!(input.queue().len(), 0);
+    }
+
+    #[test]
     fn partially_written_approval_resize_keeps_selection_after_visual_recovery() {
         let input = InputMemory::default();
         let interaction = DockInteraction::Approval(DockApprovalSelection::AllowOnce);
@@ -3868,9 +4562,16 @@ mod tests {
 
         let mut write = screen.stage_dock(&frame, true).unwrap();
         write.advance(1).unwrap();
+        let view = ViewState::default();
         let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
             write,
             intent: InlineIntent::Dock(interaction),
+            surface: SurfaceCommit {
+                request: view.requested(),
+                offset: 0,
+                total_rows: 0,
+                page_rows: 0,
+            },
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
         assert!(screen.is_poisoned());
@@ -4065,6 +4766,68 @@ mod tests {
         .unwrap();
         assert_eq!(skipped, 2);
         assert!(prompt_committed);
+    }
+
+    #[test]
+    fn context_estimate_requires_the_exact_session_boundary_and_handles_zero_window() {
+        let mut session = Session::new("interactive-context-estimate").unwrap();
+        let initial = session_context_estimate(
+            &session,
+            None,
+            Some(crate::session::EventSeq::new(0).unwrap()),
+        )
+        .unwrap();
+        let initial_status = initial.status_line().unwrap();
+        assert!(initial_status.contains("Session context estimate 0"));
+        assert!(initial_status.contains("sampled before seq 0"));
+        assert!(!initial_status.contains('%'));
+        assert!(
+            session_context_estimate(
+                &session,
+                None,
+                Some(crate::session::EventSeq::new(1).unwrap()),
+            )
+            .is_none()
+        );
+
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let step = crate::session::StepId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::step_start(turn, step)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::RequestContext {
+                context: RequestContext::new(
+                    "deepseek-official",
+                    "deepseek-chat",
+                    Some(NonNegativeSafeInteger::new(0).unwrap()),
+                )
+                .unwrap(),
+            }))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::step_end(turn, step)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .unwrap();
+        let estimate = session_context_estimate(
+            &session,
+            Some(turn),
+            Some(crate::session::EventSeq::new(5).unwrap()),
+        )
+        .unwrap();
+        let status = estimate.status_line().unwrap();
+        assert!(status.contains("deepseek-chat"));
+        assert!(status.contains("after turn 1"));
+        assert!(status.contains("sampled before seq 5"));
+        assert!(!status.contains('%'));
     }
 
     #[test]

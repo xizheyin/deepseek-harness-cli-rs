@@ -217,6 +217,59 @@ impl InlineScreen {
         )
     }
 
+    /// Changes only the owned bottom surface while the physical terminal size
+    /// stays fixed. A taller panel first clears the old dock and scrolls only
+    /// the additional rows through the full screen, so private dock content
+    /// cannot be appended to native history. A shorter panel simply releases
+    /// cleared rows below the existing transcript anchor.
+    pub(crate) fn stage_reanchor_bottom(
+        &self,
+        dock: &DockFrame,
+        styled: bool,
+    ) -> Result<PendingScreenWrite, InlineScreenError> {
+        let mut ledger = self.ready()?;
+        validate_frame(ledger.size, dock)?;
+        let dock_rows = dock.rows()?;
+        if dock_rows == ledger.dock_rows {
+            return self.stage_dock(dock, styled);
+        }
+        let output_bottom = ledger
+            .size
+            .rows
+            .checked_sub(dock_rows)
+            .filter(|row| *row != 0)
+            .ok_or(InlineScreenError::TooSmall)?;
+        let mut bytes = screen_buffer()?;
+        let old_dock_start = ledger
+            .size
+            .rows
+            .checked_sub(ledger.dock_rows)
+            .and_then(|row| row.checked_add(1))
+            .ok_or(InlineScreenError::InvalidState)?;
+        for row in old_dock_start..=ledger.size.rows {
+            push_cup(&mut bytes, row, 1);
+            bytes.push_str("\x1b[2K");
+        }
+        let scrolls = ledger.transcript_row.saturating_sub(output_bottom);
+        if scrolls != 0 {
+            push_cup(&mut bytes, ledger.size.rows, 1);
+            for _ in 0..scrolls {
+                bytes.push('\n');
+            }
+            ledger.transcript_row -= scrolls;
+        }
+        ledger.dock_rows = dock_rows;
+        dock.render_bottom(&mut bytes, styled)?;
+        let base_generation = ledger.generation;
+        ledger = next_generation(ledger)?;
+        finish_screen_write(
+            bytes,
+            Some(base_generation),
+            ScreenState::Ready(ledger),
+            Arc::clone(&self.poisoned),
+        )
+    }
+
     pub(crate) fn stage_transcript(
         &self,
         chunk: &PresentedChunk,
@@ -477,6 +530,15 @@ impl InlineScreen {
         self.state == ScreenState::Detached && !self.poisoned.load(Ordering::Acquire)
     }
 
+    pub(crate) fn dock_rows(&self) -> Option<u16> {
+        match &self.state {
+            ScreenState::Ready(ledger) if !self.poisoned.load(Ordering::Acquire) => {
+                Some(ledger.dock_rows)
+            }
+            ScreenState::Detached | ScreenState::Poisoned | ScreenState::Ready(_) => None,
+        }
+    }
+
     /// Discards coordinate knowledge only after the caller has successfully
     /// sent the fixed, coordinate-free visual reset. The next operation must
     /// be a fresh attach; no transcript state is replayed.
@@ -552,7 +614,16 @@ fn validate_frame(size: ScreenSize, dock: &DockFrame) -> Result<(), InlineScreen
 
 fn validate_ready_frame(ledger: &Ledger, dock: &DockFrame) -> Result<(), InlineScreenError> {
     validate_frame(ledger.size, dock)?;
-    if dock.rows()? != ledger.dock_rows || dock.output_bottom() != ledger.transcript_row {
+    let expected_output_bottom = ledger
+        .size
+        .rows
+        .checked_sub(ledger.dock_rows)
+        .ok_or(InlineScreenError::InvalidState)?;
+    if dock.rows()? != ledger.dock_rows
+        || dock.output_bottom() != expected_output_bottom
+        || ledger.transcript_row == 0
+        || ledger.transcript_row > expected_output_bottom
+    {
         return Err(InlineScreenError::InvalidState);
     }
     Ok(())
@@ -689,6 +760,7 @@ mod tests {
         markup::MarkupState,
         presentation::{PresentedChunk, TextStyle},
         terminal_model::{HistoryPolicy, MiniTerminal},
+        view::{DetailDocument, DetailTone, ViewMode},
     };
 
     fn dock<'a>(composer: &'a Composer, queue: &'a PromptQueue) -> DockFrame {
@@ -707,6 +779,20 @@ mod tests {
             columns,
         )
         .unwrap()
+    }
+
+    fn detail_at(rows: u16, columns: u16, sentinel: &str) -> DockFrame {
+        let document = DetailDocument::from_lines_for_test(
+            ViewMode::Inspect,
+            "INSPECT",
+            &[
+                (DetailTone::Accent, "COMMITTED FACTS"),
+                (DetailTone::Code, sentinel),
+            ],
+        );
+        DockFrame::layout_detail(&document, 0, rows, columns)
+            .unwrap()
+            .0
     }
 
     fn commit(screen: &mut InlineScreen, mut write: super::PendingScreenWrite) -> String {
@@ -1240,5 +1326,173 @@ mod tests {
         screen.abort(attach);
         assert!(screen.is_poisoned());
         assert!(screen.stage_dock(&dock, true).is_err());
+    }
+
+    #[test]
+    fn same_size_detail_grow_and_shrink_never_archive_bottom_surfaces() {
+        for policy in [
+            HistoryPolicy::FullScreenOnly,
+            HistoryPolicy::TopAnchoredRegion,
+        ] {
+            let mut terminal = MiniTerminal::blank(24, 80, policy);
+            let mut screen = InlineScreen::default();
+            let mut composer = Composer::default();
+            composer.insert_text("COMPOSER_SENTINEL").unwrap();
+            let queue = PromptQueue::default();
+            let focus = dock(&composer, &queue);
+            let detail = detail_at(24, 80, "PANEL_SENTINEL");
+            let attach = screen
+                .stage_attach(
+                    ScreenSize {
+                        rows: 24,
+                        columns: 80,
+                    },
+                    &focus,
+                    true,
+                )
+                .unwrap();
+            apply(&mut screen, &mut terminal, attach);
+            for marker in ["TRANSCRIPT_A", "TRANSCRIPT_B"] {
+                let write = screen
+                    .stage_transcript(&chunk(marker, true), &focus, true)
+                    .unwrap();
+                apply(&mut screen, &mut terminal, write);
+            }
+
+            let before_growth = terminal.history().len();
+            let delta = usize::from(detail.rows().unwrap() - focus.rows().unwrap());
+            let grow = screen.stage_reanchor_bottom(&detail, true).unwrap();
+            let grow_bytes = apply(&mut screen, &mut terminal, grow);
+            assert_eq!(grow_bytes.matches('\n').count(), delta);
+            assert_eq!(terminal.history().len() - before_growth, delta);
+            assert!(!grow_bytes.contains("TRANSCRIPT_A"));
+            assert!(!grow_bytes.contains("TRANSCRIPT_B"));
+
+            let before_shrink = terminal.history().len();
+            let shrink = screen.stage_reanchor_bottom(&focus, true).unwrap();
+            let shrink_bytes = apply(&mut screen, &mut terminal, shrink);
+            assert_eq!(shrink_bytes.matches('\n').count(), 0);
+            assert_eq!(terminal.history().len(), before_shrink);
+
+            let mut drain = PresentedChunk::builder();
+            for _ in 0..30 {
+                drain.push_line_feed().unwrap();
+            }
+            let write = screen
+                .stage_transcript(&drain.finish(), &focus, true)
+                .unwrap();
+            apply(&mut screen, &mut terminal, write);
+            let all = terminal.all_lines().join("\n");
+            assert_eq!(all.matches("TRANSCRIPT_A").count(), 1);
+            assert_eq!(all.matches("TRANSCRIPT_B").count(), 1);
+            assert!(terminal.history().iter().all(|line| {
+                !line.contains("PANEL_SENTINEL")
+                    && !line.contains("COMPOSER_SENTINEL")
+                    && !line.contains("Working")
+                    && !line.contains("Enter queue")
+                    && !line.contains('❯')
+            }));
+            assert!(!terminal.partial_margin_seen());
+            assert!(!screen.is_poisoned());
+        }
+    }
+
+    #[test]
+    fn detail_shrink_preserves_partial_transcript_continuation_without_replay() {
+        let mut terminal = MiniTerminal::blank(24, 80, HistoryPolicy::FullScreenOnly);
+        let mut screen = InlineScreen::default();
+        let composer = Composer::default();
+        let queue = PromptQueue::default();
+        let focus = dock(&composer, &queue);
+        let detail = detail_at(24, 80, "PANEL_SENTINEL");
+        let attach = screen
+            .stage_attach(
+                ScreenSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                &focus,
+                true,
+            )
+            .unwrap();
+        apply(&mut screen, &mut terminal, attach);
+        let grow = screen.stage_reanchor_bottom(&detail, true).unwrap();
+        apply(&mut screen, &mut terminal, grow);
+        let write = screen
+            .stage_transcript(&chunk("busy-partial", false), &detail, true)
+            .unwrap();
+        apply(&mut screen, &mut terminal, write);
+        let shrink = screen.stage_reanchor_bottom(&focus, true).unwrap();
+        apply(&mut screen, &mut terminal, shrink);
+        let write = screen
+            .stage_transcript(&chunk(" continued", true), &focus, true)
+            .unwrap();
+        apply(&mut screen, &mut terminal, write);
+        let mut drain = PresentedChunk::builder();
+        for _ in 0..24 {
+            drain.push_line_feed().unwrap();
+        }
+        let write = screen
+            .stage_transcript(&drain.finish(), &focus, true)
+            .unwrap();
+        apply(&mut screen, &mut terminal, write);
+        assert_eq!(
+            terminal
+                .all_lines()
+                .iter()
+                .filter(|line| line.as_str() == "busy-partial continued")
+                .count(),
+            1
+        );
+        assert!(
+            terminal
+                .history()
+                .iter()
+                .all(|line| !line.contains("PANEL_SENTINEL"))
+        );
+    }
+
+    #[test]
+    fn detail_reanchor_is_transactional_for_zero_and_partial_writes() {
+        let composer = Composer::default();
+        let queue = PromptQueue::default();
+        let focus = dock(&composer, &queue);
+        let detail = detail_at(24, 80, "PANEL_SENTINEL");
+
+        let mut zero = InlineScreen::default();
+        let attach = zero
+            .stage_attach(
+                ScreenSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                &focus,
+                true,
+            )
+            .unwrap();
+        let _ = commit(&mut zero, attach);
+        let first = zero.stage_reanchor_bottom(&detail, true).unwrap();
+        zero.abort(first);
+        assert!(!zero.is_poisoned());
+        let retry = zero.stage_reanchor_bottom(&detail, true).unwrap();
+        let _ = commit(&mut zero, retry);
+
+        let mut partial = InlineScreen::default();
+        let attach = partial
+            .stage_attach(
+                ScreenSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                &focus,
+                true,
+            )
+            .unwrap();
+        let _ = commit(&mut partial, attach);
+        let mut write = partial.stage_reanchor_bottom(&detail, true).unwrap();
+        write.advance(1).unwrap();
+        partial.abort(write);
+        assert!(partial.is_poisoned());
+        assert!(partial.stage_dock(&detail, true).is_err());
     }
 }

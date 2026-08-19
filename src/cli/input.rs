@@ -89,6 +89,8 @@ impl CanonicalRecordParser {
 pub(super) enum IdleInput {
     Redraw,
     Help,
+    Inspect,
+    Review,
     Exit,
     Submit(String),
 }
@@ -98,6 +100,8 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     match command {
         "" => IdleInput::Redraw,
         "/help" => IdleInput::Help,
+        "/inspect" => IdleInput::Inspect,
+        "/review" => IdleInput::Review,
         "/exit" | "/quit" => IdleInput::Exit,
         _ => IdleInput::Submit(record.to_owned()),
     }
@@ -234,6 +238,8 @@ mod tests {
     fn idle_classification_trims_only_for_commands_and_preserves_prompt_bytes() {
         assert_eq!(classify_idle_record("  \t", true), IdleInput::Redraw);
         assert_eq!(classify_idle_record("  /help \t", true), IdleInput::Help);
+        assert_eq!(classify_idle_record(" /inspect ", true), IdleInput::Inspect);
+        assert_eq!(classify_idle_record(" /review ", true), IdleInput::Review);
         assert_eq!(classify_idle_record(" /exit ", false), IdleInput::Exit);
         assert_eq!(classify_idle_record("\t/quit", true), IdleInput::Exit);
         assert_eq!(

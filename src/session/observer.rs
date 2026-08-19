@@ -35,14 +35,12 @@ pub(crate) enum UiObserverAttachError {
     AlreadyAttached,
 }
 
-#[derive(Debug)]
 pub(crate) struct CommittedUiEvent {
     pub(crate) seq: EventSeq,
     pub(crate) time: UnixMillis,
     pub(crate) kind: CommittedUiKind,
 }
 
-#[derive(Debug)]
 pub(crate) enum CommittedUiKind {
     TurnStart {
         turn: TurnId,
@@ -161,6 +159,219 @@ pub(crate) enum CommittedUiKind {
     },
 }
 
+impl fmt::Debug for CommittedUiEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommittedUiEvent")
+            .field("seq", &self.seq)
+            .field("time", &self.time)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CommittedUiKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TurnStart { turn } => formatter
+                .debug_struct("TurnStart")
+                .field("turn", turn)
+                .finish(),
+            Self::TurnEnd { turn, reason } => formatter
+                .debug_struct("TurnEnd")
+                .field("turn", turn)
+                .field("reason", reason)
+                .finish(),
+            Self::StepStart { turn, step } | Self::StepEnd { turn, step } => formatter
+                .debug_struct(match self {
+                    Self::StepStart { .. } => "StepStart",
+                    _ => "StepEnd",
+                })
+                .field("turn", turn)
+                .field("step", step)
+                .finish(),
+            Self::UserMessage { source, content } => formatter
+                .debug_struct("UserMessage")
+                .field("source", source)
+                .field("content", content)
+                .finish(),
+            Self::AssistantTextDelta {
+                turn,
+                step,
+                index,
+                text,
+            }
+            | Self::AssistantReasoningDelta {
+                turn,
+                step,
+                index,
+                text,
+            } => formatter
+                .debug_struct(match self {
+                    Self::AssistantTextDelta { .. } => "AssistantTextDelta",
+                    _ => "AssistantReasoningDelta",
+                })
+                .field("turn", turn)
+                .field("step", step)
+                .field("index", index)
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::UsageSample { turn, step, usage } => formatter
+                .debug_struct("UsageSample")
+                .field("turn", turn)
+                .field("step", step)
+                .field("usage", usage)
+                .finish(),
+            Self::AssistantMessage {
+                turn,
+                step,
+                content,
+                sources,
+                provider,
+                model,
+                usage,
+            } => formatter
+                .debug_struct("AssistantMessage")
+                .field("turn", turn)
+                .field("step", step)
+                .field("content", content)
+                .field("sources", sources)
+                .field("provider", provider)
+                .field("model", model)
+                .field("usage", usage)
+                .finish(),
+            Self::ToolRequested {
+                turn,
+                step,
+                call_id,
+                name,
+                arguments,
+            } => formatter
+                .debug_struct("ToolRequested")
+                .field("turn", turn)
+                .field("step", step)
+                .field("call_id", call_id)
+                .field("name", name)
+                .field("arguments", arguments)
+                .finish(),
+            Self::ToolResult {
+                turn,
+                step,
+                call_id,
+                is_error,
+                failure,
+                content,
+                meta,
+                surface_replacement_target,
+            } => formatter
+                .debug_struct("ToolResult")
+                .field("turn", turn)
+                .field("step", step)
+                .field("call_id", call_id)
+                .field("is_error", is_error)
+                .field("failure", failure)
+                .field("content", content)
+                .field("meta", meta)
+                .field("surface_replacement_target", surface_replacement_target)
+                .finish(),
+            Self::RequestContextChanged {
+                provider,
+                model,
+                context_window,
+            } => formatter
+                .debug_struct("RequestContextChanged")
+                .field("provider", provider)
+                .field("model", model)
+                .field("context_window", context_window)
+                .finish(),
+            Self::CompactionStarted {
+                id,
+                turn,
+                trigger,
+                shadowed_nodes,
+            } => formatter
+                .debug_struct("CompactionStarted")
+                .field("id", id)
+                .field("turn", turn)
+                .field("trigger", trigger)
+                .field("shadowed_nodes", shadowed_nodes)
+                .finish(),
+            Self::CompactionSummarized {
+                id,
+                shadowed_tokens,
+                provider,
+                model,
+                usage,
+            } => formatter
+                .debug_struct("CompactionSummarized")
+                .field("id", id)
+                .field("shadowed_tokens", shadowed_tokens)
+                .field("provider", provider)
+                .field("model", model)
+                .field("usage", usage)
+                .finish(),
+            Self::CompactionEnded { id, turn, error } => formatter
+                .debug_struct("CompactionEnded")
+                .field("id", id)
+                .field("turn", turn)
+                .field("error", error)
+                .finish(),
+            Self::CompactionPruneMarked {
+                target,
+                shadowed_tokens,
+            } => formatter
+                .debug_struct("CompactionPruneMarked")
+                .field("target", target)
+                .field("shadowed_tokens", shadowed_tokens)
+                .finish(),
+            Self::ApprovalAsked {
+                id,
+                tool_name,
+                call_id,
+                reason,
+            } => formatter
+                .debug_struct("ApprovalAsked")
+                .field("id", id)
+                .field("tool_name", tool_name)
+                .field("call_id", call_id)
+                .field("reason_bytes", &reason.as_ref().map_or(0, String::len))
+                .finish(),
+            Self::ApprovalDecided { id, outcome } => formatter
+                .debug_struct("ApprovalDecided")
+                .field("id", id)
+                .field("outcome", outcome)
+                .finish(),
+            Self::RetryScheduled {
+                retry_id,
+                retry,
+                provider,
+                delay_ms,
+                max_retries,
+                failure_code,
+                failure_message,
+            } => formatter
+                .debug_struct("RetryScheduled")
+                .field("retry_id", retry_id)
+                .field("retry", retry)
+                .field("provider", provider)
+                .field("delay_ms", delay_ms)
+                .field("max_retries", max_retries)
+                .field("failure_code_bytes", &failure_code.len())
+                .field("failure_message_bytes", &failure_message.len())
+                .finish(),
+            Self::RetryStarted { retry_id, retry } => formatter
+                .debug_struct("RetryStarted")
+                .field("retry_id", retry_id)
+                .field("retry", retry)
+                .finish(),
+            Self::TypeOnly { event_type } => formatter
+                .debug_struct("TypeOnly")
+                .field("event_type", event_type)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UiTokenUsage {
     pub(crate) input_tokens: u64,
@@ -190,6 +401,14 @@ impl UiIdentity {
         Arc::try_unwrap(self.0)
             .map(|inner| inner.display)
             .unwrap_or_else(|inner| inner.display.clone())
+    }
+
+    pub(crate) fn original_bytes(&self) -> usize {
+        self.0.original_bytes
+    }
+
+    pub(crate) fn was_omitted(&self) -> bool {
+        self.0.omitted
     }
 
     pub(crate) fn from_static(value: &'static str) -> Self {
@@ -284,6 +503,10 @@ impl UiOpaquePayload {
         self.original_bytes
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.value.as_ref().map_or(0, String::len)
+    }
+
     pub(crate) fn was_omitted(&self) -> bool {
         (self.value.is_none() && self.original_bytes != 0) || self.omitted_parts != 0
     }
@@ -371,20 +594,44 @@ pub(crate) enum UiTurnEndCancelCause {
     Legacy,
 }
 
-#[derive(Debug)]
 pub(crate) struct UiAssistantBlock {
     pub(crate) index: u16,
     pub(crate) kind: UiAssistantBlockKind,
     pub(crate) text: String,
 }
 
-#[derive(Debug)]
 pub(crate) enum UiAssistantContent {
     Indexed(Vec<UiAssistantBlock>),
     /// Complete final answer text when block-by-block deduplication is too large.
     Degraded {
         text: String,
     },
+}
+
+impl fmt::Debug for UiAssistantBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UiAssistantBlock")
+            .field("index", &self.index)
+            .field("kind", &self.kind)
+            .field("text_bytes", &self.text.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for UiAssistantContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Indexed(blocks) => formatter
+                .debug_struct("Indexed")
+                .field("blocks", blocks)
+                .finish(),
+            Self::Degraded { text } => formatter
+                .debug_struct("Degraded")
+                .field("text_bytes", &text.len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1065,9 +1312,11 @@ mod tests {
 
     use super::{
         CommittedUiEvent, CommittedUiKind, MAX_UI_IDENTITY_BYTES, MAX_UI_OPAQUE_PAYLOAD_BYTES,
-        UiUserSource, opaque_payload, try_ui_identity, try_ui_text,
+        SourceSeqBitmap, UiAssistantBlock, UiAssistantBlockKind, UiAssistantContent,
+        UiCompactionError, UiIdentity, UiTurnEndReason, UiUserSource, opaque_payload,
+        try_ui_identity, try_ui_text,
     };
-    use crate::session::codec::decode_event;
+    use crate::session::{EventSeq, RetryNumber, StepId, TurnId, UnixMillis, codec::decode_event};
 
     #[test]
     fn compaction_projection_exposes_safe_counts_without_summary_payloads() {
@@ -1103,6 +1352,92 @@ mod tests {
             } if provider.as_str() == "deepseek" && model.as_str() == "deepseek-chat"
         ));
         assert!(!format!("{projection:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn committed_ui_debug_never_exposes_assistant_or_failure_text() {
+        const SECRET: &str = "SECRET_COMMITTED_UI_DEBUG";
+        let turn = TurnId::new(1).unwrap();
+        let step = StepId::new(1).unwrap();
+        let id = || UiIdentity::from_text_for_test("safe-id");
+        let kinds = vec![
+            CommittedUiKind::AssistantTextDelta {
+                turn,
+                step,
+                index: 0,
+                text: SECRET.to_owned(),
+            },
+            CommittedUiKind::AssistantReasoningDelta {
+                turn,
+                step,
+                index: 0,
+                text: SECRET.to_owned(),
+            },
+            CommittedUiKind::AssistantMessage {
+                turn,
+                step,
+                content: UiAssistantContent::Indexed(vec![UiAssistantBlock {
+                    index: 0,
+                    kind: UiAssistantBlockKind::Text,
+                    text: SECRET.to_owned(),
+                }]),
+                sources: SourceSeqBitmap::from_sources(&[]).unwrap(),
+                provider: id(),
+                model: id(),
+                usage: None,
+            },
+            CommittedUiKind::AssistantMessage {
+                turn,
+                step,
+                content: UiAssistantContent::Degraded {
+                    text: SECRET.to_owned(),
+                },
+                sources: SourceSeqBitmap::from_sources(&[]).unwrap(),
+                provider: id(),
+                model: id(),
+                usage: None,
+            },
+            CommittedUiKind::ApprovalAsked {
+                id: id(),
+                tool_name: id(),
+                call_id: Some(id()),
+                reason: Some(SECRET.to_owned()),
+            },
+            CommittedUiKind::RetryScheduled {
+                retry_id: id(),
+                retry: RetryNumber::new(1).unwrap(),
+                provider: id(),
+                delay_ms: 1.0,
+                max_retries: None,
+                failure_code: SECRET.to_owned(),
+                failure_message: SECRET.to_owned(),
+            },
+            CommittedUiKind::TurnEnd {
+                turn,
+                reason: UiTurnEndReason::Error {
+                    code: SECRET.to_owned(),
+                    message: SECRET.to_owned(),
+                },
+            },
+            CommittedUiKind::CompactionEnded {
+                id: id(),
+                turn: Some(turn),
+                error: Some(UiCompactionError {
+                    code: Some(SECRET.to_owned()),
+                    message: SECRET.to_owned(),
+                }),
+            },
+        ];
+        for (seq, kind) in kinds.into_iter().enumerate() {
+            let event = CommittedUiEvent {
+                seq: EventSeq::new(u64::try_from(seq).unwrap()).unwrap(),
+                time: UnixMillis::new(i64::try_from(seq).unwrap()).unwrap(),
+                kind,
+            };
+            let debug = format!("{event:?}");
+            assert!(!debug.contains(SECRET));
+            assert!(debug.contains("bytes") || debug.contains("UiCompactionError"));
+        }
     }
 
     #[test]

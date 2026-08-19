@@ -500,6 +500,16 @@ impl GatedThenStalledSseServer {
             .expect("the reserved queue front should become the second request");
     }
 
+    pub fn assert_no_second_request(&self, timeout: Duration) {
+        match self.second_request_ready.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) => panic!("dsh dispatched a second request before the explicit test action"),
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("second-request observer disconnected before its deadline")
+            }
+        }
+    }
+
     pub fn finish(mut self) -> (Vec<String>, bool) {
         drop(self.release.take());
         self.worker

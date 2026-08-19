@@ -602,6 +602,40 @@ pub struct TurnOutcome {
 }
 
 impl TurnOutcome {
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(
+        turn: TurnId,
+        turn_end_seq: EventSeq,
+        tool_calls: usize,
+    ) -> Self {
+        Self {
+            turn,
+            turn_end_seq,
+            reason: TurnEndReason::Completed,
+            final_message: None,
+            steps: 0,
+            attempts: 0,
+            retries: 0,
+            tool_calls,
+            reported_output_tokens: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocked_for_test(turn: TurnId, turn_end_seq: EventSeq) -> Self {
+        Self {
+            turn,
+            turn_end_seq,
+            reason: TurnEndReason::Blocked,
+            final_message: None,
+            steps: 0,
+            attempts: 0,
+            retries: 0,
+            tool_calls: 0,
+            reported_output_tokens: 0,
+        }
+    }
+
     #[must_use]
     pub fn turn(&self) -> TurnId {
         self.turn

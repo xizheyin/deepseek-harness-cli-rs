@@ -74,6 +74,9 @@ pub(crate) enum Key {
     Yank,
     Undo,
     ReverseSearch,
+    Inspect,
+    PageUp,
+    PageDown,
 }
 
 impl fmt::Debug for Key {
@@ -100,6 +103,9 @@ impl fmt::Debug for Key {
             Self::Yank => "Yank",
             Self::Undo => "Undo",
             Self::ReverseSearch => "ReverseSearch",
+            Self::Inspect => "Inspect",
+            Self::PageUp => "PageUp",
+            Self::PageDown => "PageDown",
         })
     }
 }
@@ -416,6 +422,7 @@ impl KeyDecoder {
             0x05 => InputEvent::Key(Key::End),
             0x08 | 0x7f => InputEvent::Key(Key::Backspace),
             0x0b => InputEvent::Key(Key::ClearAfter),
+            0x0f => InputEvent::Key(Key::Inspect),
             0x12 => InputEvent::Key(Key::ReverseSearch),
             0x15 => InputEvent::Key(Key::ClearBefore),
             0x17 => InputEvent::Key(Key::WordErase),
@@ -482,6 +489,8 @@ impl KeyDecoder {
             b"D" => self.emit(InputEvent::Key(Key::Left), emit),
             b"H" | b"1~" => self.emit(InputEvent::Key(Key::Home), emit),
             b"F" | b"4~" => self.emit(InputEvent::Key(Key::End), emit),
+            b"5~" => self.emit(InputEvent::Key(Key::PageUp), emit),
+            b"6~" => self.emit(InputEvent::Key(Key::PageDown), emit),
             b"3~" => self.emit(InputEvent::Key(Key::Delete), emit),
             b"Z" => self.emit(InputEvent::Key(Key::BackTab), emit),
             b"13;2u" => self.emit(InputEvent::Key(Key::Newline), emit),
@@ -586,6 +595,27 @@ mod tests {
             decoder.expire_escape().unwrap().event,
             InputEvent::Key(Key::Escape)
         );
+    }
+
+    #[test]
+    fn inspect_and_page_navigation_are_fragmentation_safe() {
+        let mut decoder = KeyDecoder::default();
+        assert_eq!(
+            collect(&mut decoder, b"\x0f\x1b[5~\x1b[6~"),
+            [
+                InputEvent::Key(Key::Inspect),
+                InputEvent::Key(Key::PageUp),
+                InputEvent::Key(Key::PageDown),
+            ]
+        );
+        for sequence in [b"\x1b[5~".as_slice(), b"\x1b[6~".as_slice()] {
+            for split in 0..=sequence.len() {
+                let mut decoder = KeyDecoder::default();
+                let mut events = collect(&mut decoder, &sequence[..split]);
+                events.extend(collect(&mut decoder, &sequence[split..]));
+                assert_eq!(events.len(), 1);
+            }
+        }
     }
 
     #[test]

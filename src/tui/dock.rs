@@ -7,6 +7,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     composer::Composer,
     input_memory::PromptQueue,
+    view::{DetailDocument, DetailTone},
     visible::{VisibleTextError, render_visible_owned},
 };
 
@@ -15,6 +16,8 @@ pub(crate) const MIN_ENHANCED_ROWS: u16 = 12;
 pub(crate) const MIN_DOCK_COLUMNS: u16 = 12;
 pub(crate) const MIN_DOCK_ROWS: u16 = 5;
 const MAX_DOCK_ROWS: usize = 24;
+const MAX_DETAIL_WRAPPED_ROWS: usize = 4 * 1024;
+const DETAIL_WRAPPED_OMISSION: &str = "[omitted] wrapped row limit";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DockInteraction {
@@ -58,6 +61,22 @@ enum DockRole {
     Notice,
     ApprovalChoice,
     ApprovalWarning,
+    DetailTitle,
+    DetailPlain,
+    DetailMuted,
+    DetailAccent,
+    DetailPositive,
+    DetailCaution,
+    DetailNegative,
+    DetailCode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DetailViewport {
+    pub(crate) offset: usize,
+    pub(crate) total_rows: usize,
+    pub(crate) page_rows: usize,
+    pub(crate) truncated: bool,
 }
 
 struct DockLine {
@@ -294,6 +313,115 @@ impl DockFrame {
         })
     }
 
+    pub(crate) fn layout_detail(
+        document: &DetailDocument,
+        requested_offset: usize,
+        rows: u16,
+        columns: u16,
+    ) -> Result<(Self, DetailViewport), DockError> {
+        if rows < MIN_DOCK_ROWS || columns < MIN_DOCK_COLUMNS {
+            return Err(DockError::TooSmall);
+        }
+        let width = columns.checked_sub(1).ok_or(DockError::TooSmall)?;
+        let width_usize = usize::from(width);
+        let panel_rows = usize::from(rows.saturating_sub(1)).min(MAX_DOCK_ROWS);
+        if panel_rows < 4 {
+            return Err(DockError::TooSmall);
+        }
+        let has_divider = panel_rows >= 7;
+        let fixed_rows = 2 + usize::from(has_divider);
+        let page_rows = panel_rows
+            .checked_sub(fixed_rows)
+            .filter(|rows| *rows != 0)
+            .ok_or(DockError::TooSmall)?;
+        let mut physical = Vec::new();
+        physical
+            .try_reserve(MAX_DETAIL_WRAPPED_ROWS.min(document.lines().len().saturating_mul(2)))
+            .map_err(|_| DockError::Capacity)?;
+        let omission_line = line(DockRole::DetailCaution, DETAIL_WRAPPED_OMISSION.to_owned());
+        let mut truncated = false;
+        for source in document.lines() {
+            if wrap_detail_line(source.tone(), source.text(), width_usize, &mut physical)? {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            let last = physical.last_mut().ok_or(DockError::InvalidState)?;
+            *last = omission_line;
+        }
+        if physical.is_empty() {
+            physical.push(line(
+                DockRole::DetailMuted,
+                "No retained details.".to_owned(),
+            ));
+        }
+        let total_rows = physical.len();
+        let offset = requested_offset.min(total_rows.saturating_sub(page_rows));
+        let mut lines = Vec::new();
+        lines
+            .try_reserve_exact(panel_rows)
+            .map_err(|_| DockError::Capacity)?;
+        lines.push(line(
+            DockRole::DetailTitle,
+            fit_ascii(document.title(), width_usize),
+        ));
+        if has_divider {
+            lines.push(line(DockRole::Divider, "-".repeat(width_usize)));
+        }
+        for source in physical.iter().skip(offset).take(page_rows) {
+            lines.push(line(source.role, truncate_cells(&source.text, width_usize)));
+        }
+        while lines.len() < panel_rows - 1 {
+            lines.push(line(DockRole::DetailPlain, String::new()));
+        }
+        let total_label = if truncated {
+            format!("{total_rows}+")
+        } else {
+            total_rows.to_string()
+        };
+        let position = if total_rows <= page_rows && !truncated {
+            format!("all {total_label} rows")
+        } else {
+            format!(
+                "rows {}-{} / {total_label}",
+                offset + 1,
+                (offset + page_rows).min(total_rows)
+            )
+        };
+        let footer = if columns >= 80 {
+            format!("{position} · Up/Down/PgUp/PgDn scroll · Tab switch · Esc Focus")
+        } else {
+            format!("{position} · PgUp/Dn · Esc Focus")
+        };
+        lines.push(line(DockRole::Hint, fit_ascii(&footer, width_usize)));
+        if lines.len() != panel_rows {
+            return Err(DockError::InvalidState);
+        }
+        let dock_rows = u16::try_from(lines.len()).map_err(|_| DockError::Limit)?;
+        let output_bottom = rows.checked_sub(dock_rows).ok_or(DockError::TooSmall)?;
+        if output_bottom == 0 {
+            return Err(DockError::TooSmall);
+        }
+        Ok((
+            Self {
+                lines,
+                cursor_row: 0,
+                cursor_column: 1,
+                width,
+                terminal_rows: rows,
+                output_bottom,
+                software_cursor: false,
+            },
+            DetailViewport {
+                offset,
+                total_rows,
+                page_rows,
+                truncated,
+            },
+        ))
+    }
+
     pub(crate) fn rows(&self) -> Result<u16, DockError> {
         u16::try_from(self.lines.len()).map_err(|_| DockError::Limit)
     }
@@ -503,6 +631,66 @@ fn fit_ascii(text: &str, width: usize) -> String {
     }
 }
 
+fn wrap_detail_line(
+    tone: DetailTone,
+    text: &str,
+    width: usize,
+    output: &mut Vec<DockLine>,
+) -> Result<bool, DockError> {
+    if width == 0 {
+        return Err(DockError::TooSmall);
+    }
+    let role = detail_role(tone);
+    let mut current = String::new();
+    let mut cells = 0_usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_cells = UnicodeWidthStr::width(grapheme);
+        let display = if grapheme_cells > width || grapheme.len() > 1024 {
+            "[wide grapheme]"
+        } else {
+            grapheme
+        };
+        let display_cells = UnicodeWidthStr::width(display);
+        if cells != 0 && cells.saturating_add(display_cells) > width {
+            if push_detail_physical(output, role, std::mem::take(&mut current))? {
+                return Ok(true);
+            }
+            cells = 0;
+        }
+        current
+            .try_reserve(display.len())
+            .map_err(|_| DockError::Capacity)?;
+        current.push_str(display);
+        cells = cells.saturating_add(display_cells);
+    }
+    push_detail_physical(output, role, current)
+}
+
+fn push_detail_physical(
+    output: &mut Vec<DockLine>,
+    role: DockRole,
+    text: String,
+) -> Result<bool, DockError> {
+    if output.len() == MAX_DETAIL_WRAPPED_ROWS {
+        return Ok(true);
+    }
+    output.try_reserve(1).map_err(|_| DockError::Capacity)?;
+    output.push(line(role, text));
+    Ok(false)
+}
+
+const fn detail_role(tone: DetailTone) -> DockRole {
+    match tone {
+        DetailTone::Plain => DockRole::DetailPlain,
+        DetailTone::Muted => DockRole::DetailMuted,
+        DetailTone::Accent => DockRole::DetailAccent,
+        DetailTone::Positive => DockRole::DetailPositive,
+        DetailTone::Caution => DockRole::DetailCaution,
+        DetailTone::Negative => DockRole::DetailNegative,
+        DetailTone::Code => DockRole::DetailCode,
+    }
+}
+
 fn push_line(
     output: &mut String,
     line: &DockLine,
@@ -517,6 +705,13 @@ fn push_line(
             DockRole::Notice => "\x1b[1;33m",
             DockRole::ApprovalChoice => "\x1b[1m",
             DockRole::ApprovalWarning => "\x1b[1;33m",
+            DockRole::DetailTitle | DockRole::DetailAccent => "\x1b[1;36m",
+            DockRole::DetailPlain => "\x1b[0m",
+            DockRole::DetailMuted => "\x1b[2m",
+            DockRole::DetailPositive => "\x1b[32m",
+            DockRole::DetailCaution => "\x1b[1;33m",
+            DockRole::DetailNegative => "\x1b[1;31m",
+            DockRole::DetailCode => "\x1b[1m",
         });
     }
     output
@@ -552,8 +747,15 @@ fn byte_at_cell(text: &str, target: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DockApprovalSelection, DockFrame, DockInteraction, DockModel};
-    use crate::tui::{composer::Composer, input_memory::PromptQueue};
+    use super::{
+        DETAIL_WRAPPED_OMISSION, DockApprovalSelection, DockFrame, DockInteraction, DockModel,
+        MAX_DETAIL_WRAPPED_ROWS,
+    };
+    use crate::tui::{
+        composer::Composer,
+        input_memory::PromptQueue,
+        view::{DetailDocument, DetailTone, ViewMode},
+    };
 
     #[test]
     fn responsive_frames_fit_44_80_and_112_columns() {
@@ -771,5 +973,119 @@ mod tests {
         assert!(!model_debug.contains("SECRET_NOTICE"));
         let frame = DockFrame::layout(model, 24, 80).unwrap();
         assert!(!format!("{frame:?}").contains("SECRET_DRAFT"));
+    }
+
+    #[test]
+    fn detail_wrapped_rows_exact_and_one_over_have_truthful_markers() {
+        let exact_text = "x".repeat(43 * MAX_DETAIL_WRAPPED_ROWS);
+        let exact_document = DetailDocument::from_lines_for_test(
+            ViewMode::Inspect,
+            "INSPECT",
+            &[(DetailTone::Code, exact_text.as_str())],
+        );
+        let (exact, exact_viewport) =
+            DockFrame::layout_detail(&exact_document, usize::MAX, 20, 44).unwrap();
+        assert_eq!(exact_viewport.total_rows, MAX_DETAIL_WRAPPED_ROWS);
+        assert!(!exact_viewport.truncated);
+        assert!(
+            !exact
+                .lines
+                .iter()
+                .any(|line| line.text.contains(DETAIL_WRAPPED_OMISSION))
+        );
+        assert!(!exact.lines.last().unwrap().text.contains("4096+"));
+
+        let one_over_text = "x".repeat(43 * MAX_DETAIL_WRAPPED_ROWS + 1);
+        let one_over_document = DetailDocument::from_lines_for_test(
+            ViewMode::Inspect,
+            "INSPECT",
+            &[(DetailTone::Code, one_over_text.as_str())],
+        );
+        let (one_over, one_over_viewport) =
+            DockFrame::layout_detail(&one_over_document, usize::MAX, 20, 44).unwrap();
+        assert_eq!(one_over_viewport.total_rows, MAX_DETAIL_WRAPPED_ROWS);
+        assert!(one_over_viewport.truncated);
+        assert_eq!(
+            one_over
+                .lines
+                .iter()
+                .filter(|line| line.text.contains(DETAIL_WRAPPED_OMISSION))
+                .count(),
+            1
+        );
+        assert!(one_over.lines.last().unwrap().text.contains("4096+"));
+        assert!(
+            one_over
+                .lines
+                .iter()
+                .all(|line| { unicode_width::UnicodeWidthStr::width(line.text.as_str()) <= 43 })
+        );
+    }
+
+    #[test]
+    fn detail_frames_fit_supported_widths_and_report_truthful_viewports() {
+        let document = DetailDocument::from_lines_for_test(
+            ViewMode::Review,
+            "REVIEW · SECRET\u{202e}SAFE",
+            &[
+                (DetailTone::Accent, "ACTIONS"),
+                (DetailTone::Positive, "Updated  src/界面.rs"),
+                (DetailTone::Negative, "Command failed  exit 1"),
+                (
+                    DetailTone::Plain,
+                    "e\u{301} and a long detail that wraps without autowrap",
+                ),
+            ],
+        );
+        for (rows, columns, expected_rows, expected_page_rows) in
+            [(20, 44, 19, 16), (24, 80, 23, 20), (34, 112, 24, 21)]
+        {
+            let (frame, viewport) =
+                DockFrame::layout_detail(&document, usize::MAX, rows, columns).unwrap();
+            assert_eq!(frame.rows().unwrap(), expected_rows);
+            assert_eq!(viewport.page_rows, expected_page_rows);
+            assert_eq!(
+                viewport.offset,
+                viewport.total_rows.saturating_sub(viewport.page_rows)
+            );
+            assert!(!viewport.truncated);
+            assert!(!frame.software_cursor);
+            assert!(frame.lines[0].text.contains("REVIEW"));
+            assert!(
+                !frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains('\u{202e}'))
+            );
+            assert!(frame.lines.iter().all(|line| {
+                unicode_width::UnicodeWidthStr::width(line.text.as_str())
+                    <= usize::from(columns - 1)
+            }));
+        }
+        assert!(!format!("{document:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn detail_replaces_one_overlong_zero_width_grapheme() {
+        let mut grapheme = String::from("क");
+        grapheme.extend(std::iter::repeat_n('\u{93e}', 1_100));
+        let document = DetailDocument::from_lines_for_test(
+            ViewMode::Inspect,
+            "INSPECT",
+            &[(DetailTone::Code, grapheme.as_str())],
+        );
+        let (frame, _) = DockFrame::layout_detail(&document, 0, 20, 44).unwrap();
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| line.text.contains("[wide grapheme]"))
+        );
+        assert!(
+            frame
+                .lines
+                .iter()
+                .all(|line| { unicode_width::UnicodeWidthStr::width(line.text.as_str()) <= 43 })
+        );
     }
 }

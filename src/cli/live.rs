@@ -13,6 +13,7 @@ use crate::tui::{
     presentation::{PresentationError, PresentedChunk, PresentedChunkBuilder, TextStyle},
     projector::UiProjector,
     timeline::{TimelineTone, ToolCardView, WorkReceiptView},
+    view::{ContextEstimate, DetailDocument, JoinedTurnView, ViewArchive},
     visible::{render_visible_owned, render_visible_owned_bounded},
 };
 
@@ -248,11 +249,33 @@ impl LiveFrame {
     }
 
     pub(super) fn help() -> Result<Self, LiveRenderError> {
-        Self::trusted("[commands]\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n")
+        Self::trusted(
+            "[commands]\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
+        )
     }
 
     pub(super) fn notice(value: &'static str) -> Result<Self, LiveRenderError> {
         Self::trusted(value)
+    }
+
+    pub(super) fn detail_document(document: &DetailDocument) -> Result<Self, LiveRenderError> {
+        let mut text = String::new();
+        text.try_reserve(document.title().len().saturating_add(1))
+            .map_err(|_| LiveRenderError)?;
+        text.push_str(document.title());
+        text.push('\n');
+        for line in document.lines() {
+            text.try_reserve(line.text().len().saturating_add(1))
+                .map_err(|_| LiveRenderError)?;
+            text.push_str(line.text());
+            text.push('\n');
+        }
+        let mut parts = try_parts(1)?;
+        parts.push(LivePart::UntrustedStyled {
+            style: TextStyle::Plain,
+            text,
+        });
+        Ok(Self { parts })
     }
 
     fn markup_abort() -> Result<Self, LiveRenderError> {
@@ -624,6 +647,10 @@ impl EnhancedPresenter {
                         self.active_role = None;
                     }
                 }
+                LivePart::Untrusted {
+                    role: UiRole::Reasoning,
+                    ..
+                } => {}
                 LivePart::Untrusted { role, text } => {
                     self.abort_active_markup(&mut builder)?;
                     let text = render_visible_owned(&text, true).map_err(|_| LiveRenderError)?;
@@ -1060,6 +1087,7 @@ impl InteractivePresenter {
 pub(super) struct LiveRenderer {
     attempt: Option<AttemptState>,
     semantic: UiProjector,
+    views: ViewArchive,
     turn_end: Option<TurnEndAnchor>,
 }
 
@@ -1076,7 +1104,7 @@ enum ReceiptReason {
     Error { code: String },
     MaxTokens,
     Interrupted,
-    Other,
+    Other { kind: Option<String> },
 }
 
 impl fmt::Debug for TurnEndAnchor {
@@ -1090,11 +1118,56 @@ impl fmt::Debug for TurnEndAnchor {
 }
 
 impl LiveRenderer {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::for_session(false)
+    }
+
+    pub(super) fn for_session(resumed_live_seam: bool) -> Self {
         Self {
             attempt: None,
             semantic: UiProjector::default(),
+            views: ViewArchive::new(resumed_live_seam),
             turn_end: None,
+        }
+    }
+
+    pub(super) fn set_context_estimate(&mut self, estimate: Option<ContextEstimate>) {
+        self.views.set_context_estimate(estimate);
+    }
+
+    pub(super) fn inspect_document(&self) -> Result<DetailDocument, LiveRenderError> {
+        DetailDocument::inspect(&self.views).map_err(|_| LiveRenderError)
+    }
+
+    pub(super) fn review_document(&self) -> Result<DetailDocument, LiveRenderError> {
+        DetailDocument::review(&self.views).map_err(|_| LiveRenderError)
+    }
+
+    pub(super) fn freeze_joined_review(&mut self, outcome: &TurnOutcome) {
+        let Some(anchor) = self.turn_end.as_ref() else {
+            return;
+        };
+        if !anchor.matches(outcome.turn(), outcome.turn_end_seq(), outcome.reason()) {
+            return;
+        }
+        let receipt = match WorkReceiptView::from_outcome(
+            outcome,
+            self.semantic.tools(),
+            self.semantic.status(),
+        ) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                self.views.mark_review_join_failed(outcome.turn());
+                return;
+            }
+        };
+        let receipt = Arc::new(receipt);
+        self.views
+            .freeze_receipt(outcome.turn(), outcome.turn_end_seq(), Arc::clone(&receipt));
+        match JoinedTurnView::from_joined_receipt(outcome, receipt, self.semantic.tools()) {
+            Ok(review) => self.views.freeze_review(review),
+            Err(_) => self.views.mark_review_join_failed(outcome.turn()),
         }
     }
 
@@ -1102,6 +1175,7 @@ impl LiveRenderer {
         &mut self,
         event: CommittedUiEvent,
     ) -> Result<LiveUpdate, LiveRenderError> {
+        self.views.observe(&event);
         let first_tool_result = match &event.kind {
             CommittedUiKind::ToolResult {
                 turn,
@@ -1197,6 +1271,7 @@ impl LiveRenderer {
                 index,
                 text,
             } => {
+                enhanced_frame = EnhancedFrame::Suppress;
                 self.retain_delta(
                     turn,
                     step,
@@ -1484,10 +1559,11 @@ impl LiveRenderer {
                 &ToolCardView::from_activity(tool).map_err(|_| LiveRenderError)?,
             )?;
         }
-        let receipt =
-            WorkReceiptView::from_outcome(outcome, self.semantic.tools(), self.semantic.status())
-                .map_err(|_| LiveRenderError)?;
-        append_receipt_parts(&mut parts, &receipt)?;
+        let receipt = self
+            .views
+            .joined_receipt(outcome.turn(), outcome.turn_end_seq())
+            .ok_or(LiveRenderError)?;
+        append_receipt_parts(&mut parts, receipt)?;
         Ok(LiveFrame { parts })
     }
 
@@ -1775,7 +1851,9 @@ impl ReceiptReason {
             },
             UiTurnEndReason::MaxTokens => Self::MaxTokens,
             UiTurnEndReason::Interrupted => Self::Interrupted,
-            UiTurnEndReason::Other { .. } => Self::Other,
+            UiTurnEndReason::Other { kind } => Self::Other {
+                kind: kind.as_deref().map(copy_frame_text).transpose()?,
+            },
         })
     }
 
@@ -1798,7 +1876,12 @@ impl ReceiptReason {
             (Self::Error { code: left_code }, TurnEndReason::Error { error }) => {
                 left_code == error.code()
             }
-            (Self::Other, TurnEndReason::Other { .. }) => true,
+            (
+                Self::Other { kind: left_kind },
+                TurnEndReason::Other {
+                    kind: right_kind, ..
+                },
+            ) => left_kind.as_deref() == right_kind.as_deref(),
             _ => false,
         }
     }
@@ -2129,7 +2212,7 @@ mod tests {
 
     use crate::agent::{
         ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPreviewKind, ApprovalPrompt,
-        ApprovalRequest,
+        ApprovalRequest, TurnOutcome,
     };
     use crate::model::{CallId, LlmFailure};
     use crate::session::{
@@ -2138,10 +2221,7 @@ mod tests {
         UiAssistantContent, UiIdentity, UiOpaquePayload, UiToolFailure, UiTurnEndReason,
         UnixMillis,
     };
-    use crate::tui::{
-        presentation::{PresentedItem, TextStyle},
-        projector::UiProjector,
-    };
+    use crate::tui::presentation::{PresentedItem, TextStyle};
 
     use super::{
         AttemptState, EnhancedPresenter, FRAME_OUTPUT_CHUNK_BYTES, InteractivePresenter, LiveFrame,
@@ -2651,6 +2731,30 @@ mod tests {
         assert!(output.contains("Tool result recorded"));
         assert!(output.contains("details incomplete"));
         assert!(!output.contains("secret"));
+
+        let end_seq = EventSeq::new(258).unwrap();
+        renderer
+            .consume(event(
+                end_seq.get(),
+                CommittedUiKind::TurnEnd {
+                    turn,
+                    reason: UiTurnEndReason::Completed,
+                },
+            ))
+            .unwrap();
+        let outcome = TurnOutcome::completed_for_test(turn, end_seq, 257);
+        renderer.freeze_joined_review(&outcome);
+        let review = renderer.review_document().unwrap();
+        let review_text = review
+            .lines()
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(review_text.contains("1 action(s) omitted"));
+        let receipt = enhanced_text(renderer.receipt_frame(&outcome).unwrap());
+        assert!(receipt.contains("257 tool requests"));
+        assert!(receipt.contains("details incomplete"));
     }
 
     #[test]
@@ -2751,6 +2855,78 @@ mod tests {
             error: LlmFailure::new("x".repeat(8_192), "PROVIDER_FAILED").unwrap(),
         };
         assert!(error_anchor.matches(turn, EventSeq::new(10).unwrap(), &full_reason));
+
+        let other_event = event(
+            11,
+            CommittedUiKind::TurnEnd {
+                turn,
+                reason: UiTurnEndReason::Other {
+                    kind: Some("plugin-finished".to_owned()),
+                },
+            },
+        );
+        let other_anchor = TurnEndAnchor::from_event(&other_event).unwrap().unwrap();
+        let matching = TurnEndReason::from_value(serde_json::json!({
+            "kind": "plugin-finished",
+            "extra": true
+        }))
+        .unwrap();
+        let different = TurnEndReason::from_value(serde_json::json!({
+            "kind": "plugin-blocked",
+            "extra": true
+        }))
+        .unwrap();
+        assert!(other_anchor.matches(turn, EventSeq::new(11).unwrap(), &matching));
+        assert!(!other_anchor.matches(turn, EventSeq::new(11).unwrap(), &different));
+    }
+
+    #[test]
+    fn mismatched_outcomes_cannot_replace_the_last_joined_review_or_receipt() {
+        let turn = TurnId::new(1).unwrap();
+        let end_seq = EventSeq::new(9).unwrap();
+        let mut renderer = LiveRenderer::new();
+        renderer
+            .consume(event(
+                end_seq.get(),
+                CommittedUiKind::TurnEnd {
+                    turn,
+                    reason: UiTurnEndReason::Completed,
+                },
+            ))
+            .unwrap();
+        let joined = TurnOutcome::completed_for_test(turn, end_seq, 0);
+        renderer.freeze_joined_review(&joined);
+        let before_review = renderer
+            .review_document()
+            .unwrap()
+            .lines()
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before_receipt = enhanced_text(renderer.receipt_frame(&joined).unwrap());
+
+        for mismatch in [
+            TurnOutcome::completed_for_test(turn, EventSeq::new(10).unwrap(), 7),
+            TurnOutcome::completed_for_test(TurnId::new(2).unwrap(), end_seq, 7),
+            TurnOutcome::blocked_for_test(turn, end_seq),
+        ] {
+            renderer.freeze_joined_review(&mismatch);
+        }
+
+        let after_review = renderer
+            .review_document()
+            .unwrap()
+            .lines()
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(after_review, before_review);
+        assert_eq!(
+            enhanced_text(renderer.receipt_frame(&joined).unwrap()),
+            before_receipt
+        );
     }
 
     fn render(
@@ -2846,6 +3022,55 @@ mod tests {
             renderer.semantic.status().last_prune_shadowed_tokens,
             Some(7)
         );
+        let inspect = renderer.inspect_document().unwrap();
+        let inspect_text = inspect
+            .lines()
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Context summary started",
+            "Context summary prepared",
+            "Context summary committed",
+            "Prune marker committed · replacement pending",
+            "target seq 9",
+            "7 estimated tokens in the shadowed node",
+            "Surface replacement",
+            "replaces seq 9",
+        ] {
+            assert!(inspect_text.contains(expected), "missing {expected:?}");
+        }
+        for overclaim in ["tokens removed", "tokens freed", "tokens saved"] {
+            assert!(!inspect_text.contains(overclaim));
+        }
+
+        let mut failed = LiveRenderer::new();
+        failed
+            .consume(event(
+                0,
+                CommittedUiKind::CompactionEnded {
+                    id: identity("compact-failed"),
+                    turn: None,
+                    error: Some(crate::session::UiCompactionError {
+                        code: Some("SUMMARY_FAILED".to_owned()),
+                        message: "SECRET_COMPACTION_BODY".to_owned(),
+                    }),
+                },
+            ))
+            .unwrap();
+        let failed_text = failed
+            .inspect_document()
+            .unwrap()
+            .lines()
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(failed_text.contains("Context summary failed"));
+        assert!(failed_text.contains("SUMMARY_FAILED"));
+        assert!(!failed_text.contains("Context summary committed"));
+        assert!(!failed_text.contains("SECRET_COMPACTION_BODY"));
     }
 
     #[test]
@@ -3308,11 +3533,8 @@ mod tests {
             .unwrap();
         assert!(blocks.degraded);
 
-        let mut renderer = LiveRenderer {
-            attempt: Some(blocks),
-            semantic: UiProjector::default(),
-            turn_end: None,
-        };
+        let mut renderer = LiveRenderer::new();
+        renderer.attempt = Some(blocks);
         let mut presenter = InteractivePresenter::new();
         let mut output = String::new();
         render(

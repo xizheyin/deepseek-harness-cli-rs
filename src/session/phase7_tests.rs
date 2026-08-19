@@ -375,9 +375,10 @@ fn projection_retains_bounded_tool_payloads_but_redacts_them_from_debug() {
     }
     let debug = format!("{projected:?}");
     assert!(!debug.contains(SECRET));
-    assert!(debug.contains("visible streamed text"));
-    assert!(debug.contains("visible final text"));
-    assert!(debug.contains("visible reasoning"));
+    assert!(!debug.contains("visible streamed text"));
+    assert!(!debug.contains("visible final text"));
+    assert!(!debug.contains("visible reasoning"));
+    assert!(debug.contains("text_bytes"));
     assert!(!debug.contains("READ_FAILED"));
     assert!(matches!(
         &projected[3].kind,

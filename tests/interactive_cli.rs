@@ -387,6 +387,37 @@ fn linear_tui_keeps_markdown_literal_and_emits_no_escape_bytes() {
 }
 
 #[test]
+fn linear_inspect_and_review_are_local_zero_escape_reports() {
+    let server = SequenceSseServer::start(vec![text_sse("linear detail source answer")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"build a linear review\r");
+    dsh.expect(b"linear detail source answer");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+
+    dsh.write(b"/review\r");
+    dsh.expect(b"REVIEW");
+    dsh.expect(b"Turn complete");
+    dsh.expect(b"0 tool requests");
+    dsh.expect_occurrences(b"dsh > ", 3);
+
+    dsh.write(b"/inspect\r");
+    dsh.expect(b"INSPECT");
+    dsh.expect(b"COMMITTED FACTS");
+    dsh.expect_occurrences(b"dsh > ", 4);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "build a linear review");
+}
+
+#[test]
 fn explicit_linear_and_enhanced_tui_modes_reach_their_real_terminal_paths() {
     let server = SequenceSseServer::start(Vec::new());
     let workspace = TestWorkspace::new();
@@ -499,16 +530,23 @@ fn enhanced_dock_keeps_cbreak_across_idle_and_restores_it_for_suspend() {
     dsh.expect("❯".as_bytes());
     assert!(dsh.terminal_uses_application_mode());
     assert_ne!(dsh.terminal_state(), dsh.initial_terminal_state());
+    dsh.write(b"continue after enhanced suspension");
+    let inspect = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(inspect, b"INSPECT");
 
     dsh.signal(Signal::TSTP);
     dsh.wait_until_stopped();
     assert_eq!(dsh.terminal_state(), dsh.initial_terminal_state());
+    let resumed = dsh.checkpoint();
     dsh.signal(Signal::CONT);
-    dsh.expect_occurrences(b"Ready", 2);
+    dsh.expect_after(resumed, b"INSPECT");
     assert!(dsh.terminal_uses_application_mode());
 
     let turn_checkpoint = dsh.checkpoint();
-    dsh.write(b"continue after enhanced suspension\r");
+    dsh.write(b"\x1b");
+    dsh.expect_after(turn_checkpoint, b"continue after enhanced suspension");
+    dsh.write(b"\r");
     dsh.expect(b"answer after enhanced suspension");
     dsh.expect_after(turn_checkpoint, b"Turn complete");
     let (status, _) = dsh.exit_cleanly();
@@ -662,6 +700,196 @@ fn enhanced_composer_edits_fragmented_unicode_and_distinguishes_ctrl_j_from_ente
     assert!(status.success());
     assert_eq!(requests.len(), 1);
     assert_eq!(last_user_content(&requests[0]), "A界B\ntail");
+}
+
+#[test]
+fn enhanced_inspect_and_review_are_local_read_only_panels_that_preserve_the_draft() {
+    let mut server = GatedFirstSseServer::start(
+        String::new(),
+        text_sse("detail views kept the draft"),
+        Vec::new(),
+    );
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"draft survives detail views");
+    let inspect = dsh.checkpoint();
+    dsh.write(b"\x0f\r");
+    dsh.expect_after(inspect, b"INSPECT");
+    dsh.expect_after(inspect, b"COMMITTED FACTS");
+    server.assert_no_first_request(Duration::from_millis(250));
+
+    for (rows, columns) in [(20, 44), (34, 112), (24, 80)] {
+        let resize = dsh.checkpoint();
+        dsh.resize(rows, columns);
+        dsh.expect_after(resize, b"INSPECT");
+    }
+    let compact = dsh.checkpoint();
+    dsh.resize(20, 43);
+    dsh.expect_after(compact, b"draft survives detail views");
+    let regrow = dsh.checkpoint();
+    dsh.resize(34, 112);
+    dsh.expect_after(regrow, b"draft survives detail views");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !dsh.snapshot()[regrow..]
+            .windows(b"INSPECT".len())
+            .any(|window| window == b"INSPECT"),
+        "regrowing must not reopen a detail panel without a fresh command"
+    );
+    let reopen = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(reopen, b"INSPECT");
+
+    let paste = dsh.checkpoint();
+    dsh.write(b"\x1b[200~EVIL\rPROMPT\x1b[201~\r");
+    dsh.expect_after(paste, b"INSPECT");
+    server.assert_no_first_request(Duration::from_millis(250));
+
+    let review = dsh.checkpoint();
+    dsh.write(b"\t");
+    dsh.expect_after(review, b"REVIEW");
+    dsh.expect_after(review, b"Complete a turn before opening Review");
+
+    let focus = dsh.checkpoint();
+    dsh.write(b"\x1b");
+    dsh.expect_after(focus, b"draft survives detail views");
+    server.assert_no_first_request(Duration::from_millis(250));
+    dsh.write(b"\r");
+    dsh.expect(b"Working");
+    server.release();
+    dsh.expect(b"detail views kept the draft");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "draft survives detail views"
+    );
+}
+
+#[test]
+fn enhanced_reasoning_moves_from_focus_into_live_inspect() {
+    let partial = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"PRIVATE_REASONING_SENTINEL\"}}]}\n\n"
+    )
+    .to_owned();
+    let finish = text_sse("reasoning stayed out of Focus");
+    let mut server = GatedFirstSseServer::start(partial, finish, Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    let focus_start = dsh.checkpoint();
+    dsh.write(b"inspect the private reasoning\r");
+    dsh.expect_after(focus_start, b"Working");
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !dsh.snapshot()[focus_start..]
+            .windows(b"PRIVATE_REASONING_SENTINEL".len())
+            .any(|window| window == b"PRIVATE_REASONING_SENTINEL"),
+        "Focus must not print reasoning text"
+    );
+
+    let inspect = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(inspect, b"INSPECT");
+    dsh.expect_after(inspect, b"PRIVATE_REASONING_SENTINEL");
+    server.release();
+    dsh.expect(b"reasoning stayed out of Focus");
+    dsh.expect(b"Turn complete");
+    let review = dsh.checkpoint();
+    dsh.write(b"\t");
+    dsh.expect_after(review, b"REVIEW");
+    dsh.expect_after(review, b"0 tool requests");
+    let focus = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(focus, b"Ready");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "inspect the private reasoning"
+    );
+}
+
+#[test]
+fn active_inspect_scroll_resize_and_same_read_enter_never_queue_a_hidden_prompt() {
+    let mut reasoning = String::new();
+    for index in 0..80 {
+        std::fmt::Write::write_fmt(&mut reasoning, format_args!("REASONING_{index:02}\n"))
+            .expect("bounded test reasoning should format");
+    }
+    let encoded = serde_json::to_string(&reasoning).expect("test reasoning should encode");
+    let partial =
+        format!("data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{encoded}}}}}]}}\n\n");
+    let mut server =
+        GatedThenStalledSseServer::start(partial, text_sse("first active detail turn complete"));
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"inspect while the turn is active\r");
+    dsh.expect(b"Working");
+    let local_inspect = dsh.checkpoint();
+    dsh.write(b"/inspect\r");
+    dsh.expect_after(local_inspect, b"INSPECT");
+    let local_focus = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(local_focus, b"Working");
+    let local_review = dsh.checkpoint();
+    dsh.write(b"/review\r");
+    dsh.expect_after(local_review, b"REVIEW");
+    let review_focus = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(review_focus, b"Working");
+    dsh.write(b"SAFE_NEXT_PROMPT");
+    let inspect = dsh.checkpoint();
+    dsh.write(b"\x0f\r");
+    dsh.expect_after(inspect, b"INSPECT");
+    dsh.expect_after(inspect, b"REASONING_00");
+
+    let end = dsh.checkpoint();
+    dsh.write(b"\x1b[F");
+    dsh.expect_after(end, b"REASONING_79");
+    for (rows, columns) in [(20, 44), (34, 112), (24, 80)] {
+        let resize = dsh.checkpoint();
+        dsh.resize(rows, columns);
+        dsh.expect_after(resize, b"INSPECT");
+    }
+
+    server.release();
+    dsh.expect(b"first active detail turn complete");
+    dsh.expect(b"Turn complete");
+    server.assert_no_second_request(Duration::from_millis(250));
+
+    let focus = dsh.checkpoint();
+    dsh.write(b"\x1b");
+    dsh.expect_after(focus, b"SAFE_NEXT_PROMPT");
+    server.assert_no_second_request(Duration::from_millis(250));
+    dsh.write(b"\r");
+    server.wait_until_second_request();
+    dsh.expect(b"Working");
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    let (status, _) = dsh.exit_cleanly();
+    let (requests, second_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(second_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "inspect while the turn is active"
+    );
+    assert_eq!(last_user_content(&requests[1]), "SAFE_NEXT_PROMPT");
 }
 
 #[test]
@@ -1135,6 +1363,54 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
         );
     }
     assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn enhanced_approval_takes_over_inspect_before_rendering_the_preview() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let partial =
+        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"waiting before approval\"}}]}\n\n")
+            .to_owned();
+    let mut server = GatedFirstSseServer::start(
+        partial,
+        tool_sse(
+            "call-inspect-takeover",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        vec![text_sse("rejected after inspect takeover")],
+    );
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"open inspect before approval\r");
+    dsh.expect(b"waiting before approval");
+    let inspect = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(inspect, b"INSPECT");
+    dsh.write(b"\x1b[6~\r");
+    dsh.write(b"\x1b[200~\x1b[C\r\x1b[201~");
+
+    let takeover = dsh.checkpoint();
+    server.release();
+    dsh.expect_after(takeover, b"Requested  Patch");
+    dsh.expect_after(takeover, b"Proposed update");
+    dsh.approval_ready();
+    dsh.expect(b"> Reject");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"\r");
+    dsh.expect(b"Rejected");
+    dsh.expect(b"rejected after inspect takeover");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 2);
 }
 
 #[test]

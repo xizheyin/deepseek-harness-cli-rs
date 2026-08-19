@@ -66,7 +66,7 @@ pub(crate) use observer::{
     UiTurnEndCancelCause, UiTurnEndReason, UiUserSource,
 };
 #[cfg(test)]
-pub(crate) use observer::{UiAssistantBlock, UiToolFailure};
+pub(crate) use observer::{UiAssistantBlock, UiCompactionError, UiToolFailure};
 pub(crate) use recovery::{RecoveryCallReport, RecoveryCompactionStage, RecoveryReport};
 #[cfg(test)]
 pub(crate) use resume::PreparingResume;
