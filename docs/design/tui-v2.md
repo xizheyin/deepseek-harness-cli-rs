@@ -6,9 +6,10 @@ Phase 11 is a user-approved post-v0.1 product-quality extension. The Phase 9
 linear renderer remains the tested escape hatch. Production-reachable slices
 now add the owned composer, inline dock, one final truth-safe card per settled
 tool, one joined turn receipt, bounded assistant-only presentation, and a
-generator-provenanced semantic preview for real `apply_patch` approvals.
-Tables, Inspect/Review, themes, Session picker, installed screenshots, and the
-real-emulator matrix remain incomplete.
+generator-provenanced semantic preview for real `apply_patch` approvals. A
+bounded current-turn Inspect and one-summary Review now use the same primary-
+screen ledger. Tables, commands/suggestions, themes, Session picker, installed
+screenshots, and the real-emulator matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.
@@ -28,7 +29,7 @@ search, copy, and ordinary terminal history remain available on the verified
 primary-screen profiles. Auto mode conservatively avoids tmux, GNU Screen, and
 Zellij; users may explicitly request enhanced mode there, but no cross-emulator
 scrollback guarantee is claimed yet.
-Inspect and Review will first use a temporary, read-only panel inside the
+Inspect and Review use a temporary, read-only panel inside the
 existing primary-screen Dock. The panel is owned by the same `InlineScreen`
 ledger as the composer, so committed output continues into native scrollback
 above it and no second transcript is retained or replayed. The panel is never
@@ -113,16 +114,17 @@ paired with a word or symbol.
 
 A `tool/call`, optional approval pair, and `tool/result` project into one
 `ToolActivity`. The component changes state in the dock and commits one final
-summary to scrollback. Internal call IDs remain available in Inspect data but
-are hidden from the default view.
+summary to scrollback. Internal call IDs remain correlation state, but the
+first Inspect view reports only their retained/original byte availability.
 
 ### Progressive disclosure
 
 - **Focus**: user prompts, assistant answers, compact tool groups, decisions,
   errors, compaction notices, and final work receipt.
-- **Inspect**: retained reasoning, payload availability, retry facts, commit
-  times, and correlation IDs. It says `omitted` when a bounded source is not
-  retained; it does not call bounded data complete.
+- **Inspect**: retained reasoning, payload/identity availability, retry facts,
+  and commit times. Turn, step, and committed sequence are its visible
+  correlation keys. It says `omitted` when a bounded source is not retained;
+  it does not call bounded data complete.
 - **Review**: changed-file summaries, proven process outcomes, failures, and
   the joined turn receipt. Canonical diffs and full command records require a
   later closed presentation supplement and are not reconstructed from prose.
@@ -485,9 +487,9 @@ authoritative assistant final may recognize a closing fence at EOF without a
 trailing line feed. A stream-key change, retry/correction boundary, `StepEnd`,
 `TurnEnd`, or cancellation aborts pending syntax and flushes it as ordinary
 assistant text; an abort never promotes incomplete output to code. Code and
-diff retain copyable source text in native scrollback. Reasoning remains plain
-bounded text in the current Focus slice; its future Inspect presentation is not
-claimed here.
+diff retain copyable source text in native scrollback. Linear mode retains
+reasoning in its established plain record; enhanced Focus suppresses it and the
+bounded Inspect archive owns its current-turn presentation.
 
 ## Approval
 
@@ -570,8 +572,9 @@ Turn complete
 
 It cannot claim test counts or pass status unless a structured, trusted source
 provides them. The current slice also does not claim an execution duration.
-Review will later expand changed files, canonical diffs, commands, errors,
-denials, cancellations, and unknown outcomes.
+The current Review expands trusted changed-file and process/plugin outcome
+summaries, errors, denials, cancellations, and unknown outcomes. Canonical
+diffs and full command records still require a later closed supplement.
 
 Focus does not claim a live context percentage from the latest Provider usage.
 The first truthful status line uses the Session projection's own bounded
@@ -592,17 +595,19 @@ surface replacement commits.
 
 `LiveRenderer` remains the sole owner of `UiProjector` for the first detail
 slice. Beside it, one `ViewArchive` retains only the current turn and one
-frozen, successfully joined previous-turn review. It observes complete
+frozen last-successfully-joined review. It observes complete
 `CommittedUiEvent` values so sequence and commit time are not discarded, but
 it does not reimplement tool outcome correlation. Inspect and Review builders
 read this archive and the projector through immutable snapshots.
 
 The archive is presentation state, not a second Session log:
 
-- Inspect retains bounded reasoning text, retry facts, correlation IDs,
-  approval outcomes, compaction phases, and payload availability
+- Inspect retains bounded reasoning text, retry facts, approval outcomes,
+  compaction phases, and payload/identity availability
   (`retained/original bytes`, omitted parts). Raw tool arguments/results/meta
-  are not shown by default and never enter Debug output.
+  and literal internal correlation IDs are not shown by default and never
+  enter Debug output. Turn, step, and committed sequence are the visible
+  correlation keys in this first slice.
 - Review is frozen only after the committed `turn/end` and returned
   `TurnOutcome` agree on turn, sequence, and the receipt-relevant reason key.
   It contains trusted changed-file summaries, strict foreground process
@@ -725,11 +730,14 @@ text never controls it and the default is off.
 | canonical patch row provenance | one byte per physical preview row, at most 64 Ki entries |
 | final tool-card headline / detail | 256 UTF-8 bytes each |
 | receipt headline / counters / effects | 4 KiB UTF-8 each |
-| Inspect metadata rows | 512 per turn |
-| Inspect metadata text aggregate | 512 KiB UTF-8 |
+| Inspect committed-fact rows | 512 per turn |
+| Inspect retained text aggregate | 512 KiB UTF-8 |
 | retained reasoning for Inspect | 256 KiB UTF-8 per turn |
+| Inspect reasoning blocks / omission-step entries | 128 each |
 | frozen joined Review snapshots | 1 |
 | Review activities | 256 |
+| Review archived text aggregate | 144 KiB UTF-8 |
+| detail-panel source lines | 4,096 |
 | detail-panel physical rows | 4,096 after wrapping |
 | detail-panel source text | 1 MiB UTF-8 |
 | markup line-prefix candidate | 64 sanitized UTF-8 bytes |
@@ -840,12 +848,14 @@ remain in force.
 6. **Canonical patch approval (green)**: generator-provenanced, single-source
    `apply_patch` facts; one copyable semantic diff card; unchanged linear
    record; and the existing default-Reject input fence.
-7. **Remaining product checkpoint**: bounded view archive, primary-screen
-   Focus/Inspect/Review panels, context/compaction presentation, then tables,
-   commands/suggestions, themes, and Session picker. Each sub-slice remains
-   independently green and pushed; this line is not a claim that they are
-   already implemented.
-8. **Release checkpoint**: remove the replaced log renderer, installed-binary
+7. **Bounded detail views (green)**: current-turn committed-fact archive,
+   reasoning moved out of enhanced Focus, exact context estimates, truthful
+   compaction chronology, one joined summary Review, and transactional primary-
+   screen Inspect/Review panels with local commands and approval takeover.
+8. **Remaining product checkpoint**: tables, commands/suggestions, themes, and
+   Session picker. Each sub-slice remains independently green and pushed; this
+   line is not a claim that they are already implemented.
+9. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status
    commit.

@@ -1273,8 +1273,16 @@ closed row provenance to the same canonical preview used by the result. The
 enhanced UI can therefore style the proposed file headers, hunks, additions,
 and removals without parsing model prose or changing Session facts; generic
 approval text stays opaque. These terminal-specific behaviors have no upstream
-visual oracle, so `docs/compatibility.md` remains `partial`. Tables,
-Inspect/Review, installed Phase 11 evidence, screenshots, and the
+visual oracle. The bounded-view production slice adds a current-turn
+`ViewArchive` and primary-screen Inspect/Review panels without changing those
+facts: reasoning moves out of enhanced Focus, Inspect shows committed sequence,
+time, retry, usage, payload-availability, context-estimate, and compaction
+metadata, while one exactly joined Review reuses the Focus receipt and retains
+only trusted action summaries. It does not replay the Session, expose raw tool
+payloads or literal call/approval/compaction correlation IDs, reconstruct pre-
+resume history, or infer full diffs/commands from prose. These terminal-specific
+behaviors keep `docs/compatibility.md` `partial`. Tables, commands/suggestions,
+themes, the Session picker, installed Phase 11 evidence, screenshots, and the
 real-emulator/platform matrix must exist before any broader
 `intentional-difference` completion claim.
 

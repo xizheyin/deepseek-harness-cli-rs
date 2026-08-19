@@ -11,9 +11,11 @@ truth-safe final tool cards, and joined turn receipt now exist on conservative
 terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 11 now also has bounded assistant-only Markdown/code/fenced-diff presentation
 and a generator-provenanced semantic preview for real built-in `apply_patch`
-approvals. It is still partial because tables, Inspect/Review, theme polish,
-the Session picker, installed Phase 11 acceptance, real screenshots,
-real-emulator evidence, and same-candidate dual-platform CI are not complete.
+approvals. Bounded current-turn Inspect and one-summary Review are also
+production reachable in the primary-screen ledger. It is still partial because
+tables, commands/suggestions, theme polish, the Session picker, installed Phase
+11 acceptance, real screenshots, real-emulator evidence, and same-candidate
+dual-platform CI are not complete.
 
 ## Frozen boundary
 
@@ -21,9 +23,10 @@ The accepted design is [`../design/tui-v2.md`](../design/tui-v2.md). It keeps
 the DeepSeek Harness semantic baseline and the existing Session, approval,
 cancellation, plugin, and process-cleanup contracts. The default experience is
 an inline, native-scrollback Focus view with a bounded dynamic dock; explicit
-Inspect, Review, and Session-picker views may temporarily use the alternate
-screen. `--tui linear` is the implemented zero-ESC, no-dynamic-control
-accessible path.
+Inspect and Review use a bounded read-only panel in that same primary screen.
+Only a future Session picker may consider the alternate screen after a separate
+ownership proof. `--tui linear` is the implemented zero-ESC,
+no-dynamic-control accessible path.
 
 The implementation work is divided into these checkpoints:
 
@@ -32,9 +35,9 @@ The implementation work is divided into these checkpoints:
    next-turn queue, bounded inline dock, enhanced approval, and resize recovery;
 3. truth-safe semantic tool cards and the joined turn receipt;
 4. bounded assistant markup and semantic canonical-patch approval preview;
-5. tables, Focus/Inspect/Review, themes, context, compaction, commands,
-   suggestions, and Session picker;
-6. installed-binary PTY journey, real screenshots, clean-target repository
+5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
+6. tables, themes, commands, suggestions, and Session picker;
+7. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
 ## Semantic foundation slice — 2026-08-19
@@ -308,11 +311,98 @@ This is a green product checkpoint, not Phase 11 completion. It does not add
 multi-file patches, diff-driven permission decisions, Review mode, tables,
 themes, screenshots, or a new upstream compatibility claim.
 
+## Bounded Inspect/Review slice — 2026-08-19
+
+Implementation commit
+`c4d7917ba632e2e3e78a9c89e153de893857e49e` makes the first progressive-
+disclosure views production reachable without introducing an alternate screen
+or a second Session log:
+
+- `ViewArchive` borrows each complete `CommittedUiEvent` and retains only
+  selected, bounded presentation facts for the current turn. It keeps commit
+  sequence and signed Unix timestamp, current-turn reasoning, retry and usage
+  metadata, approval outcomes, request context, compaction chronology, and
+  payload/identity availability. Raw tool arguments, results, metadata, user
+  text, literal call/approval/compaction correlation IDs, and compaction
+  summaries are not copied into the view or its Debug output.
+- enhanced Focus no longer prints reasoning. Inspect exposes retained streamed
+  or authoritative reasoning with original/retained/omitted byte facts; linear
+  mode keeps its established complete zero-ESC record. Authoritative finals
+  transactionally replace same-step streamed reasoning, including previously
+  attributed omissions.
+- the context line samples the Session projection at one exact next-sequence
+  boundary and calls the value an estimate. A mismatched boundary omits it;
+  zero window omits a percentage; usage greater than the window remains
+  visibly greater than 100% rather than being clamped into a false claim.
+  Compaction says started/prepared/committed or failed, uses
+  estimated/shadowed-token language, and pairs a prune marker with its actual
+  replacement sequence without claiming tokens were removed, freed, or saved.
+- Review freezes only after committed `turn/end` and `TurnOutcome` agree on
+  turn, sequence, and receipt-relevant reason. It reuses the same `Arc` receipt
+  shown by Focus and keeps one bounded set of truth-safe patch, foreground
+  process, plugin, failure, denial, cancellation, and unknown summaries.
+  Wrong anchors preserve the previous Review and receipt. This first Review is
+  deliberately summary-only: canonical diffs, full commands, execution
+  duration, and history before a resume seam remain unavailable.
+- `ViewMode` separates requested from screen-committed state. Inspect/Review
+  are fixed-height read-only primary-screen panels owned by `InlineScreen`;
+  same-size re-anchor clears old rows, scrolls only a positive height delta,
+  and never replays transcript bytes. The panel continues to drain live facts,
+  supports 44/80/112-column layouts, and falls back to Focus below 44×12 while
+  keeping enhanced mode's existing 12×5 rescue floor.
+- `Ctrl+O`, exact `/inspect`, `/review`, and `/focus`, Tab, arrows,
+  Home/End, PageUp/PageDown, `q`, and a timed standalone Esc are local controls.
+  Printable text, Enter, paste, and unknown sequences cannot submit or queue
+  from a detail view. A requested-but-uncommitted transition discards input,
+  and a modal change ends the current read batch, so `Ctrl+O + Enter`,
+  PageDown + Enter, and Esc + Enter cannot create a hidden request.
+- approval remains higher priority. The driver resets the detail decoder,
+  commits Focus, appends the immutable trusted preview, completes the existing
+  quiet/flush fence, and then arms the default-Reject selector. Suspend restores
+  exact termios and resume redraws the requested panel without losing the
+  hidden draft.
+
+The implemented resource contract adds 512 Inspect rows, 512 KiB aggregate
+retained Inspect text, a 256 KiB reasoning subset, 128 reasoning blocks and
+128 omission-step entries, one frozen Review, 256 Review activities, 144 KiB
+Review text, 4,096 source lines, 4,096 wrapped physical rows, and 1 MiB detail-
+document source text. Exact/one-over tests cover Inspect row/text/reasoning and
+detail source/wrapped-row acceptance, omission accounting, and truthful markers
+without cancelling Agent work. The Review activity/text caps and reasoning
+omission-step table are implemented bounds whose direct exact/one-over tests
+remain in Evidence pending.
+One overlong grapheme is replaced by a fixed visible placeholder so a hostile
+zero-width cluster cannot invalidate panel geometry.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64 with fake models,
+loopback HTTP, temporary workspaces, and obvious fake credentials. No real API
+key, public network request, or model billing was used. The final same-tree
+`./scripts/verify.sh` passed: formatting, all-target checks, 682 library tests
+plus 335 other tests (1,017 total), zero failed/ignored, Clippy with warnings
+denied, and whitespace checks. Focused evidence includes 11 view/archive/detail-
+state tests,
+14 deterministic InlineScreen tests across both history policies, 9 Dock tests,
+28 LiveRenderer tests, 12 interactive-driver tests, and 70 tests in the real-
+binary PTY target (68 journeys plus 2 harness regressions). The PTY journeys
+cover local and active views, reasoning suppression, scroll/resize/compact
+fallback, hidden-draft preservation, same-read fences, paste, approval takeover,
+suspend/resume, exact terminal restoration, and the unchanged linear path.
+Two independent read-only reviewers found no remaining P0/P1 truth, privacy,
+terminal, input, or integration issue.
+
+This is a green product checkpoint, not Phase 11 completion. Standard ANSI
+cannot undo terminal-emulator reflow that happens before `SIGWINCH`; the tested
+claim is that dsh does not actively append or replay panel snapshots. Real
+iTerm2, Terminal.app, and VS Code resize/reflow/copy evidence remains pending,
+as do tables, themes, commands/suggestions, Session picker, installed Phase 11
+acceptance, current screenshots, and same-candidate macOS/Ubuntu CI.
+
 ## Evidence pending
 
 - remaining product files and default-enabled Phase 11 acceptance tests;
-- exact-limit and one-over tests for the current card/receipt/Dock text bounds
-  and later product/view resources;
+- exact-limit and one-over tests for remaining card/receipt/Dock fields and
+  the Review activity/text and reasoning omission-step caps, plus later
+  table/theme/picker resources;
 - installed candidate SHA and release acceptance output;
 - screenshot sizes and digests generated from real installed PTY bytes;
 - macOS and Ubuntu job URLs for the same candidate;

@@ -62,7 +62,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
 | 文件修改 | 严格的单文件 `apply_patch`，执行前展示实际 diff，并检查路径、符号链接和并发修改 |
 | 命令执行 | 经审批的前台 `bash`，限制输出和运行时间，并在正常可观察路径下终止、回收同进程组工作 |
-| 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、每个工具生命周期至多一张最终卡、回合收据、审批、Ctrl+C 取消，以及严格线性后备 |
+| 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
 | 脚本模式 | `--prompt` 或管道输入；不会停下来等待审批，并安全拒绝写文件或 Shell 请求 |
 | 长会话 | 有上限的本地 JSONL、会话列表与恢复，以及一次有界的自动上下文摘要 |
 | 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
@@ -82,10 +82,13 @@ dsh --workspace .
 | --- | --- |
 | `/help` | 显示会话内帮助 |
 | `/exit` 或 `/quit` | 等待清理后退出 |
+| `/inspect`、`/review` | 增强界面本地切换只读详情；线性界面输出零 ESC 报告；不会发送给模型或加入队列 |
+| `/focus` | 仅增强界面：从详情返回默认 Focus |
 | <kbd>Enter</kbd> | 空闲时发送；当前回合运行时加入下一回合 FIFO |
 | <kbd>Ctrl</kbd> + <kbd>J</kbd> | 在增强 Composer 中插入换行 |
 | 方向键、Home/End、Backspace/Delete | 按 Unicode 字素编辑；上下方向在边界浏览本进程已提交历史 |
 | <kbd>Ctrl</kbd> + <kbd>R</kbd> / <kbd>Ctrl</kbd> + <kbd>_</kbd> | 反向搜索历史 / 撤销；Ctrl+Z 保留给暂停 |
+| <kbd>Ctrl</kbd> + <kbd>O</kbd> | 打开 Inspect；详情中再次按下可回到 Focus |
 | <kbd>Ctrl</kbd> + <kbd>C</kbd> | 取消当前回合，清理完成后继续当前会话 |
 | <kbd>Ctrl</kbd> + <kbd>D</kbd> | 安全结束会话 |
 | <kbd>Ctrl</kbd> + <kbd>Z</kbd> | 先清理当前回合再暂停；回到 Shell 后可用 `fg` 恢复 |
@@ -108,6 +111,15 @@ dsh --workspace .
 改变最终文字和样式；线性后备仍输出可复制的纯文本且不含 ESC。这是有限子集，不是完整
 Markdown：表格、强调、链接、图片和 HTML 尚未支持；真实 `apply_patch` 审批 diff
 使用工具生成时附带的封闭行类型显示文件头、hunk、新增和删除，且不依赖文本前缀猜测。
+
+增强界面的 Inspect 会显示当前回合的 reasoning、提交序号与时间、重试、usage、
+payload 是否保留以及上下文/压缩事实；Review 显示最近一个能与 `turn/end` 精确关联的
+回合收据和可信工具结果摘要。两者都位于主屏底部的只读面板，打开时仍持续接收输出，
+不会复制 transcript，也不会修改或发送隐藏草稿。方向键和 PageUp/PageDown 浏览，Tab
+在 Inspect/Review 之间切换，<kbd>Esc</kbd>、<kbd>Ctrl</kbd>+<kbd>O</kbd> 或 `q` 返回
+Focus。首版不会从普通文字猜完整 diff、命令明细或执行时长；恢复会话后，恢复点之前的
+详情会明确标为不可用。窗口低于 44×12 时详情会安全回到 Focus；增强模式本身仍可在
+已有的 12×5 rescue Dock 中继续工作。
 
 <p align="center">
   <img src="docs/assets/dsh-approval.png" alt="dsh-rs 补丁审批选择器，默认选中 Reject，可移动到 Allow once" width="1128">
@@ -224,7 +236,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
 | Phase 10 | 已完成：受限的本地子进程工具插件、两个真实示例和故障矩阵已通过双平台验收 |
-| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff 和真实补丁语义预览已有生产路径；Inspect/Review、截图与双平台验收未完成 |
+| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff、真实补丁语义预览和只读 Inspect/Review 已有生产路径；表格、命令/文件建议、主题、Session picker、截图与双平台验收未完成 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -239,7 +251,7 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
 - 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
-- Phase 11 只实现 assistant 的有限 Markdown/代码/围栏 diff 和真实单文件 `apply_patch` 语义预览；表格、Focus/Inspect/Review、主题、Session picker 和最终安装版截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
+- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；表格、命令/文件建议、主题、Session picker、最终安装版验收和截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
 - Auto 暂不在 tmux、GNU Screen、Zellij、未知终端或初始小于 44×12 的窗口启用增强界面；已进入增强模式后可缩到 12×5，继续缩小会安全恢复并退出；
 - primary-screen resize/reflow/copy 目前只有确定性终端模型和 PTY 字节证据，真实 iTerm/Terminal/VS Code 矩阵仍待完成；
 - Windows 以及未列入发布矩阵的 Unix 平台尚未支持。
